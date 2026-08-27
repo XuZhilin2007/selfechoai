@@ -1,0 +1,1 @@
+"""SelfEcho AI application package."""

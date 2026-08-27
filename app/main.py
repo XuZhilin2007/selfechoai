@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncIterator
+
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Response,
+    status,
+)
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.auth import AuthenticationService
+from app.auth_repository import AuthRepository
+from app.auth_routes import create_auth_router, create_current_user_dependency
+from app.config import Settings
+from app.database import Database
+from app.priority import rank_items
+from app.repository import InvalidOperationError, NotFoundError, Repository
+from app.schemas import (
+    CaptureRequest,
+    DashboardResponse,
+    ItemDetailResponse,
+    ItemInputPublic,
+    ItemStatus,
+    MessageResponse,
+    PersonalItemPublic,
+    ProcessingStatus,
+    UserPublic,
+    UserItemPatch,
+)
+from app.services.ai import AIService, AIServiceError, create_ai_service
+from app.services.processing import InputProcessingService
+
+
+def create_app(
+    settings: Settings | None = None,
+    ai_service: AIService | None = None,
+) -> FastAPI:
+    settings = settings or Settings.from_environment()
+    database = Database(settings.database_path)
+    repository = Repository(database)
+    auth_repository = AuthRepository(database)
+    auth_service = AuthenticationService(
+        auth_repository,
+        registration_mode=settings.registration_mode,
+        invite_code_hash=settings.invite_code_hash,
+        session_expiration_seconds=settings.session_expiration_seconds,
+    )
+    ai_service = ai_service or create_ai_service(settings)
+    processor = InputProcessingService(repository, ai_service)
+    recovery_tasks: set[asyncio.Task[None]] = set()
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        database.initialize()
+        repository.system_recover_interrupted_inputs()
+        for pending_input in repository.system_list_pending_inputs():
+            task = asyncio.create_task(
+                processor.process_input(
+                    pending_input.input_id,
+                    pending_input.user_id,
+                )
+            )
+            recovery_tasks.add(task)
+            task.add_done_callback(recovery_tasks.discard)
+        yield
+        for task in list(recovery_tasks):
+            task.cancel()
+        if recovery_tasks:
+            await asyncio.gather(*recovery_tasks, return_exceptions=True)
+
+    app = FastAPI(
+        title="SelfEcho AI",
+        version="0.3.0",
+        lifespan=lifespan,
+    )
+    app.state.database = database
+    app.state.settings = settings
+    app.state.repository = repository
+    app.state.processor = processor
+    app.state.auth_repository = auth_repository
+    app.state.auth_service = auth_service
+    app.include_router(create_auth_router(auth_service, settings))
+    require_current_user = create_current_user_dependency(auth_service, settings)
+    require_csrf_current_user = create_current_user_dependency(
+        auth_service,
+        settings,
+        csrf_protected=True,
+    )
+
+    @app.get("/api/health", response_model=MessageResponse)
+    def health() -> MessageResponse:
+        database.check_health()
+        return MessageResponse(message="ok")
+
+    @app.post(
+        "/api/inputs",
+        response_model=ItemInputPublic,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def capture_input(
+        payload: CaptureRequest,
+        background_tasks: BackgroundTasks,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> ItemInputPublic:
+        item_input = repository.create_input(
+            payload.original_text,
+            payload.input_method,
+            current_user.id,
+        )
+        background_tasks.add_task(
+            processor.process_input,
+            item_input.id,
+            current_user.id,
+        )
+        return item_input
+
+    @app.post(
+        "/api/items/{item_id}/inputs",
+        response_model=ItemInputPublic,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def add_item_input(
+        item_id: int,
+        payload: CaptureRequest,
+        background_tasks: BackgroundTasks,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> ItemInputPublic:
+        try:
+            item_input = repository.create_input(
+                payload.original_text,
+                payload.input_method,
+                current_user.id,
+                item_id=item_id,
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        background_tasks.add_task(
+            processor.process_input,
+            item_input.id,
+            current_user.id,
+        )
+        return item_input
+
+    @app.post(
+        "/api/inputs/{input_id}/retry",
+        response_model=ItemInputPublic,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def retry_input(
+        input_id: int,
+        background_tasks: BackgroundTasks,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> ItemInputPublic:
+        try:
+            item_input = repository.retry_input(input_id, current_user.id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidOperationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        background_tasks.add_task(
+            processor.process_input,
+            item_input.id,
+            current_user.id,
+        )
+        return item_input
+
+    @app.post(
+        "/api/items/{item_id}/reprocess",
+        response_model=PersonalItemPublic,
+    )
+    async def reprocess_item(
+        item_id: int,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> PersonalItemPublic:
+        try:
+            return await processor.reprocess_item(item_id, current_user.id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AIServiceError as exc:
+            raise HTTPException(status_code=502, detail=exc.user_message) from exc
+
+    @app.get("/api/items", response_model=DashboardResponse)
+    def dashboard(
+        current_user: UserPublic = Depends(require_current_user),
+        item_status: ItemStatus = Query(default=ItemStatus.ACTIVE, alias="status"),
+    ) -> DashboardResponse:
+        sortable, needs_confirmation = rank_items(
+            repository.list_items_by_status(item_status, current_user.id)
+        )
+        show_capture_queue = item_status == ItemStatus.ACTIVE
+        return DashboardResponse(
+            sortable_items=sortable,
+            needs_confirmation=needs_confirmation,
+            pending_inputs=(
+                repository.list_unlinked_inputs(
+                    [ProcessingStatus.PENDING, ProcessingStatus.PROCESSING],
+                    current_user.id,
+                )
+                if show_capture_queue
+                else []
+            ),
+            failed_inputs=(
+                repository.list_unlinked_inputs(
+                    [ProcessingStatus.FAILED], current_user.id
+                )
+                if show_capture_queue
+                else []
+            ),
+        )
+
+    @app.get("/api/items/{item_id}", response_model=ItemDetailResponse)
+    def item_detail(
+        item_id: int,
+        current_user: UserPublic = Depends(require_current_user),
+    ) -> ItemDetailResponse:
+        try:
+            item = repository.get_item(item_id, current_user.id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return ItemDetailResponse(
+            item=item,
+            inputs=repository.list_inputs_for_item(item_id, current_user.id),
+        )
+
+    @app.patch("/api/items/{item_id}", response_model=PersonalItemPublic)
+    def update_item(
+        item_id: int,
+        payload: UserItemPatch,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> PersonalItemPublic:
+        try:
+            return repository.update_item(item_id, current_user.id, payload)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidOperationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def permanently_delete_item(
+        item_id: int,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> Response:
+        try:
+            repository.permanently_delete_item(item_id, current_user.id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidOperationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    static_directory = Path(__file__).parent / "static"
+    index_file = static_directory / "index.html"
+    service_worker_file = static_directory / "service-worker.js"
+
+    @app.get("/service-worker.js", include_in_schema=False)
+    def service_worker() -> FileResponse:
+        # Serving the worker from the application root gives it permission to
+        # control all PWA routes without broad scope headers.
+        return FileResponse(
+            service_worker_file,
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    app.mount("/static", StaticFiles(directory=static_directory), name="static")
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/login", include_in_schema=False)
+    @app.get("/register", include_in_schema=False)
+    @app.get("/account", include_in_schema=False)
+    @app.get("/capture", include_in_schema=False)
+    @app.get("/dashboard", include_in_schema=False)
+    @app.get("/items/{item_id}", include_in_schema=False)
+    def pwa_shell(item_id: int | None = None) -> FileResponse:
+        return FileResponse(index_file)
+
+    return app
+
+
+app = create_app()

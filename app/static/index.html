@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f4f1e8" />
+    <meta name="description" content="SelfEcho AI：帮助用户捕获想法、整理信息并保留决策权" />
+    <link rel="manifest" href="/static/manifest.webmanifest" />
+    <link rel="icon" href="/static/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <title>SelfEcho AI</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" data-link aria-label="SelfEcho 首页">
+          <span class="brand-mark" aria-hidden="true">S</span>
+          <span>SelfEcho</span>
+        </a>
+        <nav id="primary-navigation" aria-label="主导航" hidden>
+          <a href="/capture" data-link>记录</a>
+          <a href="/dashboard" data-link>事项</a>
+          <a href="/account" data-link>账户</a>
+        </nav>
+      </header>
+      <main id="app" tabindex="-1">
+        <p class="loading">正在加载…</p>
+      </main>
+    </div>
+    <noscript>此应用需要启用 JavaScript。</noscript>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
