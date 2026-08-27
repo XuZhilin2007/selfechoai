@@ -84,7 +84,7 @@ DeepSeek 与 OpenAI Responses API 是可选 Provider。没有 Key 时，数据�
 
 ## Community Edition vs Hosted Service
 
-- Community Edition：位于未来公开仓库 github.com/XuZhilin2007/selfechoai，可自行运行，包含应用代码、测试、示例配置和社区文档。
+- Community Edition：位于公开仓库 github.com/XuZhilin2007/selfechoai，可自行运行，包含应用代码、测试、示例配置和社区文档。
 - Hosted service：selfechoai.com，由仓库所有者独立运营。
 
 公开版本不包含托管服务的数据库、用户数据、API Key、服务器配置、Nginx、TLS、备份、日志、部署 Runbook 或私有 Git 历史。Community Edition 的许可证不构成托管服务可用性、安全或支持承诺。
