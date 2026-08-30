@@ -1,4 +1,4 @@
-const CACHE_NAME = "selfecho-ai-reminder-v0.1-stage3b-3";
+const CACHE_NAME = "selfecho-ai-community-v0.4-stage5-1";
 const SHELL = [
   "/static/index.html",
   "/static/styles.css",
@@ -16,9 +16,91 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
+      .then((keys) => Promise.all(
+        keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key)),
+      ))
   );
   self.clients.claim();
+});
+
+const GENERIC_NOTIFICATION_TITLE = "SelfEcho";
+const GENERIC_NOTIFICATION_BODY = "你有一条 SelfEcho 微提醒。";
+const DEFAULT_NOTIFICATION_TARGET = "/dashboard";
+
+function safeNotificationTargetPath(value) {
+  if (value !== DEFAULT_NOTIFICATION_TARGET) return DEFAULT_NOTIFICATION_TARGET;
+  try {
+    const target = new URL(value, self.location.origin);
+    if (
+      target.origin !== self.location.origin ||
+      target.pathname !== DEFAULT_NOTIFICATION_TARGET ||
+      target.search ||
+      target.hash
+    ) {
+      return DEFAULT_NOTIFICATION_TARGET;
+    }
+    return target.pathname;
+  } catch (_) {
+    return DEFAULT_NOTIFICATION_TARGET;
+  }
+}
+
+function parsePushNotification(event) {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch (_) {
+    payload = {};
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    payload = {};
+  }
+  return {
+    title: GENERIC_NOTIFICATION_TITLE,
+    options: {
+      body: GENERIC_NOTIFICATION_BODY,
+      icon: "/static/icon.svg",
+      tag: "selfecho-reminder",
+      data: {
+        targetPath: safeNotificationTargetPath(payload.target_path),
+      },
+    },
+  };
+}
+
+self.addEventListener("push", (event) => {
+  const notification = parsePushNotification(event);
+  event.waitUntil(
+    self.registration.showNotification(notification.title, notification.options),
+  );
+});
+
+async function openNotificationTarget(targetPath) {
+  const safePath = safeNotificationTargetPath(targetPath);
+  const targetUrl = new URL(safePath, self.location.origin).href;
+  const windows = await self.clients.matchAll({
+    type: "window",
+    includeUncontrolled: true,
+  });
+  const existing = windows.find((client) => {
+    try {
+      return new URL(client.url).origin === self.location.origin;
+    } catch (_) {
+      return false;
+    }
+  });
+  if (existing) {
+    await existing.navigate(targetUrl);
+    return existing.focus();
+  }
+  return self.clients.openWindow(targetUrl);
+}
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    openNotificationTarget(event.notification.data?.targetPath),
+  );
 });
 
 self.addEventListener("fetch", (event) => {

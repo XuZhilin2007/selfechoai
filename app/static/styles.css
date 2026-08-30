@@ -1726,6 +1726,44 @@ details summary {
   grid-column: 1 / -1;
 }
 
+.notification-device-settings,
+.notification-onboarding {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.notification-device-settings {
+  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.notification-device-settings h2,
+.notification-onboarding h2 {
+  margin-bottom: 6px;
+  font-size: 1.05rem;
+}
+
+.notification-device-settings button,
+.notification-onboarding button {
+  width: auto;
+}
+
+.notification-onboarding {
+  margin-bottom: 18px;
+}
+
+.notification-onboarding p:last-child {
+  color: var(--muted);
+}
+
+.notification-onboarding-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
 @media (max-width: 520px) {
   .quick-reminder-choice,
   .reminder-time-summary {
@@ -1752,6 +1790,18 @@ details summary {
 
   .reminder-settings-form .status-message {
     grid-column: auto;
+  }
+
+  .notification-device-settings,
+  .notification-onboarding,
+  .notification-onboarding-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .notification-device-settings button,
+  .notification-onboarding button {
+    width: 100%;
   }
 }
 

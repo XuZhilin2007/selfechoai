@@ -2,6 +2,9 @@ const appElement = document.querySelector("#app");
 const primaryNavigation = document.querySelector("#primary-navigation");
 let pollTimer = null;
 let authRedirectTimer = null;
+let pushOperationPromise = null;
+let pushStateGeneration = 0;
+let notificationOnboardingHasReminder = false;
 
 const AUTH_STATES = Object.freeze({
   LOADING: "loading",
@@ -11,9 +14,19 @@ const AUTH_STATES = Object.freeze({
 });
 const CSRF_COOKIE_NAME = "selfecho_csrf";
 const CAPTURE_DRAFT_KEY = "selfecho.capture-draft";
+const NOTIFICATION_DISMISSAL_KEY = "selfecho.notification-onboarding-dismissed";
+const NOTIFICATION_DISABLED_KEY = "selfecho.device-notifications-disabled";
+const PUSH_CLEANUP_TIMEOUT_MS = 2500;
 const authentication = {
   status: AUTH_STATES.LOADING,
   user: null,
+};
+const pushDeviceState = {
+  userId: null,
+  initialized: false,
+  status: "checking",
+  config: null,
+  lastErrorCode: null,
 };
 
 class ApiError extends Error {
@@ -162,6 +175,624 @@ function readCookie(name) {
   return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : null;
 }
 
+function resetPushDeviceState(userId) {
+  pushStateGeneration += 1;
+  pushOperationPromise = null;
+  notificationOnboardingHasReminder = false;
+  pushDeviceState.userId = userId;
+  pushDeviceState.initialized = false;
+  pushDeviceState.status = "checking";
+  pushDeviceState.config = null;
+  pushDeviceState.lastErrorCode = null;
+}
+
+function pushContextIsCurrent(userId, generation) {
+  return authentication.status === AUTH_STATES.AUTHENTICATED &&
+    authentication.user?.id === userId &&
+    pushDeviceState.userId === userId &&
+    pushStateGeneration === generation;
+}
+
+function systemNotificationsSupported() {
+  return window.isSecureContext === true &&
+    "Notification" in window &&
+    "PushManager" in window &&
+    "serviceWorker" in navigator;
+}
+
+function updatePushDeviceState(userId, generation, updates) {
+  if (!pushContextIsCurrent(userId, generation)) return false;
+  Object.assign(pushDeviceState, updates);
+  refreshNotificationUi();
+  return true;
+}
+
+function runPushSingleFlight(operation) {
+  if (pushOperationPromise) return pushOperationPromise;
+  const running = Promise.resolve().then(operation);
+  const tracked = running.finally(() => {
+    if (pushOperationPromise === tracked) pushOperationPromise = null;
+  });
+  pushOperationPromise = tracked;
+  return tracked;
+}
+
+function pushPreferenceStorageKey(prefix) {
+  const userId = authentication.user?.id ?? "anonymous";
+  return `${prefix}.${userId}.${window.location.origin}`;
+}
+
+function notificationDismissalStorageKey() {
+  return pushPreferenceStorageKey(NOTIFICATION_DISMISSAL_KEY);
+}
+
+function notificationDisabledStorageKey() {
+  return pushPreferenceStorageKey(NOTIFICATION_DISABLED_KEY);
+}
+
+function readPushPreference(key) {
+  try {
+    return localStorage.getItem(key) === "true";
+  } catch (_) {
+    return false;
+  }
+}
+
+function writePushPreference(key, value) {
+  try {
+    if (value) localStorage.setItem(key, "true");
+    else localStorage.removeItem(key);
+  } catch (_) {
+    // Notification preferences remain optional when storage is unavailable.
+  }
+}
+
+function notificationOnboardingDismissed() {
+  return readPushPreference(notificationDismissalStorageKey());
+}
+
+function notificationDisableRequested() {
+  return readPushPreference(notificationDisabledStorageKey());
+}
+
+function browserSubscriptionPayload(subscription) {
+  const serialized = subscription?.toJSON?.();
+  if (
+    typeof serialized?.endpoint !== "string" || !serialized.endpoint ||
+    typeof serialized?.keys?.p256dh !== "string" || !serialized.keys.p256dh ||
+    typeof serialized?.keys?.auth !== "string" || !serialized.keys.auth
+  ) {
+    throw new Error("invalid browser push subscription");
+  }
+  return {
+    endpoint: serialized.endpoint,
+    keys: {
+      p256dh: serialized.keys.p256dh,
+      auth: serialized.keys.auth,
+    },
+  };
+}
+
+async function syncBrowserSubscription(subscription, userId, generation) {
+  if (!pushContextIsCurrent(userId, generation)) return null;
+  return api("/api/push/subscriptions", {
+    method: "PUT",
+    body: JSON.stringify(browserSubscriptionPayload(subscription)),
+  });
+}
+
+function vapidPublicKeyBytes(value) {
+  if (typeof value !== "string" || !value || value.length > 256) {
+    throw new Error("invalid VAPID public key");
+  }
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replaceAll("-", "+").replaceAll("_", "/");
+  const decoded = window.atob(base64);
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+}
+
+function pushSubscriptionUsesVapidKey(subscription, expectedKey) {
+  const applicationServerKey = subscription?.options?.applicationServerKey;
+  if (!applicationServerKey) return false;
+  let actualKey;
+  try {
+    actualKey = applicationServerKey instanceof Uint8Array
+      ? applicationServerKey
+      : new Uint8Array(applicationServerKey);
+  } catch (_) {
+    return false;
+  }
+  return actualKey.length === expectedKey.length &&
+    actualKey.every((value, index) => value === expectedKey[index]);
+}
+
+function pushConnectionFailureCode(stage, error) {
+  const errorName = typeof error?.name === "string" &&
+    /^[A-Za-z][A-Za-z0-9]{0,31}$/.test(error.name)
+    ? error.name
+    : "UnknownError";
+  return `${stage}:${errorName}`;
+}
+
+async function unsubscribeBrowserSubscription(pushManager, subscription) {
+  try {
+    await subscription.unsubscribe();
+    const remaining = await pushManager.getSubscription();
+    return remaining === null;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function replaceAndSyncSubscriptionOnce(
+  registration,
+  subscription,
+  applicationServerKey,
+  userId,
+  generation,
+) {
+  const cleared = await unsubscribeBrowserSubscription(
+    registration.pushManager,
+    subscription,
+  );
+  if (!cleared || !pushContextIsCurrent(userId, generation)) {
+    const error = new Error("stale subscription remains");
+    error.name = "InvalidStateError";
+    throw error;
+  }
+  const replacement = await registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey,
+  });
+  if (!pushContextIsCurrent(userId, generation)) return null;
+  await syncBrowserSubscription(replacement, userId, generation);
+  return replacement;
+}
+
+async function syncWithAccountSwitchRecovery(
+  registration,
+  subscription,
+  applicationServerKey,
+  userId,
+  generation,
+) {
+  try {
+    await syncBrowserSubscription(subscription, userId, generation);
+    return subscription;
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 422) throw error;
+  }
+  return replaceAndSyncSubscriptionOnce(
+    registration,
+    subscription,
+    applicationServerKey,
+    userId,
+    generation,
+  );
+}
+
+async function apiWithTimeout(path, options, timeoutMs = PUSH_CLEANUP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await api(path, { ...options, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function promiseWithTimeout(promise, timeoutMs = PUSH_CLEANUP_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => {
+      const error = new Error("browser push operation timed out");
+      error.name = "TimeoutError";
+      reject(error);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function revokeCurrentDeviceOnBackend() {
+  try {
+    await apiWithTimeout("/api/push/subscriptions/current", { method: "DELETE" });
+    return true;
+  } catch (error) {
+    return error instanceof ApiError && error.status === 404;
+  }
+}
+
+async function browserPushManagerForCleanup(userId, generation) {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return null;
+  try {
+    const registration = typeof navigator.serviceWorker.getRegistration === "function"
+      ? await promiseWithTimeout(navigator.serviceWorker.getRegistration("/"))
+      : await promiseWithTimeout(navigator.serviceWorker.ready);
+    if (!pushContextIsCurrent(userId, generation)) return null;
+    return registration?.pushManager ?? null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function unsubscribeCurrentBrowserDevice(userId, generation) {
+  const pushManager = await browserPushManagerForCleanup(userId, generation);
+  if (!pushManager) return true;
+  try {
+    const subscription = await promiseWithTimeout(pushManager.getSubscription());
+    if (!pushContextIsCurrent(userId, generation)) return false;
+    if (!subscription) return true;
+    return await promiseWithTimeout(
+      unsubscribeBrowserSubscription(pushManager, subscription),
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+async function performDisableDeviceNotifications(userId, generation) {
+  const backendRevoked = await revokeCurrentDeviceOnBackend();
+  const browserUnsubscribed = await unsubscribeCurrentBrowserDevice(
+    userId,
+    generation,
+  );
+  updatePushDeviceState(userId, generation, {
+    initialized: true,
+    status: backendRevoked && browserUnsubscribed ? "disabled" : "cleanup_required",
+    lastErrorCode: backendRevoked && browserUnsubscribed
+      ? null
+      : `disable:${backendRevoked ? "browser" : browserUnsubscribed ? "backend" : "both"}`,
+  });
+  return pushDeviceState;
+}
+
+async function disableDeviceNotifications() {
+  if (pushOperationPromise) await pushOperationPromise;
+  if (authentication.status !== AUTH_STATES.AUTHENTICATED || !authentication.user) {
+    return pushDeviceState;
+  }
+  const userId = authentication.user.id;
+  writePushPreference(notificationDisabledStorageKey(), true);
+  return runPushSingleFlight(async () => {
+    const generation = pushStateGeneration;
+    updatePushDeviceState(userId, generation, {
+      initialized: false,
+      status: "disabling",
+      lastErrorCode: null,
+    });
+    return performDisableDeviceNotifications(userId, generation);
+  });
+}
+
+async function initializePushForAuthenticatedUser() {
+  if (authentication.status !== AUTH_STATES.AUTHENTICATED || !authentication.user) {
+    return pushDeviceState;
+  }
+  const userId = authentication.user.id;
+  if (pushDeviceState.userId !== userId) resetPushDeviceState(userId);
+  if (pushDeviceState.initialized) return pushDeviceState;
+
+  return runPushSingleFlight(async () => {
+    const generation = pushStateGeneration;
+    if (notificationDisableRequested()) {
+      return performDisableDeviceNotifications(userId, generation);
+    }
+    if (!systemNotificationsSupported()) {
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "unsupported",
+      });
+      return pushDeviceState;
+    }
+    if (window.Notification.permission === "denied") {
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "denied",
+      });
+      return pushDeviceState;
+    }
+    try {
+      const config = await api("/api/push/config");
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      if (!config.available || !config.vapid_public_key) {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "unavailable",
+          config,
+        });
+        return pushDeviceState;
+      }
+      if (window.Notification.permission !== "granted") {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "not_enabled",
+          config,
+        });
+        return pushDeviceState;
+      }
+      const registration = await navigator.serviceWorker.ready;
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      const subscription = await registration.pushManager.getSubscription();
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      if (!subscription) {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "reconnect_required",
+          config,
+        });
+        return pushDeviceState;
+      }
+      const applicationServerKey = vapidPublicKeyBytes(config.vapid_public_key);
+      if (!pushSubscriptionUsesVapidKey(subscription, applicationServerKey)) {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "reconnect_required",
+          config,
+        });
+        return pushDeviceState;
+      }
+      await syncWithAccountSwitchRecovery(
+        registration,
+        subscription,
+        applicationServerKey,
+        userId,
+        generation,
+      );
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "enabled",
+        config,
+        lastErrorCode: null,
+      });
+    } catch (error) {
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "reconnect_required",
+        lastErrorCode: pushConnectionFailureCode("initialize", error),
+      });
+    }
+    return pushDeviceState;
+  });
+}
+
+async function enableDeviceNotifications() {
+  if (pushOperationPromise) await pushOperationPromise;
+  if (authentication.status !== AUTH_STATES.AUTHENTICATED || !authentication.user) {
+    return pushDeviceState;
+  }
+  const userId = authentication.user.id;
+  writePushPreference(notificationDisabledStorageKey(), false);
+  return runPushSingleFlight(async () => {
+    const generation = pushStateGeneration;
+    if (!systemNotificationsSupported()) {
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "unsupported",
+      });
+      return pushDeviceState;
+    }
+    if (window.Notification.permission === "denied") {
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "denied",
+      });
+      return pushDeviceState;
+    }
+    updatePushDeviceState(userId, generation, {
+      initialized: false,
+      status: "connecting",
+      lastErrorCode: null,
+    });
+    let connectionStage = "config";
+    try {
+      const config = pushDeviceState.config?.available
+        ? pushDeviceState.config
+        : await api("/api/push/config");
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      if (!config.available || !config.vapid_public_key) {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "unavailable",
+          config,
+        });
+        return pushDeviceState;
+      }
+      connectionStage = "permission";
+      let permission = window.Notification.permission;
+      if (permission === "default") {
+        permission = await window.Notification.requestPermission();
+      }
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      if (permission !== "granted") {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: permission === "denied" ? "denied" : "not_enabled",
+          config,
+        });
+        return pushDeviceState;
+      }
+      connectionStage = "service_worker";
+      const registration = await navigator.serviceWorker.ready;
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      connectionStage = "get_subscription";
+      let subscription = await registration.pushManager.getSubscription();
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      connectionStage = "vapid_key";
+      const applicationServerKey = vapidPublicKeyBytes(config.vapid_public_key);
+      if (subscription && !pushSubscriptionUsesVapidKey(subscription, applicationServerKey)) {
+        connectionStage = "vapid_unsubscribe";
+        const cleared = await unsubscribeBrowserSubscription(
+          registration.pushManager,
+          subscription,
+        );
+        if (!cleared) {
+          const error = new Error("old VAPID subscription remains");
+          error.name = "InvalidStateError";
+          throw error;
+        }
+        subscription = null;
+      }
+      if (!subscription) {
+        connectionStage = "subscribe";
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey,
+        });
+        if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      }
+      connectionStage = "backend_sync";
+      await syncWithAccountSwitchRecovery(
+        registration,
+        subscription,
+        applicationServerKey,
+        userId,
+        generation,
+      );
+      if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "enabled",
+        config,
+        lastErrorCode: null,
+      });
+    } catch (error) {
+      updatePushDeviceState(userId, generation, {
+        initialized: true,
+        status: "connection_failed",
+        lastErrorCode: pushConnectionFailureCode(connectionStage, error),
+      });
+    }
+    return pushDeviceState;
+  });
+}
+
+function dismissNotificationOnboarding() {
+  writePushPreference(notificationDismissalStorageKey(), true);
+  renderNotificationOnboarding();
+}
+
+function renderNotificationOnboarding() {
+  const existing = document.querySelector("#notification-onboarding");
+  if (existing && typeof existing.remove === "function") existing.remove();
+  if (
+    !notificationOnboardingHasReminder ||
+    pushDeviceState.status !== "not_enabled" ||
+    window.Notification?.permission !== "default" ||
+    notificationOnboardingDismissed()
+  ) {
+    return;
+  }
+  appElement.insertAdjacentHTML("afterbegin", `
+    <section id="notification-onboarding" class="notification-onboarding panel">
+      <div>
+        <p class="eyebrow">此设备通知</p>
+        <h2>让 SelfEcho 在需要的时候提醒你</h2>
+        <p>通知只用于你创建的提醒。不会发送广告、活动推广或无关通知。</p>
+      </div>
+      <div class="notification-onboarding-actions">
+        <button class="primary-button notification-enable-button" type="button">开启此设备通知</button>
+        <button class="text-button notification-dismiss-button" type="button">暂时不用</button>
+      </div>
+    </section>`);
+  document.querySelector(".notification-enable-button").addEventListener(
+    "click",
+    async (event) => {
+      event.currentTarget.disabled = true;
+      await enableDeviceNotifications();
+      renderNotificationOnboarding();
+    },
+  );
+  document.querySelector(".notification-dismiss-button").addEventListener(
+    "click",
+    dismissNotificationOnboarding,
+  );
+}
+
+function renderNotificationDeviceSettings() {
+  const status = document.querySelector("#notification-device-status");
+  const action = document.querySelector("#notification-device-action");
+  if (!status || !action) return;
+  const states = {
+    checking: ["正在检查此设备…", null],
+    connecting: ["正在连接此设备通知…", null],
+    disabling: ["正在停用此设备通知…", null],
+    unsupported: ["此设备或当前连接不支持系统通知，SelfEcho 内提醒仍然可用。", null],
+    unavailable: ["系统通知当前不可用，SelfEcho 内提醒仍然可用。", null],
+    denied: ["浏览器已拒绝通知。SelfEcho 内提醒仍然可用；如需开启，请使用浏览器或系统设置。", null],
+    enabled: ["此设备通知已经可用。通知只会用于你创建的 Reminder。", "停用此设备通知"],
+    disabled: ["此设备通知已停用。SelfEcho 内提醒仍然可用。", "重新开启"],
+    not_enabled: ["未开启。SelfEcho 内提醒仍然可用。", "开启此设备通知"],
+    reconnect_required: ["需要重新连接此设备通知。SelfEcho 内提醒仍然可用。", "重新连接"],
+    connection_failed: ["连接未完成，请稍后重试。SelfEcho 内提醒仍然可用。", "重新连接"],
+    cleanup_required: ["服务端已尽力停止发送，但设备清理尚未完全完成。", "重试停用"],
+  };
+  const [message, actionLabel] = states[pushDeviceState.status] || states.reconnect_required;
+  status.textContent = message;
+  status.dataset.diagnostic = pushDeviceState.lastErrorCode || "";
+  status.dataset.kind = ["connection_failed", "cleanup_required"].includes(
+    pushDeviceState.status,
+  )
+    ? "error"
+    : pushDeviceState.status === "enabled"
+      ? "success"
+      : "";
+  action.hidden = !actionLabel;
+  action.disabled = ["connecting", "disabling"].includes(pushDeviceState.status);
+  if (actionLabel) action.textContent = actionLabel;
+}
+
+function refreshNotificationUi() {
+  renderNotificationDeviceSettings();
+  renderNotificationOnboarding();
+}
+
+function reminderIsNotificationEligible(reminder) {
+  return reminder && ["needs_confirmation", "scheduled", "due"].includes(
+    reminder.status,
+  );
+}
+
+async function cleanupPushBeforeLogout() {
+  if (authentication.status !== AUTH_STATES.AUTHENTICATED || !authentication.user) {
+    return;
+  }
+  const userId = authentication.user.id;
+  const generation = pushStateGeneration;
+  if (pushOperationPromise) {
+    try {
+      await promiseWithTimeout(pushOperationPromise);
+    } catch (_) {
+      // Logout's backend session revocation remains the final safety boundary.
+    }
+  }
+  if (!pushContextIsCurrent(userId, generation)) return;
+  await revokeCurrentDeviceOnBackend();
+  if (!pushContextIsCurrent(userId, generation)) return;
+  await unsubscribeCurrentBrowserDevice(userId, generation);
+}
+
+async function performLogout() {
+  try {
+    await cleanupPushBeforeLogout();
+  } catch (_) {
+    // Browser cleanup is best effort; server logout remains authoritative.
+  }
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+    completeLocalLogout();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      completeLocalLogout();
+      return;
+    }
+    throw error;
+  }
+}
+
 function setAuthentication(status, user = authentication.user) {
   if (status === AUTH_STATES.AUTHENTICATED && authRedirectTimer) {
     window.clearTimeout(authRedirectTimer);
@@ -170,6 +801,12 @@ function setAuthentication(status, user = authentication.user) {
   authentication.status = status;
   authentication.user = user;
   primaryNavigation.hidden = status !== AUTH_STATES.AUTHENTICATED;
+  if (status === AUTH_STATES.AUTHENTICATED && user) {
+    if (pushDeviceState.userId !== user.id) resetPushDeviceState(user.id);
+    void initializePushForAuthenticatedUser();
+  } else if (status === AUTH_STATES.UNAUTHENTICATED) {
+    resetPushDeviceState(null);
+  }
 }
 
 function setActiveNavigation() {
@@ -587,6 +1224,10 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
       );
       close();
       await onSaved(saved);
+      if (reminderIsNotificationEligible(saved)) {
+        notificationOnboardingHasReminder = true;
+        renderNotificationOnboarding();
+      }
     } catch (error) {
       status.dataset.kind = "error";
       status.textContent = `提醒未保存：${error.message}`;
@@ -804,6 +1445,14 @@ function renderAccount() {
         <button class="secondary-button" type="submit">保存默认时间</button>
         <p id="reminder-settings-status" class="status-message" role="status"></p>
       </form>
+      <section class="notification-device-settings" aria-labelledby="notification-device-heading">
+        <div>
+          <h2 id="notification-device-heading">此设备通知</h2>
+          <p class="form-hint">通知只用于你创建的 Reminder，不用于广告或活动推广。</p>
+          <p id="notification-device-status" class="status-message" role="status"></p>
+        </div>
+        <button id="notification-device-action" class="secondary-button" type="button" hidden></button>
+      </section>
       <div class="account-actions">
         <p id="logout-status" class="status-message" role="alert"></p>
         <button id="logout-button" class="secondary-button" type="button">退出登录</button>
@@ -814,6 +1463,18 @@ function renderAccount() {
   const status = document.querySelector("#logout-status");
   const reminderSettingsForm = document.querySelector("#reminder-settings-form");
   const reminderSettingsStatus = document.querySelector("#reminder-settings-status");
+  const notificationAction = document.querySelector("#notification-device-action");
+  renderNotificationDeviceSettings();
+  void initializePushForAuthenticatedUser();
+  notificationAction.addEventListener("click", async () => {
+    notificationAction.disabled = true;
+    if (["enabled", "cleanup_required"].includes(pushDeviceState.status)) {
+      await disableDeviceNotifications();
+    } else {
+      await enableDeviceNotifications();
+    }
+    renderNotificationDeviceSettings();
+  });
   reminderSettingsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const submit = reminderSettingsForm.querySelector("button[type='submit']");
@@ -841,13 +1502,8 @@ function renderAccount() {
     status.dataset.kind = "";
     status.textContent = "正在退出…";
     try {
-      await api("/api/auth/logout", { method: "POST" });
-      completeLocalLogout();
+      await performLogout();
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        completeLocalLogout();
-        return;
-      }
       status.dataset.kind = "error";
       status.textContent = error instanceof ApiError && error.status === 403
         ? "安全校验已失效，请刷新页面后重试。"
