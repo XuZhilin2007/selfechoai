@@ -39,6 +39,42 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _cancel_active_reminders_for_item(
+    connection: sqlite3.Connection,
+    *,
+    item_id: int,
+    user_id: int,
+    cancel_reason: str,
+    cancelled_time: str,
+) -> None:
+    connection.execute(
+        """
+        UPDATE reminders
+        SET status = 'cancelled',
+            cancelled_time = ?,
+            cancel_reason = ?,
+            updated_time = ?
+        WHERE item_id = ? AND user_id = ?
+          AND status IN ('needs_confirmation', 'scheduled')
+        """,
+        (
+            cancelled_time,
+            cancel_reason,
+            cancelled_time,
+            item_id,
+            user_id,
+        ),
+    )
+
+
+def _item_status_cancel_reason(status: str | None) -> str | None:
+    if status == ItemStatus.COMPLETED.value:
+        return "item_completed"
+    if status == ItemStatus.TRASH.value:
+        return "item_trashed"
+    return None
+
+
 def _serialize_deadline(value: date | datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -455,6 +491,15 @@ class Repository:
                     """,
                     [*updates.values(), item_id, user_id],
                 )
+                cancel_reason = _item_status_cancel_reason(updates.get("status"))
+                if cancel_reason is not None:
+                    _cancel_active_reminders_for_item(
+                        connection,
+                        item_id=item_id,
+                        user_id=user_id,
+                        cancel_reason=cancel_reason,
+                        cancelled_time=now,
+                    )
 
             connection.execute(
                 """
@@ -589,6 +634,15 @@ class Repository:
                 """,
                 [*values.values(), item_id, user_id],
             )
+            cancel_reason = _item_status_cancel_reason(values.get("status"))
+            if cancel_reason is not None:
+                _cancel_active_reminders_for_item(
+                    connection,
+                    item_id=item_id,
+                    user_id=user_id,
+                    cancel_reason=cancel_reason,
+                    cancelled_time=values["updated_time"],
+                )
             row = connection.execute(
                 "SELECT * FROM personal_items WHERE id = ? AND user_id = ?",
                 (item_id, user_id),

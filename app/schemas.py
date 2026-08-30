@@ -42,6 +42,19 @@ class FailureType(str, Enum):
     INTERNAL = "internal"
 
 
+class ReminderStatus(str, Enum):
+    NEEDS_CONFIRMATION = "needs_confirmation"
+    SCHEDULED = "scheduled"
+    DUE = "due"
+    CANCELLED = "cancelled"
+
+
+class ReminderCancelReason(str, Enum):
+    USER_CANCELLED = "user_cancelled"
+    ITEM_COMPLETED = "item_completed"
+    ITEM_TRASHED = "item_trashed"
+
+
 class UserStatus(str, Enum):
     ACTIVE = "active"
     DISABLED = "disabled"
@@ -190,6 +203,24 @@ class PersonalItemPublic(StrictModel):
     extra_information: dict[str, Any] | None
     created_time: datetime
     updated_time: datetime
+
+
+class ReminderRecord(StrictModel):
+    """Internal persistence model for one per-user Reminder history entry."""
+
+    id: int
+    user_id: int
+    item_id: int
+    source_expression: str | None
+    scheduled_timezone: str
+    remind_at: datetime | None
+    status: ReminderStatus
+    created_time: datetime
+    updated_time: datetime
+    due_time: datetime | None
+    cancelled_time: datetime | None
+    cancel_reason: ReminderCancelReason | None
+    surfaced_time: datetime | None
 
 
 class DashboardItem(StrictModel):
