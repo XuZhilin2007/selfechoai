@@ -12,9 +12,9 @@ from pathlib import Path
 from app.auth import hash_password, normalize_email
 from app.database import (
     ITEM_INPUTS_TABLE_SQL,
-    PERSONAL_ITEMS_TABLE_SQL,
-    SCHEMA_VERSION,
-    USERS_TABLE_SQL,
+    PERSONAL_ITEMS_V3_TABLE_SQL,
+    SCHEMA_V3_VERSION,
+    USERS_V3_TABLE_SQL,
     USER_SESSIONS_TABLE_SQL,
     V3_INDEXES_SQL,
 )
@@ -183,8 +183,8 @@ def migrate_v2_to_v3(database_path: Path, owner: OwnerUser) -> MigrationResult:
                 "ALTER TABLE personal_items RENAME TO _v2_personal_items"
             )
 
-            connection.execute(USERS_TABLE_SQL)
-            connection.execute(PERSONAL_ITEMS_TABLE_SQL)
+            connection.execute(USERS_V3_TABLE_SQL)
+            connection.execute(PERSONAL_ITEMS_V3_TABLE_SQL)
             connection.execute(ITEM_INPUTS_TABLE_SQL)
             connection.execute(USER_SESSIONS_TABLE_SQL)
 
@@ -237,7 +237,7 @@ def migrate_v2_to_v3(database_path: Path, owner: OwnerUser) -> MigrationResult:
             connection.execute("DROP TABLE _v2_item_inputs")
             connection.execute("DROP TABLE _v2_personal_items")
             _execute_statements(connection, V3_INDEXES_SQL)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.execute(f"PRAGMA user_version = {SCHEMA_V3_VERSION}")
 
             foreign_key_errors = connection.execute(
                 "PRAGMA foreign_key_check"
@@ -512,7 +512,7 @@ def main(
         output_fn(f"Owner user id: {result.owner_user_id}")
         output_fn(f"Personal Items preserved: {result.personal_item_count}")
         output_fn(f"Item Inputs preserved: {result.item_input_count}")
-        output_fn(f"Schema version is now {SCHEMA_VERSION}.")
+        output_fn(f"Schema version is now {SCHEMA_V3_VERSION}.")
         return 0
     except (MigrationError, ValueError) as exc:
         output_fn(f"ERROR: {exc}")

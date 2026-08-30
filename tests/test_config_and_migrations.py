@@ -154,7 +154,7 @@ def test_https_origin_requires_secure_cookie(tmp_path: Path, monkeypatch):
         Settings.from_environment(env_file=env_file)
 
 
-def test_new_database_initializes_directly_to_v3(tmp_path: Path):
+def test_new_database_initializes_directly_to_v4(tmp_path: Path):
     database_path = tmp_path / "new.db"
 
     Database(database_path).initialize()
@@ -183,11 +183,31 @@ def test_new_database_initializes_directly_to_v3(tmp_path: Path):
     session_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(user_sessions)")
     }
+    indexes = {
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'index' AND name NOT LIKE 'sqlite_%'
+            """
+        )
+    }
     version = connection.execute("PRAGMA user_version").fetchone()[0]
+    foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     connection.close()
 
-    assert {"users", "user_sessions", "personal_items", "item_inputs"} <= tables
+    assert {
+        "users",
+        "user_sessions",
+        "personal_items",
+        "item_inputs",
+        "reminders",
+        "push_subscriptions",
+        "reminder_deliveries",
+    } <= tables
     assert item_columns["user_id"] == 1
+    assert "reminder_prompt_dismissed_at" in item_columns
     assert input_columns["user_id"] == 1
     assert {
         "id",
@@ -195,6 +215,7 @@ def test_new_database_initializes_directly_to_v3(tmp_path: Path):
         "password_hash",
         "display_name",
         "timezone",
+        "default_reminder_time",
         "status",
         "password_changed_time",
         "created_time",
@@ -211,7 +232,20 @@ def test_new_database_initializes_directly_to_v3(tmp_path: Path):
         "revoked_time",
         "user_agent",
     } <= session_columns
+    assert {
+        "idx_user_sessions_id_user",
+        "idx_reminders_status_remind",
+        "idx_reminders_user_status_remind",
+        "idx_reminders_user_item_created",
+        "uq_reminders_user_item_active",
+        "idx_push_subscriptions_user_status",
+        "uq_push_subscriptions_endpoint",
+        "idx_reminder_deliveries_user_status",
+        "uq_reminder_deliveries_pair",
+    } <= indexes
     assert version == SCHEMA_VERSION
+    assert foreign_key_errors == []
+    assert integrity == "ok"
 
 
 @pytest.mark.parametrize("old_version", [1, 2])

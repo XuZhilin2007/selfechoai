@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 
 from app.auth import hash_password, verify_password
 from app.config import Settings
-from app.database import Database, DatabaseVersionError, SCHEMA_VERSION
+from app.database import (
+    Database,
+    DatabaseVersionError,
+    SCHEMA_V3_VERSION,
+    SCHEMA_VERSION,
+)
 from app.main import create_app
 from app.migrations import v003_auth
 from app.migrations.v003_auth import (
@@ -18,6 +23,7 @@ from app.migrations.v003_auth import (
     main,
     migrate_v2_to_v3,
 )
+from app.migrations.v004_reminders import migrate_v3_to_v4
 from app.services.ai import DisabledAIService
 
 
@@ -157,7 +163,7 @@ def test_cli_migration_rehearsal_creates_login_ready_owner_and_preserves_data(
     foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
     connection.close()
 
-    assert version == SCHEMA_VERSION
+    assert version == SCHEMA_V3_VERSION
     assert owner["email"] == "owner@example.com"
     assert verify_password("owner rehearsal password", owner["password_hash"])
     assert item["id"] == 41
@@ -324,3 +330,47 @@ def test_legacy_v2_write_cannot_silently_use_v3_database(tmp_path: Path):
 
     assert actual_version == 3
     assert actual_version != 2
+
+
+def test_v2_to_v3_to_v4_migration_chain_preserves_data(tmp_path: Path):
+    database_path = tmp_path / "v2-v3-v4-chain.db"
+    create_v2_database(database_path)
+    migrate_v2_to_v3(
+        database_path,
+        OwnerUser(
+            email="owner@example.com",
+            password_hash=hash_password("migration chain password"),
+            display_name="Owner",
+            timezone="Asia/Shanghai",
+        ),
+    )
+
+    intermediate = sqlite3.connect(database_path)
+    intermediate_version = intermediate.execute("PRAGMA user_version").fetchone()[0]
+    intermediate.close()
+    assert intermediate_version == SCHEMA_V3_VERSION
+
+    migrate_v3_to_v4(database_path)
+
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    owner = connection.execute("SELECT * FROM users").fetchone()
+    item = connection.execute(
+        "SELECT * FROM personal_items WHERE id = 41"
+    ).fetchone()
+    inputs = connection.execute("SELECT * FROM item_inputs ORDER BY id").fetchall()
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    connection.close()
+
+    assert version == SCHEMA_VERSION
+    assert owner["default_reminder_time"] == "09:00"
+    assert item["title"] == "需要保留 ID 的事项"
+    assert item["extra_information"] == '{"constraint":"原始背景不能丢失"}'
+    assert item["reminder_prompt_dismissed_at"] is None
+    assert [row["id"] for row in inputs] == [73, 79]
+    assert inputs[0]["original_text"] == "必须逐字保留的原始输入"
+    assert inputs[1]["original_text"] == "失败状态也必须保留"
+    assert foreign_key_errors == []
+    assert integrity == "ok"

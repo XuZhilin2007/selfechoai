@@ -3,7 +3,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from app.database import Database, SCHEMA_VERSION
+import pytest
+
+from app.database import Database, DatabaseVersionError, SCHEMA_V3_VERSION
 from app.migrations.v003_auth import OwnerUser, migrate_v2_to_v3
 
 
@@ -184,8 +186,9 @@ def test_v2_database_migrates_to_v3_without_losing_user_data(tmp_path: Path):
     assert inputs[3]["original_text"] == "正在整理的补充输入"
     assert inputs[3]["processing_status"] == "processing"
     assert {row["user_id"] for row in inputs} == {owner["id"]}
-    assert version == SCHEMA_VERSION
+    assert version == SCHEMA_V3_VERSION
     assert foreign_key_errors == []
     assert integrity == "ok"
 
-    Database(database_path).initialize()
+    with pytest.raises(DatabaseVersionError, match="explicit migration"):
+        Database(database_path).initialize()

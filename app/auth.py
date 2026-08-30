@@ -128,6 +128,7 @@ def _public_user(user: UserRecord) -> UserPublic:
         email=user.email,
         display_name=user.display_name,
         timezone=user.timezone,
+        default_reminder_time=user.default_reminder_time,
         created_time=user.created_time,
         updated_time=user.updated_time,
     )

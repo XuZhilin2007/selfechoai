@@ -69,6 +69,7 @@ def test_zero_user_database_bootstraps_login_ready_user(tmp_path):
         password=PASSWORD,
     )
     assert authenticated.user.email == "owner@example.com"
+    assert authenticated.user.default_reminder_time == "09:00"
 
 
 def test_existing_user_causes_bootstrap_refusal_without_prompting(tmp_path):

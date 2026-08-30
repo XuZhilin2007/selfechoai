@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+from app.time_utils import validate_timezone_name
+
 
 class PriorityLevel(str, Enum):
     HIGH = "high"
@@ -89,6 +91,11 @@ class UserCreationRequest(StrictModel):
             raise ValueError("value must not be blank")
         return value
 
+    @field_validator("timezone")
+    @classmethod
+    def timezone_must_be_valid(cls, value: str) -> str:
+        return validate_timezone_name(value)
+
 
 class RegisterRequest(UserCreationRequest):
     invite_code: SecretStr = Field(min_length=1, max_length=256)
@@ -112,6 +119,7 @@ class UserPublic(StrictModel):
     email: str
     display_name: str
     timezone: str
+    default_reminder_time: str = "09:00"
     created_time: datetime
     updated_time: datetime
 
@@ -124,6 +132,7 @@ class UserRecord(StrictModel):
     password_hash: str
     display_name: str
     timezone: str
+    default_reminder_time: str
     status: UserStatus
     password_changed_time: datetime
     created_time: datetime

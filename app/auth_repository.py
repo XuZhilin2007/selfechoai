@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from app.database import Database
 from app.schemas import UserRecord, UserSessionRecord
+from app.time_utils import validate_timezone_name
 
 
 class DuplicateUserError(Exception):
@@ -41,6 +42,7 @@ class AuthRepository:
             password_hash=row["password_hash"],
             display_name=row["display_name"],
             timezone=row["timezone"],
+            default_reminder_time=row["default_reminder_time"],
             status=row["status"],
             password_changed_time=datetime.fromisoformat(
                 row["password_changed_time"]
@@ -77,6 +79,7 @@ class AuthRepository:
         timezone_name: str,
     ) -> UserRecord:
         now = utc_now().isoformat()
+        timezone_name = validate_timezone_name(timezone_name)
         cursor = connection.execute(
             """
             INSERT INTO users (
@@ -181,7 +184,7 @@ class AuthRepository:
         if display_name is not None:
             updates["display_name"] = display_name
         if timezone_name is not None:
-            updates["timezone"] = timezone_name
+            updates["timezone"] = validate_timezone_name(timezone_name)
         if not updates:
             raise ValueError("at least one profile field is required")
         updates["updated_time"] = utc_now().isoformat()

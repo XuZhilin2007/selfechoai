@@ -87,6 +87,7 @@ def test_user_persistence_and_public_model_do_not_expose_password_hash(
     )
     assert updated.display_name == "Updated Owner"
     assert updated.timezone == "Asia/Tokyo"
+    assert updated.default_reminder_time == "09:00"
 
     new_password_hash = hash_password("new owner password for tests")
     password_updated = repository.update_password(user.id, new_password_hash)
@@ -100,6 +101,7 @@ def test_user_persistence_and_public_model_do_not_expose_password_hash(
         email=password_updated.email,
         display_name=password_updated.display_name,
         timezone=password_updated.timezone,
+        default_reminder_time=password_updated.default_reminder_time,
         created_time=password_updated.created_time,
         updated_time=password_updated.updated_time,
     )
