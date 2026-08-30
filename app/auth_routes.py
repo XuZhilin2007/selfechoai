@@ -13,6 +13,7 @@ from app.auth import (
     InvalidInviteCodeError,
     InvalidSessionError,
     RegistrationClosedError,
+    ValidatedSession,
 )
 from app.config import Settings
 from app.schemas import LoginRequest, RegisterRequest, UserPublic
@@ -147,6 +148,44 @@ def create_current_user_dependency(
         else "require_current_user"
     )
     return current_user
+
+
+def create_validated_session_dependency(
+    service: AuthenticationService,
+    settings: Settings,
+    *,
+    csrf_protected: bool = False,
+) -> Callable[[Request], ValidatedSession]:
+    """Build a session-aware dependency for device-scoped operations."""
+
+    def validated_session(request: Request) -> ValidatedSession:
+        session_token = _require_session_cookie(request, settings)
+        try:
+            validated = service.validate_session(session_token)
+        except InvalidSessionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="authentication required",
+            ) from exc
+        if csrf_protected:
+            try:
+                service.validate_csrf_token(
+                    validated,
+                    request.headers.get("X-CSRF-Token"),
+                )
+            except InvalidCsrfTokenError as exc:
+                raise HTTPException(
+                    status_code=403,
+                    detail="invalid CSRF token",
+                ) from exc
+        return validated
+
+    validated_session.__name__ = (
+        "require_csrf_validated_session"
+        if csrf_protected
+        else "require_validated_session"
+    )
+    return validated_session
 
 
 def session_cookie_name(settings: Settings) -> str:

@@ -19,10 +19,15 @@ from fastapi.staticfiles import StaticFiles
 
 from app.auth import AuthenticationService
 from app.auth_repository import AuthRepository
-from app.auth_routes import create_auth_router, create_current_user_dependency
+from app.auth_routes import (
+    create_auth_router,
+    create_current_user_dependency,
+    create_validated_session_dependency,
+)
 from app.config import Settings
 from app.database import Database
 from app.priority import rank_items
+from app.push_routes import create_push_router
 from app.reminder_repository import ReminderRepository
 from app.reminder_routes import create_reminder_router
 from app.repository import InvalidOperationError, NotFoundError, Repository
@@ -41,12 +46,16 @@ from app.schemas import (
 )
 from app.services.ai import AIService, AIServiceError, create_ai_service
 from app.services.processing import InputProcessingService
+from app.services.push_security import PushEndpointPolicy
+from app.services.push_subscriptions import PushSubscriptionService
 from app.services.reminders import ReminderService
+from app.services.web_push import WebPushService
 
 
 def create_app(
     settings: Settings | None = None,
     ai_service: AIService | None = None,
+    push_endpoint_policy: PushEndpointPolicy | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
     database = Database(settings.database_path)
@@ -57,6 +66,14 @@ def create_app(
         reminder_repository,
         repository,
         auth_repository,
+    )
+    push_endpoint_policy = push_endpoint_policy or PushEndpointPolicy()
+    web_push_service = WebPushService(settings, push_endpoint_policy)
+    push_subscription_service = PushSubscriptionService(
+        reminder_repository,
+        settings,
+        web_push_service,
+        push_endpoint_policy,
     )
     auth_service = AuthenticationService(
         auth_repository,
@@ -91,6 +108,7 @@ def create_app(
             task.cancel()
         if recovery_tasks:
             await asyncio.gather(*recovery_tasks, return_exceptions=True)
+        web_push_service.requests_session.close()
 
     app = FastAPI(
         title="SelfEcho AI",
@@ -105,9 +123,17 @@ def create_app(
     app.state.auth_service = auth_service
     app.state.reminder_repository = reminder_repository
     app.state.reminder_service = reminder_service
+    app.state.push_endpoint_policy = push_endpoint_policy
+    app.state.web_push_service = web_push_service
+    app.state.push_subscription_service = push_subscription_service
     app.include_router(create_auth_router(auth_service, settings))
     require_current_user = create_current_user_dependency(auth_service, settings)
     require_csrf_current_user = create_current_user_dependency(
+        auth_service,
+        settings,
+        csrf_protected=True,
+    )
+    require_csrf_validated_session = create_validated_session_dependency(
         auth_service,
         settings,
         csrf_protected=True,
@@ -117,6 +143,13 @@ def create_app(
             reminder_service,
             require_current_user,
             require_csrf_current_user,
+        )
+    )
+    app.include_router(
+        create_push_router(
+            push_subscription_service,
+            require_current_user,
+            require_csrf_validated_session,
         )
     )
 

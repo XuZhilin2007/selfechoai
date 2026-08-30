@@ -299,6 +299,13 @@ class AuthRepository:
                 """,
                 (revoked, session_id),
             )
+            if cursor.rowcount == 1:
+                self._revoke_push_subscriptions_for_sessions(
+                    connection,
+                    "id = ?",
+                    (session_id,),
+                    revoked,
+                )
         return cursor.rowcount == 1
 
     def revoke_all_user_sessions(
@@ -313,7 +320,43 @@ class AuthRepository:
                 """,
                 (revoked, user_id),
             )
+            if cursor.rowcount:
+                self._revoke_push_subscriptions_for_sessions(
+                    connection,
+                    "user_id = ?",
+                    (user_id,),
+                    revoked,
+                )
         return cursor.rowcount
+
+    @staticmethod
+    def _revoke_push_subscriptions_for_sessions(
+        connection: sqlite3.Connection,
+        session_where: str,
+        parameters: tuple[int, ...],
+        revoked_time: str,
+    ) -> None:
+        """Revoke v4 bindings while retaining compatibility with v3 schemas."""
+
+        table_exists = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'push_subscriptions'
+            """
+        ).fetchone()
+        if table_exists is None:
+            return
+        connection.execute(
+            f"""
+            UPDATE push_subscriptions
+            SET status = 'revoked', invalidated_time = ?, updated_time = ?
+            WHERE status = 'active'
+              AND session_id IN (
+                  SELECT id FROM user_sessions WHERE {session_where}
+              )
+            """,
+            (revoked_time, revoked_time, *parameters),
+        )
 
     def cleanup_expired_sessions(self, cutoff: datetime | None = None) -> int:
         cutoff_value = _serialize_datetime(cutoff or utc_now())

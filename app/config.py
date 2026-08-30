@@ -1,15 +1,111 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from dotenv import dotenv_values
+from pydantic import SecretStr
+from py_vapid import Vapid02
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATABASE_PATH = Path("data/selfecho.db")
 LEGACY_DATABASE_PATH = Path("data/personal_ai_inbox.db")
+_BASE64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+
+
+def _decode_base64url(value: str, *, field_name: str) -> bytes:
+    if not value or not _BASE64URL_PATTERN.fullmatch(value):
+        raise ValueError(f"{field_name} must be valid base64url")
+    if "=" in value[:-2]:
+        raise ValueError(f"{field_name} must be valid base64url")
+    try:
+        return base64.urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4))
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(f"{field_name} must be valid base64url") from exc
+
+
+def _validate_vapid_subject(value: str) -> None:
+    if (
+        value != value.strip()
+        or not value
+        or len(value) > 2_048
+        or any(ord(character) < 33 for character in value)
+    ):
+        raise ValueError(
+            "WEB_PUSH_VAPID_SUBJECT must be a valid mailto or HTTPS URI"
+        )
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError(
+            "WEB_PUSH_VAPID_SUBJECT must be a valid mailto or HTTPS URI"
+        ) from exc
+    if parsed.scheme == "mailto":
+        if (
+            not parsed.path
+            or parsed.path.count("@") != 1
+            or parsed.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "WEB_PUSH_VAPID_SUBJECT must be a valid mailto or HTTPS URI"
+            )
+        return
+    if parsed.scheme == "https":
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                "WEB_PUSH_VAPID_SUBJECT must be a valid mailto or HTTPS URI"
+            ) from exc
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or port not in {None, 443}
+        ):
+            raise ValueError(
+                "WEB_PUSH_VAPID_SUBJECT must be a valid mailto or HTTPS URI"
+            )
+        return
+    raise ValueError("WEB_PUSH_VAPID_SUBJECT must be a valid mailto or HTTPS URI")
+
+
+def _validate_vapid_key_pair(public_value: str, private_value: str) -> None:
+    if len(public_value) > 256:
+        raise ValueError("WEB_PUSH_VAPID_PUBLIC_KEY must be an uncompressed P-256 key")
+    if len(private_value) > 4_096:
+        raise ValueError("WEB_PUSH_VAPID_PRIVATE_KEY must be a valid P-256 key")
+    public_bytes = _decode_base64url(
+        public_value,
+        field_name="WEB_PUSH_VAPID_PUBLIC_KEY",
+    )
+    if len(public_bytes) != 65 or public_bytes[0] != 4:
+        raise ValueError("WEB_PUSH_VAPID_PUBLIC_KEY must be an uncompressed P-256 key")
+    try:
+        vapid = Vapid02.from_string(private_value)
+        derived_public = vapid.public_key.public_bytes(
+            Encoding.X962,
+            PublicFormat.UncompressedPoint,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "WEB_PUSH_VAPID_PRIVATE_KEY must be a valid P-256 key"
+        ) from exc
+    if derived_public != public_bytes:
+        raise ValueError(
+            "WEB_PUSH_VAPID_PUBLIC_KEY and WEB_PUSH_VAPID_PRIVATE_KEY must match"
+        )
 
 
 def default_database_path() -> Path:
@@ -37,11 +133,34 @@ class Settings:
     deepseek_model: str = "deepseek-v4-flash"
     ai_timeout_seconds: float = 30.0
     ai_debug_output: bool = False
+    web_push_enabled: bool = False
+    web_push_vapid_public_key: str = ""
+    web_push_vapid_private_key: SecretStr = SecretStr("")
+    web_push_vapid_subject: str = ""
+    web_push_test_send_enabled: bool = False
+    web_push_timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
-        if self.app_origin.lower().startswith("https://") and not self.session_cookie_secure:
+        if (
+            self.app_origin.lower().startswith("https://")
+            and not self.session_cookie_secure
+        ):
             raise ValueError(
                 "AUTH_COOKIE_SECURE must be true when APP_ORIGIN uses HTTPS"
+            )
+        if self.web_push_test_send_enabled and not self.web_push_enabled:
+            raise ValueError("WEB_PUSH_TEST_SEND_ENABLED requires WEB_PUSH_ENABLED")
+        if self.web_push_enabled:
+            if not math.isfinite(self.web_push_timeout_seconds) or not (
+                0 < self.web_push_timeout_seconds <= 30
+            ):
+                raise ValueError(
+                    "WEB_PUSH_TIMEOUT_SECONDS must be greater than 0 and at most 30"
+                )
+            _validate_vapid_subject(self.web_push_vapid_subject)
+            _validate_vapid_key_pair(
+                self.web_push_vapid_public_key,
+                self.web_push_vapid_private_key.get_secret_value(),
             )
 
     @classmethod
@@ -116,4 +235,18 @@ class Settings:
             ).strip(),
             ai_timeout_seconds=float(read("AI_TIMEOUT_SECONDS", "30")),
             ai_debug_output=read_bool("AI_DEBUG_OUTPUT", "false"),
+            web_push_enabled=read_bool("WEB_PUSH_ENABLED", "false"),
+            web_push_vapid_public_key=read(
+                "WEB_PUSH_VAPID_PUBLIC_KEY"
+            ).strip(),
+            web_push_vapid_private_key=SecretStr(
+                read("WEB_PUSH_VAPID_PRIVATE_KEY").strip()
+            ),
+            web_push_vapid_subject=read("WEB_PUSH_VAPID_SUBJECT").strip(),
+            web_push_test_send_enabled=read_bool(
+                "WEB_PUSH_TEST_SEND_ENABLED", "false"
+            ),
+            web_push_timeout_seconds=float(
+                read("WEB_PUSH_TIMEOUT_SECONDS", "10")
+            ),
         )

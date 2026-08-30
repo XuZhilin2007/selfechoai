@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from fastapi.testclient import TestClient
 
 from app.auth import hash_invite_code
@@ -33,6 +36,34 @@ class FunctionAIService(AIService):
 
 TEST_INVITE_CODE = "workflow-test-invite"
 TEST_PASSWORD = "workflow test password"
+
+
+def base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+@pytest.fixture(scope="session")
+def vapid_key_pair() -> tuple[str, str]:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_value = private_key.public_key().public_bytes(
+        Encoding.X962,
+        PublicFormat.UncompressedPoint,
+    )
+    private_value = private_key.private_numbers().private_value.to_bytes(32, "big")
+    return base64url(public_value), base64url(private_value)
+
+
+@pytest.fixture(scope="session")
+def subscription_keys() -> dict[str, str]:
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    public_value = private_key.public_key().public_bytes(
+        Encoding.X962,
+        PublicFormat.UncompressedPoint,
+    )
+    return {
+        "p256dh": base64url(public_value),
+        "auth": base64url(b"synthetic-auth12"),
+    }
 
 
 @pytest.fixture

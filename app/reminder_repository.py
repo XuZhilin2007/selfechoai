@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from app.database import Database
 from app.repository import InvalidOperationError, NotFoundError
 from app.schemas import (
+    PushSubscriptionRecord,
+    PushSubscriptionStatus,
     ReminderCancelReason,
     ReminderCreationCandidate,
     ReminderRecord,
@@ -42,6 +44,22 @@ class ReminderRepository:
             cancelled_time=_optional_datetime(row["cancelled_time"]),
             cancel_reason=row["cancel_reason"],
             surfaced_time=_optional_datetime(row["surfaced_time"]),
+        )
+
+    @staticmethod
+    def _subscription_from_row(row: sqlite3.Row) -> PushSubscriptionRecord:
+        return PushSubscriptionRecord(
+            id=row["id"],
+            user_id=row["user_id"],
+            session_id=row["session_id"],
+            endpoint=row["endpoint"],
+            p256dh=row["p256dh"],
+            auth=row["auth"],
+            status=row["status"],
+            created_time=datetime.fromisoformat(row["created_time"]),
+            updated_time=datetime.fromisoformat(row["updated_time"]),
+            invalidated_time=_optional_datetime(row["invalidated_time"]),
+            last_error_code=row["last_error_code"],
         )
 
     def create_ai_reminder_if_absent(
@@ -513,3 +531,263 @@ class ReminderRepository:
             if cursor.rowcount != 1:
                 raise NotFoundError("item not found")
         return dismissed
+
+    def sync_push_subscription(
+        self,
+        *,
+        user_id: int,
+        session_id: int,
+        endpoint: str,
+        p256dh: str,
+        auth: str,
+    ) -> PushSubscriptionRecord:
+        """Idempotently bind one endpoint to the current user and session."""
+
+        endpoint_value = endpoint.strip()
+        p256dh_value = p256dh.strip()
+        auth_value = auth.strip()
+        if not endpoint_value or not p256dh_value or not auth_value:
+            raise ValueError("invalid push subscription")
+        now_value = serialize_utc_datetime(utc_now(), field_name="updated_time")
+
+        with self.database.transaction() as connection:
+            session = connection.execute(
+                """
+                SELECT 1 FROM user_sessions
+                WHERE id = ? AND user_id = ? AND revoked_time IS NULL
+                  AND expires_time > ?
+                """,
+                (session_id, user_id, now_value),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("session not found")
+            connection.execute(
+                """
+                UPDATE push_subscriptions
+                SET status = 'revoked', invalidated_time = ?, updated_time = ?,
+                    last_error_code = NULL
+                WHERE user_id = ? AND session_id = ? AND status = 'active'
+                  AND endpoint != ?
+                """,
+                (now_value, now_value, user_id, session_id, endpoint_value),
+            )
+            existing = connection.execute(
+                "SELECT id, user_id FROM push_subscriptions WHERE endpoint = ?",
+                (endpoint_value,),
+            ).fetchone()
+            if existing is not None and existing["user_id"] != user_id:
+                raise InvalidOperationError("push subscription is unavailable")
+            if existing is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO push_subscriptions (
+                        user_id, session_id, endpoint, p256dh, auth, status,
+                        created_time, updated_time
+                    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                    """,
+                    (
+                        user_id,
+                        session_id,
+                        endpoint_value,
+                        p256dh_value,
+                        auth_value,
+                        now_value,
+                        now_value,
+                    ),
+                )
+                subscription_id = cursor.lastrowid
+            else:
+                subscription_id = existing["id"]
+                connection.execute(
+                    """
+                    UPDATE push_subscriptions
+                    SET session_id = ?, p256dh = ?, auth = ?, status = 'active',
+                        updated_time = ?, invalidated_time = NULL,
+                        last_error_code = NULL
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (
+                        session_id,
+                        p256dh_value,
+                        auth_value,
+                        now_value,
+                        subscription_id,
+                        user_id,
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM push_subscriptions WHERE id = ? AND user_id = ?",
+                (subscription_id, user_id),
+            ).fetchone()
+        return self._subscription_from_row(row)
+
+    def list_active_push_subscriptions(
+        self,
+        user_id: int,
+        *,
+        as_of: datetime | None = None,
+    ) -> list[PushSubscriptionRecord]:
+        cutoff = serialize_utc_datetime(as_of or utc_now(), field_name="as_of")
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT subscriptions.*
+                FROM push_subscriptions AS subscriptions
+                JOIN user_sessions AS sessions
+                  ON sessions.id = subscriptions.session_id
+                 AND sessions.user_id = subscriptions.user_id
+                WHERE subscriptions.user_id = ?
+                  AND subscriptions.status = 'active'
+                  AND sessions.revoked_time IS NULL
+                  AND sessions.expires_time > ?
+                ORDER BY subscriptions.id
+                """,
+                (user_id, cutoff),
+            ).fetchall()
+        return [self._subscription_from_row(row) for row in rows]
+
+    def get_active_push_subscription_for_session(
+        self,
+        user_id: int,
+        session_id: int,
+        *,
+        as_of: datetime | None = None,
+    ) -> PushSubscriptionRecord:
+        cutoff = serialize_utc_datetime(as_of or utc_now(), field_name="as_of")
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT subscriptions.*
+                FROM push_subscriptions AS subscriptions
+                JOIN user_sessions AS sessions
+                  ON sessions.id = subscriptions.session_id
+                 AND sessions.user_id = subscriptions.user_id
+                WHERE subscriptions.user_id = ?
+                  AND subscriptions.session_id = ?
+                  AND subscriptions.status = 'active'
+                  AND sessions.revoked_time IS NULL
+                  AND sessions.expires_time > ?
+                ORDER BY subscriptions.updated_time DESC, subscriptions.id DESC
+                LIMIT 1
+                """,
+                (user_id, session_id, cutoff),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("active push subscription not found")
+        return self._subscription_from_row(row)
+
+    def revoke_push_subscription(
+        self,
+        subscription_id: int,
+        user_id: int,
+        session_id: int,
+    ) -> PushSubscriptionRecord:
+        now_value = serialize_utc_datetime(utc_now(), field_name="invalidated_time")
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE push_subscriptions
+                SET status = 'revoked', invalidated_time = ?, updated_time = ?
+                WHERE id = ? AND user_id = ? AND session_id = ?
+                  AND status = 'active'
+                """,
+                (now_value, now_value, subscription_id, user_id, session_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("push subscription not found")
+            row = connection.execute(
+                "SELECT * FROM push_subscriptions WHERE id = ? AND user_id = ?",
+                (subscription_id, user_id),
+            ).fetchone()
+        return self._subscription_from_row(row)
+
+    def revoke_current_session_push_subscription(
+        self,
+        user_id: int,
+        session_id: int,
+    ) -> PushSubscriptionRecord:
+        now_value = serialize_utc_datetime(utc_now(), field_name="invalidated_time")
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM push_subscriptions
+                WHERE user_id = ? AND session_id = ? AND status = 'active'
+                ORDER BY updated_time DESC, id DESC
+                LIMIT 1
+                """,
+                (user_id, session_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("active push subscription not found")
+            connection.execute(
+                """
+                UPDATE push_subscriptions
+                SET status = 'revoked', invalidated_time = ?, updated_time = ?
+                WHERE user_id = ? AND session_id = ? AND status = 'active'
+                """,
+                (now_value, now_value, user_id, session_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM push_subscriptions WHERE id = ? AND user_id = ?",
+                (row["id"], user_id),
+            ).fetchone()
+        return self._subscription_from_row(updated)
+
+    def get_push_subscription(
+        self,
+        subscription_id: int,
+        user_id: int,
+    ) -> PushSubscriptionRecord:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM push_subscriptions
+                WHERE id = ? AND user_id = ?
+                """,
+                (subscription_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("push subscription not found")
+        return self._subscription_from_row(row)
+
+    def set_push_subscription_status(
+        self,
+        subscription_id: int,
+        user_id: int,
+        *,
+        status: PushSubscriptionStatus,
+        last_error_code: str | None = None,
+    ) -> PushSubscriptionRecord:
+        if status == PushSubscriptionStatus.ACTIVE:
+            raise InvalidOperationError("reactivation requires a new subscription")
+        now_value = serialize_utc_datetime(utc_now(), field_name="invalidated_time")
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE push_subscriptions
+                SET status = ?, invalidated_time = ?, last_error_code = ?,
+                    updated_time = ?
+                WHERE id = ? AND user_id = ? AND status = 'active'
+                """,
+                (
+                    status.value,
+                    now_value,
+                    last_error_code[:100] if last_error_code else None,
+                    now_value,
+                    subscription_id,
+                    user_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                exists = connection.execute(
+                    "SELECT 1 FROM push_subscriptions WHERE id = ? AND user_id = ?",
+                    (subscription_id, user_id),
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("push subscription not found")
+                raise InvalidOperationError("push subscription is not active")
+            updated = connection.execute(
+                "SELECT * FROM push_subscriptions WHERE id = ? AND user_id = ?",
+                (subscription_id, user_id),
+            ).fetchone()
+        return self._subscription_from_row(updated)

@@ -59,6 +59,26 @@ class ReminderCancelReason(str, Enum):
     ITEM_TRASHED = "item_trashed"
 
 
+class PushSubscriptionStatus(str, Enum):
+    ACTIVE = "active"
+    INVALID = "invalid"
+    REVOKED = "revoked"
+
+
+class WebPushPayloadType(str, Enum):
+    REMINDER = "reminder"
+    TEST = "test"
+
+
+class WebPushOutcome(str, Enum):
+    ACCEPTED = "accepted"
+    SUBSCRIPTION_GONE = "subscription_gone"
+    AUTHENTICATION_ERROR = "authentication_error"
+    TRANSIENT_ERROR = "transient_error"
+    PROVIDER_ERROR = "provider_error"
+    CONFIGURATION_ERROR = "configuration_error"
+
+
 class UserStatus(str, Enum):
     ACTIVE = "active"
     DISABLED = "disabled"
@@ -170,6 +190,54 @@ class UserSessionRecord(StrictModel):
     user_agent: str | None
 
 
+class PushConfigurationPublic(StrictModel):
+    available: bool
+    vapid_public_key: str | None = None
+
+
+class PushSubscriptionKeys(StrictModel):
+    p256dh: SecretStr = Field(min_length=1, max_length=256)
+    auth: SecretStr = Field(min_length=1, max_length=128)
+
+
+class PushSubscriptionSyncRequest(StrictModel):
+    endpoint: SecretStr = Field(min_length=1, max_length=2_048)
+    keys: PushSubscriptionKeys
+
+
+class PushSubscriptionPublic(StrictModel):
+    id: int
+    status: PushSubscriptionStatus
+
+
+class WebPushPayload(StrictModel):
+    type: WebPushPayloadType
+    title: str = Field(min_length=1, max_length=64)
+    body: str = Field(min_length=1, max_length=160)
+    target_path: str = Field(min_length=1, max_length=200)
+
+    @field_validator("title", "body")
+    @classmethod
+    def notification_copy_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("notification copy must not be blank")
+        return normalized
+
+    @field_validator("target_path")
+    @classmethod
+    def target_path_must_be_internal(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized in {"/", "/capture", "/dashboard", "/account"}:
+            return normalized
+        raise ValueError("target path must be an internal SelfEcho route")
+
+
+class PushTestNotificationResponse(StrictModel):
+    outcome: WebPushOutcome
+    provider_status: int | None = None
+
+
 class CaptureRequest(StrictModel):
     original_text: str = Field(min_length=1, max_length=10_000)
     input_method: InputMethod = InputMethod.TEXT
@@ -225,6 +293,22 @@ class ReminderRecord(StrictModel):
     cancelled_time: datetime | None
     cancel_reason: ReminderCancelReason | None
     surfaced_time: datetime | None
+
+
+class PushSubscriptionRecord(StrictModel):
+    """Internal subscription model. Endpoint and keys are never public."""
+
+    id: int
+    user_id: int
+    session_id: int
+    endpoint: SecretStr
+    p256dh: SecretStr
+    auth: SecretStr
+    status: PushSubscriptionStatus
+    created_time: datetime
+    updated_time: datetime
+    invalidated_time: datetime | None
+    last_error_code: str | None
 
 
 class ReminderPublic(StrictModel):
