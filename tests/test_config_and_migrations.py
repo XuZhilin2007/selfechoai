@@ -138,6 +138,82 @@ def test_settings_load_authentication_environment(tmp_path: Path, monkeypatch):
     assert settings.session_cookie_secure is False
 
 
+def test_reminder_worker_settings_are_safe_by_default_and_load_from_env(
+    tmp_path: Path,
+    monkeypatch,
+):
+    empty_env = tmp_path / "empty.env"
+    empty_env.write_text("", encoding="utf-8")
+    for name in (
+        "REMINDER_WORKER_ENABLED",
+        "REMINDER_POLL_INTERVAL_SECONDS",
+        "REMINDER_BATCH_SIZE",
+        "REMINDER_SENDING_STALE_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    defaults = Settings.from_environment(env_file=empty_env)
+
+    assert defaults.reminder_worker_enabled is False
+    assert defaults.reminder_poll_interval_seconds == 30
+    assert defaults.reminder_batch_size == 100
+    assert defaults.reminder_sending_stale_seconds == 300
+
+    configured_env = tmp_path / "worker.env"
+    configured_env.write_text(
+        "\n".join(
+            [
+                "REMINDER_WORKER_ENABLED=true",
+                "REMINDER_POLL_INTERVAL_SECONDS=12.5",
+                "REMINDER_BATCH_SIZE=25",
+                "REMINDER_SENDING_STALE_SECONDS=600",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    configured = Settings.from_environment(env_file=configured_env)
+
+    assert configured.reminder_worker_enabled is True
+    assert configured.web_push_enabled is False
+    assert configured.reminder_poll_interval_seconds == 12.5
+    assert configured.reminder_batch_size == 25
+    assert configured.reminder_sending_stale_seconds == 600
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "reminder_poll_interval_seconds",
+            float("nan"),
+            "REMINDER_POLL_INTERVAL_SECONDS",
+        ),
+        ("reminder_poll_interval_seconds", 0, "REMINDER_POLL_INTERVAL_SECONDS"),
+        (
+            "reminder_poll_interval_seconds",
+            3_601,
+            "REMINDER_POLL_INTERVAL_SECONDS",
+        ),
+        ("reminder_batch_size", 0, "REMINDER_BATCH_SIZE"),
+        ("reminder_batch_size", 1_001, "REMINDER_BATCH_SIZE"),
+        ("reminder_sending_stale_seconds", 0, "REMINDER_SENDING_STALE_SECONDS"),
+        (
+            "reminder_sending_stale_seconds",
+            86_401,
+            "REMINDER_SENDING_STALE_SECONDS",
+        ),
+    ],
+)
+def test_reminder_worker_settings_are_positive_finite_and_bounded(
+    tmp_path: Path,
+    field: str,
+    value: float | int,
+    message: str,
+):
+    with pytest.raises(ValueError, match=message):
+        Settings(database_path=tmp_path / "invalid-worker.db", **{field: value})
+
+
 def test_https_origin_requires_secure_cookie(tmp_path: Path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text(

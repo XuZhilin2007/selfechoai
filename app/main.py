@@ -48,6 +48,10 @@ from app.services.ai import AIService, AIServiceError, create_ai_service
 from app.services.processing import InputProcessingService
 from app.services.push_security import PushEndpointPolicy
 from app.services.push_subscriptions import PushSubscriptionService
+from app.services.reminder_delivery import (
+    ReminderDeliveryService,
+    run_reminder_polling_worker,
+)
 from app.services.reminders import ReminderService
 from app.services.web_push import WebPushService
 
@@ -74,6 +78,11 @@ def create_app(
         settings,
         web_push_service,
         push_endpoint_policy,
+    )
+    reminder_delivery_service = ReminderDeliveryService(
+        reminder_repository,
+        web_push_service,
+        delivery_enabled=settings.web_push_enabled,
     )
     auth_service = AuthenticationService(
         auth_repository,
@@ -103,12 +112,29 @@ def create_app(
             )
             recovery_tasks.add(task)
             task.add_done_callback(recovery_tasks.discard)
-        yield
-        for task in list(recovery_tasks):
-            task.cancel()
-        if recovery_tasks:
-            await asyncio.gather(*recovery_tasks, return_exceptions=True)
-        web_push_service.requests_session.close()
+        reminder_worker_task: asyncio.Task[None] | None = None
+        if settings.reminder_worker_enabled:
+            reminder_worker_task = asyncio.create_task(
+                run_reminder_polling_worker(
+                    reminder_delivery_service,
+                    settings,
+                )
+            )
+        application.state.reminder_worker_task = reminder_worker_task
+        try:
+            yield
+        finally:
+            if reminder_worker_task is not None:
+                reminder_worker_task.cancel()
+                await asyncio.gather(
+                    reminder_worker_task,
+                    return_exceptions=True,
+                )
+            for task in list(recovery_tasks):
+                task.cancel()
+            if recovery_tasks:
+                await asyncio.gather(*recovery_tasks, return_exceptions=True)
+            web_push_service.requests_session.close()
 
     app = FastAPI(
         title="SelfEcho AI",
@@ -126,6 +152,7 @@ def create_app(
     app.state.push_endpoint_policy = push_endpoint_policy
     app.state.web_push_service = web_push_service
     app.state.push_subscription_service = push_subscription_service
+    app.state.reminder_delivery_service = reminder_delivery_service
     app.include_router(create_auth_router(auth_service, settings))
     require_current_user = create_current_user_dependency(auth_service, settings)
     require_csrf_current_user = create_current_user_dependency(

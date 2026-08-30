@@ -79,6 +79,14 @@ class WebPushOutcome(str, Enum):
     CONFIGURATION_ERROR = "configuration_error"
 
 
+class ReminderDeliveryStatus(str, Enum):
+    QUEUED = "queued"
+    SENDING = "sending"
+    SENT = "sent"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 class UserStatus(str, Enum):
     ACTIVE = "active"
     DISABLED = "disabled"
@@ -309,6 +317,19 @@ class PushSubscriptionRecord(StrictModel):
     updated_time: datetime
     invalidated_time: datetime | None
     last_error_code: str | None
+
+
+class ReminderDeliveryRecord(StrictModel):
+    """Internal durable ledger record for one subscription delivery attempt."""
+
+    id: int
+    user_id: int
+    reminder_id: int
+    subscription_id: int
+    status: ReminderDeliveryStatus
+    attempted_time: datetime | None
+    finished_time: datetime | None
+    provider_status: str | None
 
 
 class ReminderPublic(StrictModel):

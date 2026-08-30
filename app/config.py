@@ -139,6 +139,10 @@ class Settings:
     web_push_vapid_subject: str = ""
     web_push_test_send_enabled: bool = False
     web_push_timeout_seconds: float = 10.0
+    reminder_worker_enabled: bool = False
+    reminder_poll_interval_seconds: float = 30.0
+    reminder_batch_size: int = 100
+    reminder_sending_stale_seconds: int = 300
 
     def __post_init__(self) -> None:
         if (
@@ -161,6 +165,21 @@ class Settings:
             _validate_vapid_key_pair(
                 self.web_push_vapid_public_key,
                 self.web_push_vapid_private_key.get_secret_value(),
+            )
+        if not math.isfinite(self.reminder_poll_interval_seconds) or not (
+            0 < self.reminder_poll_interval_seconds <= 3_600
+        ):
+            raise ValueError(
+                "REMINDER_POLL_INTERVAL_SECONDS must be greater than 0 "
+                "and at most 3600"
+            )
+        if not 1 <= self.reminder_batch_size <= 1_000:
+            raise ValueError(
+                "REMINDER_BATCH_SIZE must be between 1 and 1000"
+            )
+        if not 1 <= self.reminder_sending_stale_seconds <= 86_400:
+            raise ValueError(
+                "REMINDER_SENDING_STALE_SECONDS must be between 1 and 86400"
             )
 
     @classmethod
@@ -248,5 +267,15 @@ class Settings:
             ),
             web_push_timeout_seconds=float(
                 read("WEB_PUSH_TIMEOUT_SECONDS", "10")
+            ),
+            reminder_worker_enabled=read_bool(
+                "REMINDER_WORKER_ENABLED", "false"
+            ),
+            reminder_poll_interval_seconds=float(
+                read("REMINDER_POLL_INTERVAL_SECONDS", "30")
+            ),
+            reminder_batch_size=int(read("REMINDER_BATCH_SIZE", "100")),
+            reminder_sending_stale_seconds=int(
+                read("REMINDER_SENDING_STALE_SECONDS", "300")
             ),
         )
