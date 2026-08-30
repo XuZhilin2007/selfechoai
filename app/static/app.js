@@ -198,14 +198,14 @@ function detailRefreshBlocked() {
   const editorHasFocus =
     activeControl instanceof HTMLElement &&
     activeControl.matches(
-      "#update-form textarea, #edit-form input, #edit-form textarea, #edit-form select",
+      "#update-form textarea, #edit-form input, #edit-form textarea, #edit-form select, #reminder-form input",
     );
   const dirtyForm = document.querySelector(
-    '#update-form[data-dirty="true"], #edit-form[data-dirty="true"]',
+    '#update-form[data-dirty="true"], #edit-form[data-dirty="true"], #reminder-form[data-dirty="true"]',
   );
   const modalOpen = document.querySelector(
     "#trash-confirm-dialog[open], #edit-dialog[open]",
-  );
+  ) || document.querySelector("#reminder-dialog[open]");
   return editorHasFocus || Boolean(dirtyForm) || Boolean(modalOpen);
 }
 
@@ -243,6 +243,96 @@ function formatTime(value) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function profileTimezone() {
+  return authentication.user?.timezone || "UTC";
+}
+
+function zonedParts(value, timezoneName = profileTimezone()) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezoneName,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  return Object.fromEntries(
+    formatter
+      .formatToParts(new Date(value))
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+}
+
+function profileToday() {
+  const parts = zonedParts(new Date());
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function addProfileDays(days) {
+  const [year, month, day] = profileToday().split("-").map(Number);
+  const target = new Date(Date.UTC(year, month - 1, day + days, 12));
+  return `${target.getUTCFullYear()}-${String(target.getUTCMonth() + 1).padStart(2, "0")}-${String(target.getUTCDate()).padStart(2, "0")}`;
+}
+
+function localDateDistance(localDate) {
+  const [todayYear, todayMonth, todayDay] = profileToday().split("-").map(Number);
+  const [year, month, day] = localDate.split("-").map(Number);
+  return Math.round(
+    (Date.UTC(year, month - 1, day) - Date.UTC(todayYear, todayMonth - 1, todayDay)) /
+      86_400_000,
+  );
+}
+
+function chineseClock(hourText, minuteText) {
+  const hour = Number(hourText);
+  const period = hour < 6 ? "凌晨" : hour < 12 ? "上午" : hour < 18 ? "下午" : "晚上";
+  const displayHour = hour % 12 || 12;
+  return `${period}${displayHour}:${minuteText}`;
+}
+
+function reminderExactTime(remindAt) {
+  if (!remindAt) return "尚未设置具体时间";
+  const parts = zonedParts(remindAt);
+  return `${Number(parts.month)} 月 ${Number(parts.day)} 日 ${parts.hour}:${parts.minute}`;
+}
+
+function reminderNaturalText(reminder) {
+  if (!reminder?.remind_at) return "还需要选择一个具体时间";
+  const target = new Date(reminder.remind_at);
+  const difference = target.getTime() - Date.now();
+  if (reminder.status === "due" || difference <= 0) {
+    const minutes = Math.floor(Math.abs(difference) / 60_000);
+    return minutes < 1 ? "刚刚到了提醒时间" : `${minutes} 分钟前已到提醒时间`;
+  }
+  const minutes = Math.ceil(difference / 60_000);
+  if (minutes < 60) return `${minutes} 分钟后会微提醒你`;
+  if (minutes < 360) return `${Math.ceil(minutes / 60)} 小时后会微提醒你`;
+  const parts = zonedParts(reminder.remind_at);
+  const localDate = `${parts.year}-${parts.month}-${parts.day}`;
+  const distance = localDateDistance(localDate);
+  const dayLabel = distance === 0
+    ? "今天"
+    : distance === 1
+      ? "明天"
+      : distance === 2
+        ? "后天"
+        : distance === 3
+          ? "大后天"
+          : `${Number(parts.month)} 月 ${Number(parts.day)} 日`;
+  return `${dayLabel}${chineseClock(parts.hour, parts.minute)}会微提醒你`;
+}
+
+function reminderCardText(reminder) {
+  if (!reminder || reminder.status === "cancelled") return null;
+  if (reminder.status === "needs_confirmation") return "🔔 待设置时间";
+  if (reminder.status === "due") {
+    return reminder.surfaced_time ? null : "🔔 已到提醒时间";
+  }
+  return `🔔 ${reminderNaturalText(reminder).replace("会微提醒你", "")}`;
 }
 
 function tag(label, value) {
@@ -308,6 +398,8 @@ function itemCard(item) {
     metadata.push(deadline.text);
   }
   if (item.estimated_time) metadata.push(`约 ${item.estimated_time} 分钟`);
+  const reminderText = reminderCardText(item.reminder);
+  if (reminderText) metadata.push(reminderText);
   return `
     <a class="item-card" href="/items/${item.id}" data-link>
       <h3>${escapeHtml(item.title)}</h3>
@@ -335,12 +427,176 @@ function quickPriorityButtons(item, field) {
 }
 
 function quickConfirmationCard(item) {
+  const reminderChoice = item.reminder?.status === "needs_confirmation"
+    ? `
+        <div class="quick-reminder-choice reminder-needs-confirmation">
+          <span>你想之后被提醒，但还没有确定时间。</span>
+          ${item.reminder.source_expression ? `<small>原话里的时间：${escapeHtml(item.reminder.source_expression)}</small>` : ""}
+          <div>
+            <button class="secondary-button reminder-decline-button" type="button" data-item-id="${item.id}">暂时不用提醒</button>
+            <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置时间</button>
+          </div>
+        </div>`
+    : item.show_reminder_prompt
+      ? `
+        <div class="quick-reminder-choice">
+          <span>需要提醒吗？</span>
+          <div>
+            <button class="secondary-button reminder-dismiss-button" type="button" data-item-id="${item.id}">不用</button>
+            <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置提醒</button>
+          </div>
+        </div>`
+      : "";
   return `
     <article class="quick-confirmation-card">
       <h3>${escapeHtml(item.title)}</h3>
       ${item.importance === "unknown" ? quickPriorityButtons(item, "importance") : ""}
       ${item.urgency === "unknown" ? quickPriorityButtons(item, "urgency") : ""}
+      ${reminderChoice}
     </article>`;
+}
+
+function selectedReminderText(localDate, localTime) {
+  const distance = localDateDistance(localDate);
+  const [year, month, day] = localDate.split("-").map(Number);
+  const [hour, minute] = localTime.split(":");
+  const dateLabel = distance === 0
+    ? "今天"
+    : distance === 1
+      ? "明天"
+      : distance === 2
+        ? "后天"
+        : distance === 3
+          ? "大后天"
+          : `${year} 年 ${month} 月 ${day} 日`;
+  return `将在${dateLabel}${chineseClock(hour, minute)}微提醒你`;
+}
+
+function openReminderEditor({ item, reminder = null, onSaved }) {
+  document.querySelector("#reminder-dialog")?.remove();
+  const isActiveReminder = reminder && ["needs_confirmation", "scheduled"].includes(reminder.status);
+  const existingParts = reminder?.remind_at ? zonedParts(reminder.remind_at) : null;
+  let selectedDate = existingParts
+    ? `${existingParts.year}-${existingParts.month}-${existingParts.day}`
+    : addProfileDays(1);
+  let selectedTime = existingParts
+    ? `${existingParts.hour}:${existingParts.minute}`
+    : authentication.user.default_reminder_time;
+  let usingDefaultTime = !existingParts;
+
+  appElement.insertAdjacentHTML("beforeend", `
+    <dialog id="reminder-dialog" class="reminder-dialog" aria-labelledby="reminder-dialog-title">
+      <form id="reminder-form" class="reminder-surface">
+        <header class="reminder-dialog-header">
+          <div><p class="eyebrow">微提醒</p><h2 id="reminder-dialog-title">${isActiveReminder ? "修改提醒时间" : "什么时候再想起它？"}</h2></div>
+          <button class="reminder-close-button" type="button" aria-label="关闭提醒设置">×</button>
+        </header>
+        <p class="reminder-item-title">${escapeHtml(item.title)}</p>
+        <div class="reminder-date-options" role="group" aria-label="快速选择日期">
+          <button type="button" data-days="1">明天</button>
+          <button type="button" data-days="2">后天</button>
+          <button type="button" data-days="3">大后天</button>
+          <button type="button" id="reminder-custom-date-button">选日期</button>
+        </div>
+        <div id="reminder-date-field" class="reminder-date-field" hidden>
+          <label for="reminder-date">选择日期</label>
+          <input id="reminder-date" type="date" min="${profileToday()}" value="${selectedDate}" required />
+          <p class="form-hint">今天是 ${formatDate(profileToday())}；过去日期不可选择。</p>
+        </div>
+        <div class="reminder-time-summary">
+          <p id="reminder-selection-summary"></p>
+          <button id="reminder-change-time" class="secondary-button quiet-button" type="button">改时间</button>
+        </div>
+        <div id="reminder-time-field" class="reminder-time-field" hidden>
+          <label for="reminder-time">具体时间</label>
+          <input id="reminder-time" type="time" value="${selectedTime}" required />
+          <p class="form-hint">未主动修改时使用账户默认时间 ${escapeHtml(authentication.user.default_reminder_time)}。</p>
+        </div>
+        <p id="reminder-form-status" class="status-message" role="status"></p>
+        <div class="reminder-dialog-actions">
+          <button class="secondary-button reminder-cancel-button" type="button">暂不设置</button>
+          <button class="primary-button" type="submit">保存提醒</button>
+        </div>
+      </form>
+    </dialog>`);
+
+  const dialog = document.querySelector("#reminder-dialog");
+  const form = document.querySelector("#reminder-form");
+  const dateInput = document.querySelector("#reminder-date");
+  const timeInput = document.querySelector("#reminder-time");
+  const dateField = document.querySelector("#reminder-date-field");
+  const timeField = document.querySelector("#reminder-time-field");
+  const status = document.querySelector("#reminder-form-status");
+  const submit = form.querySelector("button[type='submit']");
+  const renderSelection = () => {
+    document.querySelector("#reminder-selection-summary").textContent = selectedReminderText(selectedDate, selectedTime);
+    form.querySelectorAll("[data-days]").forEach((button) => {
+      button.dataset.selected = String(addProfileDays(Number(button.dataset.days)) === selectedDate);
+    });
+  };
+  const close = () => {
+    if (typeof dialog.close === "function") dialog.close();
+    else dialog.remove();
+  };
+  form.querySelectorAll("[data-days]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectedDate = addProfileDays(Number(button.dataset.days));
+      dateInput.value = selectedDate;
+      dateField.hidden = true;
+      form.dataset.dirty = "true";
+      renderSelection();
+    });
+  });
+  document.querySelector("#reminder-custom-date-button").addEventListener("click", () => {
+    dateField.hidden = false;
+    dateInput.focus();
+  });
+  dateInput.addEventListener("change", () => {
+    if (!dateInput.value) return;
+    selectedDate = dateInput.value;
+    form.dataset.dirty = "true";
+    renderSelection();
+  });
+  document.querySelector("#reminder-change-time").addEventListener("click", () => {
+    timeField.hidden = false;
+    timeInput.focus();
+  });
+  timeInput.addEventListener("change", () => {
+    selectedTime = timeInput.value;
+    usingDefaultTime = false;
+    form.dataset.dirty = "true";
+    renderSelection();
+  });
+  [document.querySelector(".reminder-close-button"), document.querySelector(".reminder-cancel-button")]
+    .forEach((button) => button.addEventListener("click", close));
+  dialog.addEventListener("close", () => dialog.remove(), { once: true });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    status.dataset.kind = "";
+    status.textContent = "正在保存提醒…";
+    const payload = { local_date: selectedDate };
+    if (!usingDefaultTime || isActiveReminder) payload.local_time = selectedTime;
+    try {
+      const saved = await api(
+        isActiveReminder ? `/api/reminders/${reminder.id}` : `/api/items/${item.id}/reminder`,
+        {
+          method: isActiveReminder ? "PUT" : "POST",
+          body: JSON.stringify(payload),
+        },
+      );
+      close();
+      await onSaved(saved);
+    } catch (error) {
+      status.dataset.kind = "error";
+      status.textContent = `提醒未保存：${error.message}`;
+      submit.disabled = false;
+    }
+  });
+  renderSelection();
+  form.dataset.dirty = "false";
+  if (typeof dialog.showModal === "function") dialog.showModal();
+  else dialog.setAttribute("open", "");
 }
 
 function renderLoading() {
@@ -539,6 +795,15 @@ function renderAccount() {
         <div><dt>显示名称</dt><dd>${escapeHtml(user.display_name)}</dd></div>
         <div><dt>时区</dt><dd>${escapeHtml(user.timezone)}</dd></div>
       </dl>
+      <form id="reminder-settings-form" class="reminder-settings-form">
+        <div>
+          <label for="default-reminder-time">无具体时间时默认提醒</label>
+          <p class="form-hint">按 ${escapeHtml(user.timezone)} 的本地时间解释。</p>
+        </div>
+        <input id="default-reminder-time" type="time" value="${escapeHtml(user.default_reminder_time)}" required />
+        <button class="secondary-button" type="submit">保存默认时间</button>
+        <p id="reminder-settings-status" class="status-message" role="status"></p>
+      </form>
       <div class="account-actions">
         <p id="logout-status" class="status-message" role="alert"></p>
         <button id="logout-button" class="secondary-button" type="button">退出登录</button>
@@ -547,6 +812,30 @@ function renderAccount() {
 
   const button = document.querySelector("#logout-button");
   const status = document.querySelector("#logout-status");
+  const reminderSettingsForm = document.querySelector("#reminder-settings-form");
+  const reminderSettingsStatus = document.querySelector("#reminder-settings-status");
+  reminderSettingsForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = reminderSettingsForm.querySelector("button[type='submit']");
+    const defaultTime = document.querySelector("#default-reminder-time").value;
+    submit.disabled = true;
+    reminderSettingsStatus.dataset.kind = "";
+    reminderSettingsStatus.textContent = "正在保存默认时间…";
+    try {
+      const settings = await api("/api/reminder-settings", {
+        method: "PATCH",
+        body: JSON.stringify({ default_reminder_time: defaultTime }),
+      });
+      authentication.user.default_reminder_time = settings.default_reminder_time;
+      reminderSettingsStatus.dataset.kind = "success";
+      reminderSettingsStatus.textContent = `已保存：${settings.default_reminder_time}`;
+    } catch (error) {
+      reminderSettingsStatus.dataset.kind = "error";
+      reminderSettingsStatus.textContent = `默认时间未保存：${error.message}`;
+    } finally {
+      submit.disabled = false;
+    }
+  });
   button.addEventListener("click", async () => {
     button.disabled = true;
     status.dataset.kind = "";
@@ -651,6 +940,7 @@ function renderCapture() {
       <section class="page-heading capture-heading">
         <h1>先记下来</h1>
       </section>
+      <div id="capture-micro-reminders"></div>
       <section class="panel capture-panel">
         <form id="capture-form">
           <label class="visually-hidden" for="capture-text">记录内容</label>
@@ -676,6 +966,7 @@ function renderCapture() {
   const status = document.querySelector("#capture-status");
   const button = form.querySelector("button");
   const quickSection = document.querySelector("#quick-confirmation-section");
+  const captureReminders = document.querySelector("#capture-micro-reminders");
   const quickList = document.querySelector("#quick-confirmation-list");
   const quickCount = document.querySelector("#quick-confirmation-count");
   const quickStatus = document.querySelector("#quick-confirmation-status");
@@ -686,7 +977,8 @@ function renderCapture() {
 
   function renderQuickConfirmation() {
     const items = quickItems.filter(
-      (item) => item.importance === "unknown" || item.urgency === "unknown",
+      (item) => item.importance === "unknown" || item.urgency === "unknown" ||
+        item.show_reminder_prompt || item.reminder?.status === "needs_confirmation",
     );
     quickSection.hidden = items.length === 0;
     quickCount.textContent = items.length;
@@ -699,7 +991,9 @@ function renderCapture() {
     try {
       const data = await api("/api/items");
       if (!quickSection.isConnected) return;
-      quickItems = data.needs_confirmation;
+      captureReminders.innerHTML = inAppReminderList(data.due_reminders);
+      markRenderedRemindersSurfaced(data.due_reminders);
+      quickItems = [...data.sortable_items, ...data.needs_confirmation];
       renderQuickConfirmation();
       if (data.pending_inputs.length) {
         pollTimer = window.setTimeout(loadQuickConfirmation, 2500);
@@ -710,6 +1004,53 @@ function renderCapture() {
   }
 
   quickList.addEventListener("click", async (event) => {
+    const reminderChoice = event.target.closest(
+      ".reminder-decline-button, .reminder-dismiss-button, .reminder-set-button",
+    );
+    if (reminderChoice) {
+      const item = quickItems.find(
+        (candidate) => candidate.id === Number(reminderChoice.dataset.itemId),
+      );
+      if (!item) return;
+      if (reminderChoice.classList.contains("reminder-set-button")) {
+        openReminderEditor({
+          item,
+          reminder: item.reminder,
+          onSaved: async (saved) => {
+            item.reminder = saved;
+            item.show_reminder_prompt = false;
+            quickStatus.dataset.kind = "success";
+            quickStatus.textContent = "微提醒已设置。";
+            renderQuickConfirmation();
+          },
+        });
+        return;
+      }
+      reminderChoice.disabled = true;
+      quickStatus.dataset.kind = "";
+      quickStatus.textContent = "正在保存选择…";
+      try {
+        if (reminderChoice.classList.contains("reminder-decline-button")) {
+          item.reminder = await api(`/api/reminders/${item.reminder.id}`, {
+            method: "DELETE",
+          });
+          quickStatus.textContent = "已记住：暂时不用提醒。";
+        } else {
+          await api(`/api/items/${item.id}/reminder-prompt/dismiss`, {
+            method: "POST",
+          });
+          item.show_reminder_prompt = false;
+          quickStatus.textContent = "已记住：这次不用提醒。";
+        }
+        quickStatus.dataset.kind = "success";
+        renderQuickConfirmation();
+      } catch (error) {
+        quickStatus.dataset.kind = "error";
+        quickStatus.textContent = `选择未保存：${error.message}`;
+        reminderChoice.disabled = false;
+      }
+      return;
+    }
     const choice = event.target.closest(".priority-choice-button");
     if (!choice) return;
     const item = quickItems.find(
@@ -798,6 +1139,31 @@ function inputStatusCard(input, failed = false) {
     </article>`;
 }
 
+function inAppReminderList(reminders) {
+  if (!reminders.length) return "";
+  return `
+    <section class="micro-reminder-section" aria-label="到了时间的微提醒">
+      ${reminders.map((reminder) => `
+        <article class="micro-reminder" data-reminder-id="${reminder.id}">
+          <p>提醒一下：你之前希望现在记起这件事：</p>
+          <a href="/items/${reminder.item_id}" data-link>${escapeHtml(reminder.item_title)}</a>
+          <span>${escapeHtml(reminderExactTime(reminder.remind_at))}</span>
+        </article>`).join("")}
+    </section>`;
+}
+
+function markRenderedRemindersSurfaced(reminders) {
+  const rendered = reminders.filter((reminder) =>
+    document.querySelector(`.micro-reminder[data-reminder-id="${reminder.id}"]`),
+  );
+  if (!rendered.length) return;
+  void Promise.allSettled(
+    rendered.map((reminder) =>
+      api(`/api/reminders/${reminder.id}/surface`, { method: "POST" }),
+    ),
+  );
+}
+
 async function renderDashboard({ silent = false } = {}) {
   if (!silent) {
     appElement.innerHTML = '<p class="loading">正在读取事项…</p>';
@@ -816,6 +1182,8 @@ async function renderDashboard({ silent = false } = {}) {
           <span class="dashboard-total" aria-label="${visibleCount} 个事项">${visibleCount}</span>
         </div>
       </section>
+
+      ${selectedStatus === "active" ? inAppReminderList(data.due_reminders) : ""}
 
       ${lifecycleNavigation(selectedStatus)}
 
@@ -845,6 +1213,10 @@ async function renderDashboard({ silent = false } = {}) {
         </section>`}
 
       ${selectedStatus === "active" && activeCount === 0 && data.pending_inputs.length === 0 && data.failed_inputs.length === 0 ? `<div class="empty-state compact-empty-state section">${escapeHtml(view.empty)} <a href="/capture" data-link>去记录一条想法</a></div>` : ""}`;
+
+    if (selectedStatus === "active") {
+      markRenderedRemindersSurfaced(data.due_reminders);
+    }
 
     document.querySelectorAll(".retry-button").forEach((button) => {
       button.addEventListener("click", async () => {
@@ -1016,6 +1388,51 @@ function confirmTrashMove() {
   });
 }
 
+function reminderDetailSection(item, reminder) {
+  let body;
+  let actions = "";
+  if (!reminder) {
+    body = '<p class="muted">还没有设置微提醒。需要时再打开即可。</p>';
+    if (item.status === "active") {
+      actions = '<button class="secondary-button reminder-set-detail-button" type="button">设置提醒</button>';
+    }
+  } else if (reminder.status === "scheduled") {
+    body = `
+      <p class="reminder-natural">${escapeHtml(reminderNaturalText(reminder))}</p>
+      <p class="reminder-exact">${escapeHtml(reminderExactTime(reminder.remind_at))}</p>`;
+    actions = `
+      <button class="secondary-button reminder-set-detail-button" type="button">修改时间</button>
+      <button class="text-button reminder-cancel-detail-button" type="button">关闭提醒</button>`;
+  } else if (reminder.status === "needs_confirmation") {
+    body = `
+      <p class="reminder-natural">你想之后被提醒，但还没有一个可以安全执行的时间。</p>
+      ${reminder.source_expression ? `<p class="reminder-exact">原话里的时间：${escapeHtml(reminder.source_expression)}</p>` : ""}`;
+    actions = `
+      <button class="secondary-button reminder-set-detail-button" type="button">设置时间</button>
+      <button class="text-button reminder-cancel-detail-button" type="button">关闭提醒</button>`;
+  } else if (reminder.status === "due") {
+    body = `
+      <p class="reminder-natural">${escapeHtml(reminderNaturalText(reminder))}</p>
+      <p class="reminder-exact">${escapeHtml(reminderExactTime(reminder.remind_at))}</p>
+      <p class="muted">这只表示 SelfEcho 已把它重新带回视野。</p>`;
+    if (item.status === "active") {
+      actions = '<button class="secondary-button reminder-set-detail-button" type="button">再次设置提醒</button>';
+    }
+  } else {
+    body = '<p class="muted">这个微提醒已关闭；记录仍保留。</p>';
+    if (item.status === "active") {
+      actions = '<button class="secondary-button reminder-set-detail-button" type="button">重新设置提醒</button>';
+    }
+  }
+  return `
+    <section class="detail-block reminder-detail-block" data-reminder-status="${escapeHtml(reminder?.status || "off")}">
+      <h2>微提醒</h2>
+      ${body}
+      ${actions ? `<div class="detail-actions reminder-detail-actions">${actions}</div>` : ""}
+      <p id="reminder-action-status" class="status-message" role="status"></p>
+    </section>`;
+}
+
 async function renderDetail(
   itemId,
   { silent = false, actionMessage = "", automatic = false } = {},
@@ -1078,6 +1495,8 @@ async function renderDetail(
               ${renderExtraInformation(item.extra_information)}
             </div>` : ""}
         </section>
+
+        ${reminderDetailSection(item, data.reminder)}
 
         <section class="detail-block lifecycle-block">
           <h2>事项状态</h2>
@@ -1151,6 +1570,7 @@ async function renderDetail(
     const editMessage = document.querySelector("#edit-status-message");
     const actionStatus = document.querySelector("#item-action-status");
     const reprocessStatus = document.querySelector("#reprocess-status");
+    const reminderActionStatus = document.querySelector("#reminder-action-status");
 
     const closeEditor = () => {
       if (typeof editDialog.close === "function") editDialog.close("cancel");
@@ -1290,6 +1710,44 @@ async function renderDetail(
         }
       });
     });
+
+    const reminderSetButton = document.querySelector(".reminder-set-detail-button");
+    if (reminderSetButton) {
+      reminderSetButton.addEventListener("click", () => {
+        openReminderEditor({
+          item,
+          reminder: data.reminder,
+          onSaved: async () => {
+            await renderDetail(itemId, { silent: true });
+          },
+        });
+      });
+    }
+    const reminderCancelButton = document.querySelector(".reminder-cancel-detail-button");
+    if (reminderCancelButton) {
+      reminderCancelButton.addEventListener("click", async () => {
+        reminderCancelButton.disabled = true;
+        reminderActionStatus.textContent = "正在关闭提醒…";
+        try {
+          await api(`/api/reminders/${data.reminder.id}`, { method: "DELETE" });
+          await renderDetail(itemId, { silent: true });
+        } catch (error) {
+          reminderActionStatus.dataset.kind = "error";
+          reminderActionStatus.textContent = `提醒未关闭：${error.message}`;
+          reminderCancelButton.disabled = false;
+        }
+      });
+    }
+    if (data.reminder?.status === "due" && !data.reminder.surfaced_time) {
+      const reminderWasRendered = document.querySelector(
+        '.reminder-detail-block[data-reminder-status="due"]',
+      );
+      if (reminderWasRendered) {
+        void api(`/api/reminders/${data.reminder.id}/surface`, { method: "POST" }).catch(
+          () => {},
+        );
+      }
+    }
 
     if (actionMessage) {
       reprocessStatus.dataset.kind = "success";

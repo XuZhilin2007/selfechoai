@@ -174,6 +174,30 @@ Use JSON null for an optional value that is not supported by the user's text.
 Do not use empty strings, "unknown", "待定", or other placeholder text for
 optional date, duration, action, or context fields. Return JSON only.
 
+Return one provider-independent top-level reminder candidate in addition to
+fields and evidence_fields:
+- reminder.intent is true only when the latest user text explicitly asks
+  SelfEcho to remind, call, or alert the user;
+- a date, deadline, class, exam, or other time fact alone is not reminder
+  intent;
+- reminder.temporal_expression is the smallest exact time phrase from the
+  user's text, such as "30分钟后", "明天下午3点", or "10月14日";
+- when reminder intent is explicit but the time is absent or ambiguous, keep
+  intent true and preserve the supplied ambiguous phrase when possible;
+- when intent is false, use temporal_expression null.
+Never calculate remind_at, convert timezones, or replace an ambiguous phrase
+with a guessed time. Deterministic application code performs that work.
+
+Examples:
+- "明天提醒我买鞋" -> {"intent": true,
+  "temporal_expression": "明天"}
+- "30分钟后叫我继续学习" -> {"intent": true,
+  "temporal_expression": "30分钟后"}
+- "比赛10月15日截止" -> {"intent": false,
+  "temporal_expression": null}
+- "过几天提醒我问学长" -> {"intent": true,
+  "temporal_expression": "过几天"}
+
 The request includes current_local_date, calculated by the application at
 runtime. Ground all dates against it:
 1. Preserve an explicit year supplied by the user.

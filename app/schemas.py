@@ -6,7 +6,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from app.time_utils import validate_timezone_name
+from app.time_utils import (
+    normalize_utc_datetime,
+    validate_default_reminder_time,
+    validate_timezone_name,
+)
 
 
 class PriorityLevel(str, Enum):
@@ -223,6 +227,25 @@ class ReminderRecord(StrictModel):
     surfaced_time: datetime | None
 
 
+class ReminderPublic(StrictModel):
+    id: int
+    item_id: int
+    source_expression: str | None
+    scheduled_timezone: str
+    remind_at: datetime | None
+    status: ReminderStatus
+    created_time: datetime
+    updated_time: datetime
+    due_time: datetime | None
+    cancelled_time: datetime | None
+    cancel_reason: ReminderCancelReason | None
+    surfaced_time: datetime | None
+
+
+class ReminderWithItemPublic(ReminderPublic):
+    item_title: str
+
+
 class DashboardItem(StrictModel):
     id: int
     title: str
@@ -231,6 +254,8 @@ class DashboardItem(StrictModel):
     deadline: Deadline | None
     estimated_time: int | None
     priority_score: float | None = None
+    reminder: ReminderPublic | None = None
+    show_reminder_prompt: bool = False
 
 
 class DashboardResponse(StrictModel):
@@ -238,11 +263,48 @@ class DashboardResponse(StrictModel):
     needs_confirmation: list[DashboardItem]
     pending_inputs: list[ItemInputPublic]
     failed_inputs: list[ItemInputPublic]
+    due_reminders: list[ReminderWithItemPublic] = Field(default_factory=list)
 
 
 class ItemDetailResponse(StrictModel):
     item: PersonalItemPublic
     inputs: list[ItemInputPublic]
+    reminder: ReminderPublic | None = None
+    show_reminder_prompt: bool = False
+
+
+class ReminderScheduleRequest(StrictModel):
+    local_date: date
+    local_time: str | None = None
+
+    @field_validator("local_time")
+    @classmethod
+    def reminder_time_must_be_valid(cls, value: str | None) -> str | None:
+        return validate_default_reminder_time(value) if value is not None else None
+
+
+class ItemReminderResponse(StrictModel):
+    reminder: ReminderPublic | None
+    show_reminder_prompt: bool
+
+
+class ReminderPromptResponse(StrictModel):
+    dismissed_time: datetime
+    show_reminder_prompt: bool = False
+
+
+class ReminderSettingsPublic(StrictModel):
+    timezone: str
+    default_reminder_time: str
+
+
+class ReminderSettingsPatch(StrictModel):
+    default_reminder_time: str
+
+    @field_validator("default_reminder_time")
+    @classmethod
+    def default_time_must_be_valid(cls, value: str) -> str:
+        return validate_default_reminder_time(value)
 
 
 class UserItemPatch(StrictModel):
@@ -287,9 +349,62 @@ class AIItemFields(StrictModel):
     extra_information: dict[str, Any] | None = None
 
 
+class AIReminderCandidate(StrictModel):
+    """Provider-independent reminder intent extracted from the latest input."""
+
+    intent: bool = Field(default=False, strict=True)
+    temporal_expression: str | None = Field(default=None, max_length=200)
+
+    @field_validator("temporal_expression")
+    @classmethod
+    def temporal_expression_must_not_be_blank(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        expression = value.strip()
+        return expression or None
+
+
+class ReminderCreationCandidate(StrictModel):
+    """Validated persistence command produced by deterministic parsing."""
+
+    source_expression: str | None = Field(default=None, max_length=200)
+    scheduled_timezone: str = Field(min_length=1, max_length=100)
+    remind_at: datetime | None = None
+
+    @field_validator("source_expression")
+    @classmethod
+    def source_expression_must_not_be_blank(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        expression = value.strip()
+        return expression or None
+
+    @field_validator("scheduled_timezone")
+    @classmethod
+    def scheduled_timezone_must_be_valid(cls, value: str) -> str:
+        return validate_timezone_name(value)
+
+    @field_validator("remind_at")
+    @classmethod
+    def remind_at_must_be_canonical_utc(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, field_name="remind_at")
+
+
 class AIExtraction(StrictModel):
     fields: AIItemFields
     evidence_fields: set[ImportantField] = Field(default_factory=set)
+    reminder: AIReminderCandidate = Field(default_factory=AIReminderCandidate)
 
 
 class MessageResponse(StrictModel):

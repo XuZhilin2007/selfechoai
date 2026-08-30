@@ -63,7 +63,11 @@ Example for creating an item:
     "next_action": null,
     "extra_information": null
   }},
-  "evidence_fields": []
+  "evidence_fields": [],
+  "reminder": {{
+    "intent": false,
+    "temporal_expression": null
+  }}
 }}
 
 Context-preserving decision example for latest_user_text
@@ -407,6 +411,7 @@ class DeepSeekProvider(AIService):
             current_local_date=current_local_date,
             is_update=is_update,
         )
+        self._normalize_reminder_candidate(decoded_output)
 
         try:
             extraction = AIExtraction.model_validate(decoded_output)
@@ -441,6 +446,25 @@ class DeepSeekProvider(AIService):
                 output_text,
             )
         return extraction
+
+    @staticmethod
+    def _normalize_reminder_candidate(decoded_output: Any) -> None:
+        if not isinstance(decoded_output, dict):
+            return
+        if "reminder" not in decoded_output:
+            decoded_output["reminder"] = {
+                "intent": False,
+                "temporal_expression": None,
+            }
+            return
+        reminder = decoded_output.get("reminder")
+        if not isinstance(reminder, dict):
+            return
+        expression = reminder.get("temporal_expression")
+        if isinstance(expression, str):
+            reminder["temporal_expression"] = expression.strip() or None
+        if reminder.get("intent") is False:
+            reminder["temporal_expression"] = None
 
     @staticmethod
     def _normalize_optional_empty_values(

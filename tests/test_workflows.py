@@ -580,7 +580,7 @@ def test_pwa_routes_and_health_start(client_factory):
     assert service_worker.status_code == 200
     assert service_worker.headers["content-type"].startswith("text/javascript")
     assert service_worker.headers["cache-control"] == "no-cache"
-    assert "selfecho-ai-v0.3-ui-phase2-1-correction-1" in service_worker.text
+    assert "selfecho-ai-reminder-v0.1-stage3b-3" in service_worker.text
     frontend = client.get("/static/app.js").text
     assert "<h1>先记下来</h1>" in frontend
     assert 'class="visually-hidden" for="capture-text">记录内容</label>' in frontend

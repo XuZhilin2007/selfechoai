@@ -23,9 +23,12 @@ from app.auth_routes import create_auth_router, create_current_user_dependency
 from app.config import Settings
 from app.database import Database
 from app.priority import rank_items
+from app.reminder_repository import ReminderRepository
+from app.reminder_routes import create_reminder_router
 from app.repository import InvalidOperationError, NotFoundError, Repository
 from app.schemas import (
     CaptureRequest,
+    DashboardItem,
     DashboardResponse,
     ItemDetailResponse,
     ItemInputPublic,
@@ -38,6 +41,7 @@ from app.schemas import (
 )
 from app.services.ai import AIService, AIServiceError, create_ai_service
 from app.services.processing import InputProcessingService
+from app.services.reminders import ReminderService
 
 
 def create_app(
@@ -48,6 +52,12 @@ def create_app(
     database = Database(settings.database_path)
     repository = Repository(database)
     auth_repository = AuthRepository(database)
+    reminder_repository = ReminderRepository(database)
+    reminder_service = ReminderService(
+        reminder_repository,
+        repository,
+        auth_repository,
+    )
     auth_service = AuthenticationService(
         auth_repository,
         registration_mode=settings.registration_mode,
@@ -55,7 +65,12 @@ def create_app(
         session_expiration_seconds=settings.session_expiration_seconds,
     )
     ai_service = ai_service or create_ai_service(settings)
-    processor = InputProcessingService(repository, ai_service)
+    processor = InputProcessingService(
+        repository,
+        ai_service,
+        auth_repository=auth_repository,
+        reminder_repository=reminder_repository,
+    )
     recovery_tasks: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
@@ -88,6 +103,8 @@ def create_app(
     app.state.processor = processor
     app.state.auth_repository = auth_repository
     app.state.auth_service = auth_service
+    app.state.reminder_repository = reminder_repository
+    app.state.reminder_service = reminder_service
     app.include_router(create_auth_router(auth_service, settings))
     require_current_user = create_current_user_dependency(auth_service, settings)
     require_csrf_current_user = create_current_user_dependency(
@@ -95,6 +112,30 @@ def create_app(
         settings,
         csrf_protected=True,
     )
+    app.include_router(
+        create_reminder_router(
+            reminder_service,
+            require_current_user,
+            require_csrf_current_user,
+        )
+    )
+
+    def add_reminder_state(
+        items: list[DashboardItem],
+        user_id: int,
+    ) -> list[DashboardItem]:
+        enriched: list[DashboardItem] = []
+        for item in items:
+            reminder_state = reminder_service.get_item_state(item.id, user_id)
+            enriched.append(
+                item.model_copy(
+                    update={
+                        "reminder": reminder_state.reminder,
+                        "show_reminder_prompt": reminder_state.show_reminder_prompt,
+                    }
+                )
+            )
+        return enriched
 
     @app.get("/api/health", response_model=MessageResponse)
     def health() -> MessageResponse:
@@ -195,13 +236,17 @@ def create_app(
         current_user: UserPublic = Depends(require_current_user),
         item_status: ItemStatus = Query(default=ItemStatus.ACTIVE, alias="status"),
     ) -> DashboardResponse:
+        reminder_service.lazy_transition_due(current_user.id)
         sortable, needs_confirmation = rank_items(
             repository.list_items_by_status(item_status, current_user.id)
         )
         show_capture_queue = item_status == ItemStatus.ACTIVE
         return DashboardResponse(
-            sortable_items=sortable,
-            needs_confirmation=needs_confirmation,
+            sortable_items=add_reminder_state(sortable, current_user.id),
+            needs_confirmation=add_reminder_state(
+                needs_confirmation,
+                current_user.id,
+            ),
             pending_inputs=(
                 repository.list_unlinked_inputs(
                     [ProcessingStatus.PENDING, ProcessingStatus.PROCESSING],
@@ -217,6 +262,14 @@ def create_app(
                 if show_capture_queue
                 else []
             ),
+            due_reminders=(
+                reminder_service.list_due(
+                    current_user.id,
+                    unsurfaced_only=True,
+                )
+                if show_capture_queue
+                else []
+            ),
         )
 
     @app.get("/api/items/{item_id}", response_model=ItemDetailResponse)
@@ -224,13 +277,20 @@ def create_app(
         item_id: int,
         current_user: UserPublic = Depends(require_current_user),
     ) -> ItemDetailResponse:
+        reminder_service.lazy_transition_due(current_user.id)
         try:
             item = repository.get_item(item_id, current_user.id)
+            reminder_state = reminder_service.get_item_state(
+                item_id,
+                current_user.id,
+            )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return ItemDetailResponse(
             item=item,
             inputs=repository.list_inputs_for_item(item_id, current_user.id),
+            reminder=reminder_state.reminder,
+            show_reminder_prompt=reminder_state.show_reminder_prompt,
         )
 
     @app.patch("/api/items/{item_id}", response_model=PersonalItemPublic)

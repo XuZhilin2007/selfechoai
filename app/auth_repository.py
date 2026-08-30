@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from app.database import Database
 from app.schemas import UserRecord, UserSessionRecord
-from app.time_utils import validate_timezone_name
+from app.time_utils import validate_default_reminder_time, validate_timezone_name
 
 
 class DuplicateUserError(Exception):
@@ -179,12 +179,17 @@ class AuthRepository:
         *,
         display_name: str | None = None,
         timezone_name: str | None = None,
+        default_reminder_time: str | None = None,
     ) -> UserRecord:
         updates: dict[str, str] = {}
         if display_name is not None:
             updates["display_name"] = display_name
         if timezone_name is not None:
             updates["timezone"] = validate_timezone_name(timezone_name)
+        if default_reminder_time is not None:
+            updates["default_reminder_time"] = validate_default_reminder_time(
+                default_reminder_time
+            )
         if not updates:
             raise ValueError("at least one profile field is required")
         updates["updated_time"] = utc_now().isoformat()

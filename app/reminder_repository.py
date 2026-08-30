@@ -5,7 +5,12 @@ from datetime import datetime, timezone
 
 from app.database import Database
 from app.repository import InvalidOperationError, NotFoundError
-from app.schemas import ReminderCancelReason, ReminderRecord, ReminderStatus
+from app.schemas import (
+    ReminderCancelReason,
+    ReminderCreationCandidate,
+    ReminderRecord,
+    ReminderStatus,
+)
 from app.time_utils import serialize_utc_datetime, validate_timezone_name
 
 
@@ -37,6 +42,66 @@ class ReminderRepository:
             cancelled_time=_optional_datetime(row["cancelled_time"]),
             cancel_reason=row["cancel_reason"],
             surfaced_time=_optional_datetime(row["surfaced_time"]),
+        )
+
+    def create_ai_reminder_if_absent(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        item_id: int,
+        user_id: int,
+        reminder: ReminderCreationCandidate,
+        created_time: str,
+    ) -> None:
+        """Create one AI-derived reminder while preserving any active choice."""
+
+        item = connection.execute(
+            "SELECT status FROM personal_items WHERE id = ? AND user_id = ?",
+            (item_id, user_id),
+        ).fetchone()
+        if item is None:
+            raise NotFoundError("item not found")
+        if item["status"] != "active":
+            return
+        active = connection.execute(
+            """
+            SELECT 1 FROM reminders
+            WHERE item_id = ? AND user_id = ?
+              AND status IN ('needs_confirmation', 'scheduled')
+            LIMIT 1
+            """,
+            (item_id, user_id),
+        ).fetchone()
+        if active is not None:
+            return
+
+        remind_at = (
+            serialize_utc_datetime(reminder.remind_at, field_name="remind_at")
+            if reminder.remind_at is not None
+            else None
+        )
+        status = (
+            ReminderStatus.SCHEDULED.value
+            if remind_at is not None
+            else ReminderStatus.NEEDS_CONFIRMATION.value
+        )
+        connection.execute(
+            """
+            INSERT INTO reminders (
+                user_id, item_id, source_expression, scheduled_timezone,
+                remind_at, status, created_time, updated_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                item_id,
+                reminder.source_expression,
+                reminder.scheduled_timezone,
+                remind_at,
+                status,
+                created_time,
+                created_time,
+            ),
         )
 
     def create_reminder(
@@ -174,6 +239,60 @@ class ReminderRepository:
             ).fetchone()
         return self._reminder_from_row(row) if row is not None else None
 
+    def should_offer_reminder_prompt(self, item_id: int, user_id: int) -> bool:
+        with self.database.connection() as connection:
+            item = connection.execute(
+                """
+                SELECT status, reminder_prompt_dismissed_at
+                FROM personal_items
+                WHERE id = ? AND user_id = ?
+                """,
+                (item_id, user_id),
+            ).fetchone()
+            if item is None:
+                raise NotFoundError("item not found")
+            has_reminder = connection.execute(
+                """
+                SELECT 1 FROM reminders
+                WHERE item_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (item_id, user_id),
+            ).fetchone()
+        return (
+            item["status"] == "active"
+            and item["reminder_prompt_dismissed_at"] is None
+            and has_reminder is None
+        )
+
+    def mark_due_reminders(
+        self,
+        user_id: int,
+        *,
+        as_of: datetime | None = None,
+    ) -> int:
+        """Lazily transition this user's due reminders without delivery writes."""
+
+        due_value = serialize_utc_datetime(as_of or utc_now(), field_name="as_of")
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE reminders
+                SET status = 'due', due_time = ?, updated_time = ?
+                WHERE user_id = ?
+                  AND status = 'scheduled'
+                  AND remind_at <= ?
+                  AND EXISTS (
+                      SELECT 1 FROM personal_items AS items
+                      WHERE items.id = reminders.item_id
+                        AND items.user_id = reminders.user_id
+                        AND items.status = 'active'
+                  )
+                """,
+                (due_value, due_value, user_id, due_value),
+            )
+        return cursor.rowcount
+
     def list_upcoming(
         self,
         user_id: int,
@@ -192,15 +311,21 @@ class ReminderRepository:
             ).fetchall()
         return [self._reminder_from_row(row) for row in rows]
 
-    def list_due(self, user_id: int) -> list[ReminderRecord]:
+    def list_due(
+        self,
+        user_id: int,
+        *,
+        unsurfaced_only: bool = False,
+    ) -> list[ReminderRecord]:
         with self.database.connection() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM reminders
                 WHERE user_id = ? AND status = 'due'
+                  AND (? = 0 OR surfaced_time IS NULL)
                 ORDER BY due_time ASC, id ASC
                 """,
-                (user_id,),
+                (user_id, int(unsurfaced_only)),
             ).fetchall()
         return [self._reminder_from_row(row) for row in rows]
 
@@ -328,3 +453,63 @@ class ReminderRepository:
                 (reminder_id, user_id),
             ).fetchone()
         return self._reminder_from_row(updated)
+
+    def mark_surfaced(
+        self,
+        reminder_id: int,
+        user_id: int,
+        *,
+        surfaced_time: datetime,
+    ) -> ReminderRecord:
+        surfaced_value = serialize_utc_datetime(
+            surfaced_time,
+            field_name="surfaced_time",
+        )
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT status FROM reminders WHERE id = ? AND user_id = ?",
+                (reminder_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("reminder not found")
+            if row["status"] != ReminderStatus.DUE.value:
+                raise InvalidOperationError("only a due reminder can be surfaced")
+            connection.execute(
+                """
+                UPDATE reminders
+                SET surfaced_time = COALESCE(surfaced_time, ?), updated_time = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (surfaced_value, surfaced_value, reminder_id, user_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM reminders WHERE id = ? AND user_id = ?",
+                (reminder_id, user_id),
+            ).fetchone()
+        return self._reminder_from_row(updated)
+
+    def dismiss_reminder_prompt(
+        self,
+        item_id: int,
+        user_id: int,
+        *,
+        dismissed_time: datetime | None = None,
+    ) -> datetime:
+        dismissed = datetime.fromisoformat(
+            serialize_utc_datetime(
+                dismissed_time or utc_now(),
+                field_name="reminder_prompt_dismissed_at",
+            )
+        )
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE personal_items
+                SET reminder_prompt_dismissed_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (dismissed.isoformat(timespec="seconds"), item_id, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("item not found")
+        return dismissed

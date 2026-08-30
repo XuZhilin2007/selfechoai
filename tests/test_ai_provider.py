@@ -31,6 +31,11 @@ def test_openai_adapter_validates_structured_output(response_shape):
             assert "explicit consequences" in payload["instructions"]
             assert "Judge importance and urgency separately" in payload["instructions"]
             assert "generic category has a fixed priority" in payload["instructions"]
+            assert "reminder.intent is true only" in payload["instructions"]
+            assert "a date, deadline, class, exam" in payload["instructions"]
+            assert "Never calculate remind_at" in payload["instructions"]
+            schema = payload["text"]["format"]["schema"]
+            assert "reminder" in schema["properties"]
             assert json.loads(payload["input"])["current_local_date"] == "2026-08-24"
             extraction = json.dumps(
                 {
@@ -42,6 +47,10 @@ def test_openai_adapter_validates_structured_output(response_shape):
                         "status": "active",
                     },
                     "evidence_fields": [],
+                    "reminder": {
+                        "intent": False,
+                        "temporal_expression": None,
+                    },
                 },
                 ensure_ascii=False,
             )
@@ -72,6 +81,97 @@ def test_openai_adapter_validates_structured_output(response_shape):
             result = await service.extract("有空研究 AI Agent", None)
             assert result.fields.title == "研究 AI Agent"
             assert result.fields.importance.value == "unknown"
+            assert result.reminder.intent is False
+
+    import asyncio
+
+    asyncio.run(run_test())
+
+
+def test_openai_adapter_returns_provider_independent_reminder_candidate():
+    async def run_test():
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "output_text": json.dumps(
+                        {
+                            "fields": {
+                                "title": "继续学习",
+                                "type": "study",
+                                "importance": "unknown",
+                                "urgency": "unknown",
+                                "status": "active",
+                            },
+                            "evidence_fields": [],
+                            "reminder": {
+                                "intent": True,
+                                "temporal_expression": "30分钟后",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            service = OpenAIResponsesAIService(
+                api_url="https://example.test/v1/responses",
+                api_key="secret",
+                model="test-model",
+                timeout_seconds=1,
+                client=client,
+            )
+            result = await service.extract("30分钟后提醒我继续学习", None)
+
+        assert result.reminder.intent is True
+        assert result.reminder.temporal_expression == "30分钟后"
+
+    import asyncio
+
+    asyncio.run(run_test())
+
+
+def test_openai_adapter_rejects_malformed_reminder_candidate():
+    async def run_test():
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "output_text": json.dumps(
+                        {
+                            "fields": {
+                                "title": "无效提醒",
+                                "type": "note",
+                                "importance": "unknown",
+                                "urgency": "unknown",
+                                "status": "active",
+                            },
+                            "evidence_fields": [],
+                            "reminder": {
+                                "intent": "true",
+                                "temporal_expression": "明天",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            service = OpenAIResponsesAIService(
+                api_url="https://example.test/v1/responses",
+                api_key="secret",
+                model="test-model",
+                timeout_seconds=1,
+                client=client,
+            )
+            with pytest.raises(AIInvalidOutputError):
+                await service.extract("明天提醒我", None)
 
     import asyncio
 

@@ -4,7 +4,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from app.database import Database
 from app.schemas import (
@@ -17,8 +17,12 @@ from app.schemas import (
     PersonalItemPublic,
     PriorityLevel,
     ProcessingStatus,
+    ReminderCreationCandidate,
     UserItemPatch,
 )
+
+if TYPE_CHECKING:
+    from app.reminder_repository import ReminderRepository
 
 
 class NotFoundError(Exception):
@@ -337,6 +341,9 @@ class Repository:
         user_id: int,
         fields: AIItemFields,
         evidence_fields: set[ImportantField],
+        *,
+        reminder: ReminderCreationCandidate | None = None,
+        reminder_repository: ReminderRepository | None = None,
     ) -> PersonalItemPublic:
         if fields.title is None:
             raise InvalidOperationError("AI result for a new item requires a title")
@@ -396,6 +403,16 @@ class Repository:
                 ),
             )
             item_id = int(cursor.lastrowid)
+            if reminder is not None:
+                if reminder_repository is None:
+                    raise InvalidOperationError("reminder repository is required")
+                reminder_repository.create_ai_reminder_if_absent(
+                    connection,
+                    item_id=item_id,
+                    user_id=input_user_id,
+                    reminder=reminder,
+                    created_time=now,
+                )
             connection.execute(
                 """
                 UPDATE item_inputs
@@ -420,6 +437,9 @@ class Repository:
         user_id: int,
         fields: AIItemFields,
         evidence_fields: set[ImportantField],
+        *,
+        reminder: ReminderCreationCandidate | None = None,
+        reminder_repository: ReminderRepository | None = None,
     ) -> PersonalItemPublic:
         now = utc_now().isoformat()
         with self.database.transaction() as connection:
@@ -500,6 +520,17 @@ class Repository:
                         cancel_reason=cancel_reason,
                         cancelled_time=now,
                     )
+
+            if reminder is not None:
+                if reminder_repository is None:
+                    raise InvalidOperationError("reminder repository is required")
+                reminder_repository.create_ai_reminder_if_absent(
+                    connection,
+                    item_id=item_id,
+                    user_id=user_id,
+                    reminder=reminder,
+                    created_time=now,
+                )
 
             connection.execute(
                 """

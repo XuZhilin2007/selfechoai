@@ -159,6 +159,8 @@ def test_deepseek_provider_uses_official_chat_completions_json_output():
             assert "explicit consequences" in payload["messages"][0]["content"]
             assert "A deadline normally supports urgency" in payload["messages"][0]["content"]
             assert "purchases are low importance" in payload["messages"][0]["content"]
+            assert "reminder.intent is true only" in payload["messages"][0]["content"]
+            assert "Never calculate remind_at" in payload["messages"][0]["content"]
             assert "不要猜" not in payload["messages"][1]["content"]
             assert "下周复习高数" in payload["messages"][1]["content"]
             assert '"current_local_date": "2026-08-24"' in payload["messages"][1]["content"]
@@ -180,6 +182,37 @@ def test_deepseek_provider_uses_official_chat_completions_json_output():
             assert result.fields.title == "复习高数"
             assert result.fields.importance.value == "unknown"
             assert result.fields.extra_information == {"chapter": "第四章"}
+            assert result.reminder.intent is False
+
+    asyncio.run(run_test())
+
+
+def test_deepseek_normalizes_and_validates_reminder_candidate():
+    async def run_test():
+        output = json.loads(extraction_json())
+        output["reminder"] = {
+            "intent": True,
+            "temporal_expression": "  后天下午3点  ",
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=chat_completion(json.dumps(output, ensure_ascii=False)),
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            provider = DeepSeekProvider(
+                api_url="https://api.deepseek.com",
+                api_key="test-secret",
+                client=client,
+            )
+            result = await provider.extract("后天下午3点提醒我买东西", None)
+
+        assert result.reminder.intent is True
+        assert result.reminder.temporal_expression == "后天下午3点"
 
     asyncio.run(run_test())
 
