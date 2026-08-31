@@ -138,7 +138,7 @@ def create_app(
 
     app = FastAPI(
         title="SelfEcho AI",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
     app.state.database = database
