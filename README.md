@@ -4,7 +4,7 @@
 
 SelfEcho AI helps you capture ideas quickly and uses AI to organize them into structured Personal Items, while always preserving the original input and leaving every final decision to you. AI extracts and organizes information; it does not decide what matters, what to plan, or what to do next.
 
-**Status:** v0.3.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.4.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
@@ -19,13 +19,35 @@ Scattered thoughts often appear earlier than conventional tasks, and they carry 
 - Capture with raw input saved first
 - DeepSeek/OpenAI AI structuring
 - Personal Item dashboard, detail view, and lifecycle management
+- One-time Reminders, created manually or extracted by AI from natural language and resolved deterministically in your timezone; ambiguous time expressions stay in a `needs_confirmation` state
+- In-app due fallback, so Reminders remain usable without any notification setup
+- Optional Web Push (disabled by default) with your own VAPID keys, browser subscription lifecycle, Service Worker delivery, and an embedded Reminder worker for scheduled multi-device delivery
 - Mobile-first Web/PWA interface
 - Login, logout, server-side sessions, and CSRF protection
 - Registration closed by default, with optional invite registration
 - Multi-user data ownership isolation
-- SQLite schema v3, including a preserved generic v2→v3 migration implementation
+- SQLite schema v4, including a preserved generic v2→v3 migration implementation
 
-Reminders, planning, calendar integration, and autonomous agents are not implemented yet.
+Planner, calendar integration, and autonomous agents are not implemented yet.
+
+## Reminder Semantics
+
+- AI only extracts reminder intent and a time expression; the application resolves the actual time deterministically using your timezone and your default reminder time.
+- Ambiguous time expressions can remain unresolved in the `needs_confirmation` state until you confirm or edit them.
+- Completing or trashing an item cancels its active Reminder; restoring the item does not revive the Reminder.
+- Reminders are one-time. Recurring reminders are not supported.
+
+## Web Push
+
+Web Push is optional and disabled by default:
+
+- It requires a browser that supports Push notifications and a secure context; use HTTPS for real deployments.
+- The self-host operator generates their own VAPID key pair and configures it in `.env`.
+- Scheduled Push delivery requires explicitly enabling the embedded Reminder worker; a single application instance is the supported topology.
+- Without Push, Reminders and the in-app due fallback remain fully usable.
+- Scheduled delivery is at-most-once: each notification is attempted at most once per subscribed device, and neither the provider accepting the message nor the device displaying it is guaranteed.
+
+Web Push self-hosting has additional security and deployment considerations; see [Security Policy](SECURITY.md).
 
 ## Requirements
 
@@ -85,7 +107,7 @@ python -m app.bootstrap
 Bootstrap will:
 
 - use the SQLite database configured via `APP_DATABASE_PATH` in `.env`;
-- initialize schema v3 when the database does not exist yet;
+- initialize schema v4 when the database does not exist yet;
 - create one regular user only when the user count is 0;
 - read and confirm the password through `getpass`;
 - apply the same user constraints and Argon2id password hashing as the application;
@@ -143,7 +165,7 @@ AI_API_KEY=
 AI_MODEL=
 ```
 
-Depending on the configured provider, user input and related item context are sent to an external LLM provider such as DeepSeek or OpenAI. You are responsible for reviewing the provider's privacy policy, data retention rules, and API costs. Do not enable `AI_DEBUG_OUTPUT` in shared environments; debug output may contain personal input or model results.
+Depending on the configured provider, user input and related item context are sent to an external LLM provider such as DeepSeek or OpenAI. Reminder extraction is part of this data flow: text containing reminder intent or time expressions participates in the provider call. You are responsible for reviewing the provider's privacy policy, data retention rules, and API costs. Do not enable `AI_DEBUG_OUTPUT` in shared environments; debug output may contain personal input or model results.
 
 Even without a provider key, you can still initialize the database, create a user, and sign in. Capture saves the raw input first, but AI structuring will report a missing configuration.
 
@@ -153,9 +175,30 @@ Even without a provider key, you can still initialize the database, create a use
 - SQLite data belongs to the current self-hosted instance
 - `.env`, `data/`, `*.db`, WAL/SHM files, and logs are ignored by Git
 - The Community Edition ships no production data and no seeds derived from real data
-- Empty databases are initialized directly to schema v3
+- Empty databases are initialized directly to schema v4
 
 Never commit databases, backups, logs, or screenshots containing personal content to Git.
+
+## Upgrade from v0.3.0
+
+A v0.3.0 database uses schema v3; v0.4.0 uses schema v4. Startup does not migrate automatically — it refuses to start on an unsupported schema version.
+
+1. Stop the application and back up the database file together with its WAL/SHM companions.
+2. Preview the migration with a read-only check:
+
+```bash
+python -m app.migrations.v004_reminders --database data/selfecho.db --check-only
+```
+
+3. Run the explicit v3→v4 migration. It asks for a typed confirmation before it starts:
+
+```bash
+python -m app.migrations.v004_reminders --database data/selfecho.db
+```
+
+4. Start v0.4.0 only after the migration has completed successfully.
+
+There is no direct v2→v4 upgrade path; the preserved v2→v3 migration remains a historical implementation detail.
 
 ## Tests
 
@@ -163,29 +206,33 @@ Never commit databases, backups, logs, or screenshots containing personal conten
 python -m pytest
 ```
 
-Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses, authentication, sessions, CSRF, invites, migrations, multi-user isolation, PWA behavior, plus first-user bootstrap and local/production cookie handling.
+Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses, authentication, sessions, CSRF, invites, migrations, multi-user isolation, Reminders, temporal parsing, Web Push security and subscriptions, PWA behavior, plus first-user bootstrap and local/production cookie handling. The JavaScript and Service Worker contract tests live in `tests/*.mjs` and run with the Node test runner.
 
 ## Current Limitations
 
 - No password reset
 - No email verification
-- No reminder system or planner yet
+- No recurring reminders, planner, or calendar integration
 - No built-in rate limiting
 - No formal admin console or role system
+- Scheduled Web Push is best-effort: at-most-once, no guaranteed delivery
+- Single application instance and origin-root deployment; no official Docker image or binary distribution
+- Voice Capture is not part of Public v0.4.0
 
 ## Architecture
 
 ```text
-Vanilla JavaScript PWA
+Vanilla JavaScript PWA (incl. Service Worker push handling)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite
-          └── DeepSeek / OpenAI provider abstraction
+          ├── SQLite (schema v4)
+          ├── DeepSeek / OpenAI provider abstraction
+          └── optional embedded Reminder worker → Web Push
 ```
 
 The core product principles: original input must never be lost; unknown information stays unknown; AI only organizes information, and the user is always the final decision maker.
 
-For full component, data-flow, authentication, multi-user isolation, PWA cache, and provider boundary details, see [Architecture](docs/ARCHITECTURE.md). Stable product boundaries are described in [Product Principles](docs/PRODUCT_PRINCIPLES.md).
+For full component, data-flow, authentication, multi-user isolation, Reminder/Push/worker, PWA cache, and provider boundary details, see [Architecture](docs/ARCHITECTURE.md). Stable product boundaries are described in [Product Principles](docs/PRODUCT_PRINCIPLES.md).
 
 ## Security and Contributing
 

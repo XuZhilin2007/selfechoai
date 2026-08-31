@@ -25,22 +25,33 @@ Windows PowerShell 可用 Copy-Item .env.example .env，并通过 .venv\Scripts\
 
 ## Scope and Quality
 
-- 保持 Capture、AI Structuring、事项管理和 PWA 的当前 MVP 范围。
+- 保持 Capture、AI Structuring、事项管理、Reminder 与 PWA 的当前 MVP 范围。
 - 不要把所有 Personal Item 强制转成传统 Todo。
 - 原始输入必须先保存；未知信息不能由 AI 猜测补全。
 - 涉及 Authentication、Session、CSRF 或 Repository 查询时，必须补充或更新安全测试与多用户隔离测试。
+- Reminder 变更必须保持 per-user ownership，并补充或更新所有权/隔离测试。
+- 数据库 schema 或迁移变更必须携带迁移与回归测试。
+- Push 变更必须保持 Session 与用户隔离；订阅数据不能跨用户或跨 Session 可见。
+- 出站 endpoint / 安全逻辑变更必须附带 SSRF 回归测试。
+- 前端 Push 或 Service Worker 变更需要运行 JS/SW 合同测试（Node 内置 test runner）。
 - 前端保持 mobile-first，并验证窄屏、触控和 PWA 基本流程。
 - Provider 实现不得在普通日志中记录原始用户文本、完整模型输入/输出、API Key 或 Session。
 - 生产服务器、Nginx、TLS、真实域名和私有运维配置不属于 Community Edition 的贡献范围。
 
 ## Test Data and Secrets
 
-只使用合成测试数据。不要提交真实用户文本、数据库、备份、日志、Cookie、邀请代码、API Key、.env 或由真实数据生成的截图。示例中的邮箱、Token 和 Provider 响应必须明显是虚构值。
+只使用合成测试数据。不要提交真实用户文本、数据库、备份、日志、Cookie、邀请代码、API Key、.env 或由真实数据生成的截图。示例中的邮箱、Token 和 Provider 响应必须明显是虚构值。Push 相关 fixture 只能使用合成的 endpoint 与 VAPID 材料，不得出现真实推送端点、真实密钥或个人数据。
 
 提交 Pull Request 前至少运行：
 
 ~~~bash
 python -m pytest
+~~~
+
+修改前端 Push 或 Service Worker 时，还需运行对应的合同测试，例如：
+
+~~~bash
+node --test tests/test_frontend_push.mjs tests/test_service_worker_push.mjs
 ~~~
 
 如果修改打包、静态资源或启动流程，还应执行 wheel 构建、全新环境安装和本地启动检查。

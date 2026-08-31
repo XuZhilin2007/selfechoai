@@ -136,8 +136,21 @@ def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
         "AUTH_INVITE_CODE_HASH",
         "APP_ORIGIN",
         "AUTH_COOKIE_SECURE",
+        "REMINDER_WORKER_ENABLED",
+        "REMINDER_POLL_INTERVAL_SECONDS",
+        "REMINDER_BATCH_SIZE",
+        "REMINDER_SENDING_STALE_SECONDS",
+        "WEB_PUSH_ENABLED",
+        "WEB_PUSH_VAPID_PUBLIC_KEY",
+        "WEB_PUSH_VAPID_PRIVATE_KEY",
+        "WEB_PUSH_VAPID_SUBJECT",
+        "WEB_PUSH_TIMEOUT_SECONDS",
+        "WEB_PUSH_TEST_SEND_ENABLED",
     ]:
         assert setting in environment_example
+    assert "WEB_PUSH_ENABLED=false" in environment_example
+    assert "WEB_PUSH_TEST_SEND_ENABLED=false" in environment_example
+    assert "REMINDER_WORKER_ENABLED=false" in environment_example
     assert "python -m app.bootstrap" in readme
     assert "hash_invite_code" in readme
     assert "http://127.0.0.1:8000" in readme
