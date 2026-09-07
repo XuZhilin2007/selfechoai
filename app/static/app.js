@@ -5,6 +5,7 @@ let authRedirectTimer = null;
 let pushOperationPromise = null;
 let pushStateGeneration = 0;
 let notificationOnboardingHasReminder = false;
+let activeCaptureController = null;
 
 const AUTH_STATES = Object.freeze({
   LOADING: "loading",
@@ -14,6 +15,25 @@ const AUTH_STATES = Object.freeze({
 });
 const CSRF_COOKIE_NAME = "selfecho_csrf";
 const CAPTURE_DRAFT_KEY = "selfecho.capture-draft";
+const CAPTURE_AUTOSAVE_DELAY_MS = 700;
+const CAPTURE_STATUS_POLL_DELAY_MS = 800;
+const VOICE_CANCEL_DISTANCE_PX = 72;
+const VOICE_MAX_RECORDING_MS = 60_000;
+const VOICE_COMPLETION_HIGHLIGHT_MS = 700;
+const VOICE_COMPLETION_VIBRATION_MS = 25;
+const CAPTURE_BROWSER_STATES = Object.freeze({
+  BOOTSTRAPPING: "BOOTSTRAPPING",
+  OPEN: "OPEN",
+  DIRTY: "DIRTY",
+  REQUESTING_MIC: "REQUESTING_MIC",
+  RECORDING: "RECORDING",
+  CANCEL_ARMED: "CANCEL_ARMED",
+  FINALIZING: "FINALIZING",
+  UPLOADING: "UPLOADING",
+  POLLING: "POLLING",
+  SAVING: "SAVING",
+  REVISION_CONFLICT: "REVISION_CONFLICT",
+});
 const NOTIFICATION_DISMISSAL_KEY = "selfecho.notification-onboarding-dismissed";
 const NOTIFICATION_DISABLED_KEY = "selfecho.device-notifications-disabled";
 const PUSH_CLEANUP_TIMEOUT_MS = 2500;
@@ -156,6 +176,43 @@ async function api(path, options = {}) {
       else if (Array.isArray(body.detail)) message = "提交内容不符合要求，请检查后重试。";
     } catch (_) {
       // Keep the user-facing fallback and never expose an HTML error page.
+    }
+    const error = new ApiError(message, response.status);
+    if (response.status === 401 && !path.startsWith("/api/auth/")) {
+      scheduleSessionExpiredRedirect();
+    }
+    throw error;
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+async function rawApi(path, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    const csrfToken = readCookie(CSRF_COOKIE_NAME);
+    if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
+  }
+
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      method,
+      credentials: "same-origin",
+      headers,
+    });
+  } catch (_) {
+    throw new NetworkError();
+  }
+  if (!response.ok) {
+    let message = "请求失败，请稍后重试。";
+    try {
+      const body = await response.json();
+      if (typeof body.detail === "string") message = body.detail;
+      else if (Array.isArray(body.detail)) message = "提交内容不符合要求，请检查后重试。";
+    } catch (_) {
+      // Never surface an HTML error body.
     }
     const error = new ApiError(message, response.status);
     if (response.status === 401 && !path.startsWith("/api/auth/")) {
@@ -825,7 +882,11 @@ function setActiveNavigation() {
   });
 }
 
-function navigate(path) {
+async function navigate(path) {
+  if (activeCaptureController) {
+    const canLeave = await activeCaptureController.prepareNavigation();
+    if (!canLeave) return;
+  }
   history.pushState({}, "", path);
   renderRoute();
 }
@@ -862,10 +923,23 @@ document.addEventListener("click", (event) => {
   const link = event.target.closest("a[data-link]");
   if (!link || link.origin !== window.location.origin) return;
   event.preventDefault();
-  navigate(`${link.pathname}${link.search}`);
+  void navigate(`${link.pathname}${link.search}`);
 });
 
-window.addEventListener("popstate", renderRoute);
+window.addEventListener("popstate", () => {
+  const controller = activeCaptureController;
+  if (!controller) {
+    renderRoute();
+    return;
+  }
+  void controller.prepareNavigation().then((canLeave) => {
+    if (canLeave) {
+      renderRoute();
+      return;
+    }
+    history.pushState({}, "", controller.location);
+  });
+});
 
 function formatDate(value) {
   if (!value) return "";
@@ -1549,6 +1623,7 @@ function completeLocalLogout() {
 
 function scheduleSessionExpiredRedirect() {
   if (authentication.status !== AUTH_STATES.AUTHENTICATED || authRedirectTimer) return;
+  if (activeCaptureController?.deferSessionExpiredRedirect()) return;
   const next = `${window.location.pathname}${window.location.search}`;
   setAuthentication(AUTH_STATES.UNAUTHENTICATED, null);
   authRedirectTimer = window.setTimeout(() => {
@@ -1568,18 +1643,47 @@ function captureDraftStorageKey() {
     : `${CAPTURE_DRAFT_KEY}.anonymous`;
 }
 
-function readCaptureDraft() {
+function readCaptureBuffer() {
   try {
-    return sessionStorage.getItem(captureDraftStorageKey()) || "";
+    const raw = sessionStorage.getItem(captureDraftStorageKey());
+    if (!raw) return { text: "", dirty: false, draftId: null, revision: 0, savePending: false };
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.version === 1 && typeof parsed.text === "string") {
+        return {
+          text: parsed.text,
+          dirty: parsed.dirty === true,
+          draftId: Number.isInteger(parsed.draftId) ? parsed.draftId : null,
+          revision: Number.isInteger(parsed.revision) ? parsed.revision : 0,
+          savePending: parsed.savePending === true,
+        };
+      }
+    } catch (_) {
+      // A pre-v0.5 plain-text value is still recoverable local input.
+    }
+    return { text: raw, dirty: true, draftId: null, revision: 0, savePending: false };
   } catch (_) {
-    return "";
+    return { text: "", dirty: false, draftId: null, revision: 0, savePending: false };
   }
 }
 
-function writeCaptureDraft(value) {
+function readCaptureDraft() {
+  return readCaptureBuffer().text;
+}
+
+function writeCaptureDraft(value, metadata = {}) {
   try {
     const key = captureDraftStorageKey();
-    if (value) sessionStorage.setItem(key, value);
+    if (value || metadata.dirty || metadata.savePending) {
+      sessionStorage.setItem(key, JSON.stringify({
+        version: 1,
+        text: value,
+        dirty: metadata.dirty === true,
+        draftId: Number.isInteger(metadata.draftId) ? metadata.draftId : null,
+        revision: Number.isInteger(metadata.revision) ? metadata.revision : 0,
+        savePending: metadata.savePending === true,
+      }));
+    }
     else sessionStorage.removeItem(key);
   } catch (_) {
     // Capture still works if browser storage is unavailable.
@@ -1588,6 +1692,106 @@ function writeCaptureDraft(value) {
 
 function clearCaptureDraft() {
   writeCaptureDraft("");
+}
+
+function voiceGestureCancelArmed(startY, currentY) {
+  return currentY <= startY - VOICE_CANCEL_DISTANCE_PX;
+}
+
+function captureHasActiveSegment(draft) {
+  return Boolean(draft?.voice_segments?.some((segment) =>
+    ["pending", "transcribing"].includes(segment.transcription_status)
+  ));
+}
+
+function captureHasFailedSegment(draft) {
+  return Boolean(draft?.voice_segments?.some((segment) =>
+    segment.transcription_status === "failed"
+  ));
+}
+
+function voiceSegmentStatusSnapshot(draft) {
+  return new Map((draft?.voice_segments || []).map((segment) => [
+    segment.id,
+    segment.transcription_status,
+  ]));
+}
+
+function observeVoiceSegmentCompletions(previousStatuses, draft) {
+  const statuses = voiceSegmentStatusSnapshot(draft);
+  const completedSegmentIds = [];
+  for (const [segmentId, status] of statuses) {
+    if (
+      status === "succeeded" &&
+      ["pending", "transcribing"].includes(previousStatuses.get(segmentId))
+    ) {
+      completedSegmentIds.push(segmentId);
+    }
+  }
+  return { statuses, completedSegmentIds };
+}
+
+function applyVoiceCompletionFeedback(
+  textarea,
+  {
+    documentObject = document,
+    navigatorObject = navigator,
+    schedule = (callback, delay) => window.setTimeout(callback, delay),
+  } = {},
+) {
+  textarea.classList.remove("voice-completion-feedback");
+  textarea.classList.add("voice-completion-feedback");
+  textarea.scrollTop = textarea.scrollHeight;
+  if (
+    documentObject.activeElement === textarea &&
+    typeof textarea.setSelectionRange === "function"
+  ) {
+    const textEnd = textarea.value.length;
+    textarea.setSelectionRange(textEnd, textEnd);
+  }
+  const timer = schedule(() => {
+    textarea.classList.remove("voice-completion-feedback");
+  }, VOICE_COMPLETION_HIGHLIGHT_MS);
+  if (documentObject.visibilityState === "visible") {
+    try {
+      if (typeof navigatorObject?.vibrate === "function") {
+        navigatorObject.vibrate(VOICE_COMPLETION_VIBRATION_MS);
+      }
+    } catch (_) {
+      // Haptic completion feedback is best-effort only.
+    }
+  }
+  return timer;
+}
+
+function isDraftRevisionConflict(error) {
+  return error instanceof ApiError && error.status === 409 &&
+    error.message === "Capture Draft revision is stale";
+}
+
+async function recoverVoiceUploadRevisionConflict({
+  pendingUpload,
+  localText,
+  loadServerDraft,
+  isRetained,
+  adoptEquivalent,
+  requireChoice,
+  retryPendingUpload,
+}) {
+  const response = await loadServerDraft();
+  if (!isRetained(pendingUpload)) return "cancelled";
+  const serverDraft = response.draft;
+  if (serverDraft && serverDraft.current_text === localText) {
+    adoptEquivalent(serverDraft, response.voice_available === true);
+    await retryPendingUpload(pendingUpload);
+    return "retried";
+  }
+  requireChoice(serverDraft, response.voice_available === true, pendingUpload);
+  return "requires_choice";
+}
+
+function voiceAudioMarkup(segmentId, label = "播放原始录音") {
+  return `<audio class="voice-audio" controls preload="none" aria-label="${escapeHtml(label)}" src="/api/voice-segments/${segmentId}/audio"></audio>`;
 }
 
 function renderCapture() {
@@ -1600,10 +1804,27 @@ function renderCapture() {
       <section class="panel capture-panel">
         <form id="capture-form">
           <label class="visually-hidden" for="capture-text">记录内容</label>
-          <textarea id="capture-text" name="original_text" maxlength="10000" required autofocus placeholder="想到什么，就写下来……"></textarea>
+          <textarea id="capture-text" name="original_text" maxlength="10000" autofocus placeholder="想到什么，就写下来……"></textarea>
+          <div class="voice-capture-row">
+            <button id="voice-hold-button" class="voice-hold-button" type="button" hidden>
+              <span aria-hidden="true">●</span>
+              <span class="voice-hold-label">按住说话</span>
+            </button>
+            <p id="voice-gesture-hint" class="form-hint" hidden>按住录音；按住时上滑，松手取消。</p>
+          </div>
+          <div id="voice-segment-list" class="voice-segment-list" aria-live="polite"></div>
+          <div id="pending-upload-actions" class="pending-upload-actions" hidden>
+            <p>这段录音尚未得到服务器安全确认，暂时保留在本页。</p>
+            <button class="secondary-button pending-upload-retry" type="button">重试上传</button>
+            <button class="text-button pending-upload-delete" type="button">删除这段录音</button>
+          </div>
+          <div id="capture-revision-conflict" class="capture-revision-conflict" hidden></div>
           <div class="form-footer">
             <p id="capture-status" class="status-message" role="status">原文会先保存。</p>
-            <button class="primary-button capture-submit" type="submit">保存</button>
+            <div class="capture-actions">
+              <button id="capture-discard" class="text-button" type="button" hidden>丢弃草稿</button>
+              <button class="primary-button capture-submit" type="submit">保存</button>
+            </div>
           </div>
         </form>
       </section>
@@ -1620,16 +1841,794 @@ function renderCapture() {
   const form = document.querySelector("#capture-form");
   const textarea = document.querySelector("#capture-text");
   const status = document.querySelector("#capture-status");
-  const button = form.querySelector("button");
+  const button = form.querySelector(".capture-submit");
+  const discardButton = document.querySelector("#capture-discard");
+  const voiceButton = document.querySelector("#voice-hold-button");
+  const voiceLabel = voiceButton.querySelector(".voice-hold-label");
+  const voiceHint = document.querySelector("#voice-gesture-hint");
+  const segmentList = document.querySelector("#voice-segment-list");
+  const pendingUploadActions = document.querySelector("#pending-upload-actions");
+  const revisionConflictPanel = document.querySelector("#capture-revision-conflict");
   const quickSection = document.querySelector("#quick-confirmation-section");
   const captureReminders = document.querySelector("#capture-micro-reminders");
   const quickList = document.querySelector("#quick-confirmation-list");
   const quickCount = document.querySelector("#quick-confirmation-count");
   const quickStatus = document.querySelector("#quick-confirmation-status");
   let quickItems = [];
+  const localBuffer = readCaptureBuffer();
+  const state = {
+    phase: CAPTURE_BROWSER_STATES.BOOTSTRAPPING,
+    draft: null,
+    dirty: localBuffer.dirty,
+    savePending: localBuffer.savePending,
+    voiceAvailable: false,
+    autosaveTimer: null,
+    statusPollTimer: null,
+    completionFeedbackTimer: null,
+    flushPromise: null,
+    pendingUpload: null,
+    revisionConflict: null,
+    gesture: null,
+    disposed: false,
+    userTypedDuringBootstrap: false,
+    voiceSegmentStatuses: new Map(),
+  };
+  textarea.value = localBuffer.text;
 
-  textarea.value = readCaptureDraft();
-  textarea.addEventListener("input", () => writeCaptureDraft(textarea.value));
+  function setCaptureStatus(message, kind = "") {
+    if (state.disposed || !status.isConnected) return;
+    status.dataset.kind = kind;
+    status.textContent = message;
+  }
+
+  function writeSafetyBuffer({ savePending = state.savePending } = {}) {
+    writeCaptureDraft(textarea.value, {
+      dirty: state.dirty,
+      draftId: state.draft?.id ?? localBuffer.draftId,
+      revision: state.draft?.revision ?? localBuffer.revision,
+      savePending,
+    });
+  }
+
+  function renderVoiceSegments() {
+    const segments = state.draft?.voice_segments || [];
+    segmentList.innerHTML = segments.map((segment, index) => {
+      const statusText = {
+        pending: "等待转写",
+        transcribing: "正在转写",
+        succeeded: "已加入可编辑文字",
+        failed: "转写未完成",
+      }[segment.transcription_status] || segment.transcription_status;
+      const failure = segment.transcription_status === "failed"
+        ? `<p class="voice-segment-error">${escapeHtml(segment.failure_message || "转写失败；原始录音已保留。")}</p>
+           <div class="voice-segment-actions">
+             <button class="secondary-button voice-segment-retry" type="button" data-segment-id="${segment.id}">重试</button>
+             <button class="text-button voice-segment-delete" type="button" data-segment-id="${segment.id}">删除录音</button>
+           </div>`
+        : "";
+      return `<article class="voice-segment" data-status="${escapeHtml(segment.transcription_status)}">
+        <div class="voice-segment-heading">
+          <strong>录音 ${index + 1}</strong>
+          <span>${escapeHtml(statusText)}</span>
+        </div>
+        ${voiceAudioMarkup(segment.id, `播放第 ${index + 1} 段原始录音`)}
+        ${failure}
+      </article>`;
+    }).join("");
+  }
+
+  function renderRevisionConflict() {
+    if (!state.revisionConflict) {
+      revisionConflictPanel.hidden = true;
+      revisionConflictPanel.innerHTML = "";
+      return;
+    }
+    const serverDraft = state.revisionConflict.serverDraft;
+    revisionConflictPanel.hidden = false;
+    revisionConflictPanel.innerHTML = `
+      <strong>Draft 在其他页面发生了变化</strong>
+      <p>${state.pendingUpload
+        ? "尚未上传的录音仍保留在本页。请选择文字版本后，将继续上传同一段录音。"
+        : "请选择要保留的文字版本；系统不会自动覆盖任一版本。"}</p>
+      <div class="revision-conflict-comparison">
+        <div><span>本页文字</span><pre>${escapeHtml(textarea.value)}</pre></div>
+        <div><span>服务器文字</span><pre>${escapeHtml(serverDraft?.current_text ?? "（服务器 Draft 已不存在）")}</pre></div>
+      </div>
+      <div class="revision-conflict-actions">
+        <button class="secondary-button conflict-keep-local" type="button">保留本页文字并继续</button>
+        ${serverDraft ? '<button class="secondary-button conflict-use-server" type="button">使用服务器文字并继续</button>' : ""}
+      </div>`;
+  }
+
+  function updateCaptureControls() {
+    const hasActive = captureHasActiveSegment(state.draft);
+    const hasFailed = captureHasFailedSegment(state.draft);
+    const transient = [
+      CAPTURE_BROWSER_STATES.REQUESTING_MIC,
+      CAPTURE_BROWSER_STATES.RECORDING,
+      CAPTURE_BROWSER_STATES.CANCEL_ARMED,
+      CAPTURE_BROWSER_STATES.FINALIZING,
+      CAPTURE_BROWSER_STATES.UPLOADING,
+      CAPTURE_BROWSER_STATES.SAVING,
+    ].includes(state.phase);
+    textarea.disabled = state.savePending || hasActive || transient;
+    voiceButton.hidden = !state.voiceAvailable;
+    voiceHint.hidden = !state.voiceAvailable;
+    voiceButton.disabled = state.savePending || !state.voiceAvailable || hasActive || hasFailed || transient ||
+      state.phase === CAPTURE_BROWSER_STATES.BOOTSTRAPPING || Boolean(state.pendingUpload);
+    button.disabled = transient || hasActive || hasFailed || Boolean(state.pendingUpload) ||
+      Boolean(state.revisionConflict) ||
+      !textarea.value.trim();
+    discardButton.hidden = state.savePending ||
+      (!state.draft && !textarea.value && !state.pendingUpload);
+    pendingUploadActions.hidden = !state.pendingUpload;
+    pendingUploadActions.querySelector(".pending-upload-retry").disabled =
+      Boolean(state.revisionConflict) || state.phase === CAPTURE_BROWSER_STATES.UPLOADING;
+    renderRevisionConflict();
+    voiceButton.dataset.state = state.phase;
+    voiceLabel.textContent = state.phase === CAPTURE_BROWSER_STATES.REQUESTING_MIC
+      ? "正在请求麦克风…"
+      : state.phase === CAPTURE_BROWSER_STATES.RECORDING
+        ? "松手完成 · 上滑取消"
+        : state.phase === CAPTURE_BROWSER_STATES.CANCEL_ARMED
+          ? "松手取消"
+          : state.phase === CAPTURE_BROWSER_STATES.FINALIZING
+            ? "正在结束录音…"
+            : state.phase === CAPTURE_BROWSER_STATES.UPLOADING
+              ? "正在安全保存…"
+              : "按住说话";
+    renderVoiceSegments();
+  }
+
+  function scheduleDraftPoll() {
+    if (state.statusPollTimer) window.clearTimeout(state.statusPollTimer);
+    if (state.disposed || !captureHasActiveSegment(state.draft)) return;
+    state.statusPollTimer = window.setTimeout(() => {
+      state.statusPollTimer = null;
+      void refreshDraft({ polling: true });
+    }, CAPTURE_STATUS_POLL_DELAY_MS);
+  }
+
+  async function refreshDraft({ polling = false } = {}) {
+    try {
+      const response = await api("/api/capture-draft");
+      if (state.disposed) return null;
+      state.voiceAvailable = response.voice_available === true;
+      const completion = observeVoiceSegmentCompletions(
+        state.voiceSegmentStatuses,
+        response.draft,
+      );
+      state.voiceSegmentStatuses = completion.statuses;
+      if (response.draft) {
+        state.draft = response.draft;
+        if (!state.dirty && !state.savePending) {
+          textarea.value = response.draft.current_text;
+          clearCaptureDraft();
+        }
+      } else if (!state.savePending) {
+        state.draft = null;
+      }
+      const active = captureHasActiveSegment(state.draft);
+      if (polling || active) {
+        state.phase = active ? CAPTURE_BROWSER_STATES.POLLING : CAPTURE_BROWSER_STATES.OPEN;
+      }
+      if (!active && captureHasFailedSegment(state.draft)) {
+        setCaptureStatus("转写未完成：原始录音已保留。请播放、重试或删除。", "error");
+      } else if (!active && polling) {
+        setCaptureStatus("转写已加入文本，你可以继续编辑后保存。", "success");
+      }
+      updateCaptureControls();
+      if (
+        completion.completedSegmentIds.length > 0 &&
+        response.draft &&
+        textarea.value === response.draft.current_text
+      ) {
+        if (state.completionFeedbackTimer) {
+          window.clearTimeout(state.completionFeedbackTimer);
+        }
+        state.completionFeedbackTimer = applyVoiceCompletionFeedback(textarea);
+      }
+      scheduleDraftPoll();
+      return state.draft;
+    } catch (error) {
+      if (!state.disposed) {
+        setCaptureStatus(`暂时无法刷新 Draft：${error.message}`, "error");
+        scheduleDraftPoll();
+      }
+      return null;
+    }
+  }
+
+  function scheduleAutosave() {
+    if (state.autosaveTimer) window.clearTimeout(state.autosaveTimer);
+    if (state.savePending || state.disposed) return;
+    state.autosaveTimer = window.setTimeout(() => {
+      state.autosaveTimer = null;
+      void flushDraft({ quiet: true });
+    }, CAPTURE_AUTOSAVE_DELAY_MS);
+  }
+
+  async function flushDraft({ quiet = false, ensureDraft = false } = {}) {
+    if (state.disposed) return state.draft;
+    if (state.revisionConflict) {
+      if (!quiet) {
+        setCaptureStatus("请先明确选择本页或服务器 Draft 文字。", "error");
+      }
+      return state.draft;
+    }
+    if (state.flushPromise) {
+      await state.flushPromise;
+      if (!state.dirty) return state.draft;
+    }
+    if (state.savePending) {
+      if (!quiet) setCaptureStatus("上次最终保存结果待确认，请再次点“保存”。", "error");
+      return state.draft;
+    }
+    const snapshot = textarea.value;
+    if (!state.dirty && state.draft) return state.draft;
+    if (!ensureDraft && !state.draft && !snapshot && !state.dirty) return null;
+    const expectedRevision = state.draft?.revision || 0;
+    writeSafetyBuffer();
+    if (!quiet) setCaptureStatus("正在持久保存 Draft…");
+    state.flushPromise = (async () => {
+      try {
+        const response = await api("/api/capture-draft", {
+          method: "PUT",
+          body: JSON.stringify({ current_text: snapshot, revision: expectedRevision }),
+        });
+        if (state.disposed) return response.draft;
+        state.draft = response.draft;
+        state.voiceAvailable = response.voice_available === true;
+        if (textarea.value === snapshot) {
+          state.dirty = false;
+          clearCaptureDraft();
+        } else {
+          state.dirty = true;
+          writeSafetyBuffer();
+          scheduleAutosave();
+        }
+        if (!(state.gesture && state.phase === CAPTURE_BROWSER_STATES.REQUESTING_MIC)) {
+          state.phase = CAPTURE_BROWSER_STATES.OPEN;
+        }
+        if (!quiet) setCaptureStatus("Draft 已持久保存。", "success");
+        return state.draft;
+      } catch (error) {
+        state.dirty = true;
+        writeSafetyBuffer();
+        state.phase = error instanceof ApiError && error.status === 409
+          ? CAPTURE_BROWSER_STATES.REVISION_CONFLICT
+          : CAPTURE_BROWSER_STATES.DIRTY;
+        setCaptureStatus(
+          error instanceof ApiError && error.status === 409
+            ? "Draft 已在其他页面更新；本地未确认文字仍保留，请刷新后手动取舍。"
+            : `Draft 尚未同步；本地安全缓冲仍保留：${error.message}`,
+          "error",
+        );
+        throw error;
+      } finally {
+        state.flushPromise = null;
+        updateCaptureControls();
+      }
+    })();
+    return state.flushPromise;
+  }
+
+  async function bootstrapDraft() {
+    try {
+      const response = await api("/api/capture-draft");
+      if (state.disposed) return;
+      state.voiceAvailable = response.voice_available === true;
+      const serverDraft = response.draft;
+      if (serverDraft) {
+        state.draft = serverDraft;
+        const localMatchesServer = localBuffer.text === serverDraft.current_text;
+        const pendingSaveMatchesServer = localBuffer.savePending &&
+          localBuffer.draftId === serverDraft.id &&
+          localBuffer.revision === serverDraft.revision &&
+          localMatchesServer;
+        if (!state.userTypedDuringBootstrap && pendingSaveMatchesServer) {
+          textarea.value = localBuffer.text;
+          state.dirty = false;
+          state.savePending = true;
+          setCaptureStatus("上次最终保存结果待确认；请再次点“保存”安全确认。", "error");
+        } else if (!state.userTypedDuringBootstrap && (!localBuffer.dirty || localMatchesServer)) {
+          textarea.value = serverDraft.current_text;
+          state.dirty = false;
+          state.savePending = false;
+          clearCaptureDraft();
+        } else {
+          state.dirty = true;
+          setCaptureStatus("已恢复本地未确认文字；服务器 Draft 未被自动覆盖。", "error");
+        }
+      } else if (localBuffer.savePending && localBuffer.draftId) {
+        state.draft = {
+          id: localBuffer.draftId,
+          revision: localBuffer.revision,
+          current_text: localBuffer.text,
+          voice_segments: [],
+        };
+        state.savePending = true;
+        setCaptureStatus("上次最终保存结果待确认；请再次点“保存”安全确认。", "error");
+      } else {
+        state.draft = null;
+        state.dirty = localBuffer.dirty || state.userTypedDuringBootstrap;
+      }
+      state.voiceSegmentStatuses = voiceSegmentStatusSnapshot(state.draft);
+      state.phase = captureHasActiveSegment(state.draft)
+        ? CAPTURE_BROWSER_STATES.POLLING
+        : state.dirty
+          ? CAPTURE_BROWSER_STATES.DIRTY
+          : CAPTURE_BROWSER_STATES.OPEN;
+      updateCaptureControls();
+      if (state.dirty && !state.savePending) scheduleAutosave();
+      scheduleDraftPoll();
+    } catch (error) {
+      state.phase = state.dirty ? CAPTURE_BROWSER_STATES.DIRTY : CAPTURE_BROWSER_STATES.OPEN;
+      setCaptureStatus(`服务器 Draft 暂时不可用；本地未确认文字仍保留：${error.message}`, "error");
+      updateCaptureControls();
+    }
+  }
+
+  function stopTracks(stream) {
+    stream?.getTracks?.().forEach((track) => track.stop());
+  }
+
+  function abandonVoiceGesture(gesture, message) {
+    if (gesture.limitTimer) window.clearTimeout(gesture.limitTimer);
+    stopTracks(gesture.stream);
+    if (state.gesture === gesture) state.gesture = null;
+    state.phase = CAPTURE_BROWSER_STATES.OPEN;
+    if (!state.disposed) {
+      setCaptureStatus(message, "error");
+      updateCaptureControls();
+    }
+  }
+
+  function finishRecording(discard = false) {
+    const gesture = state.gesture;
+    if (!gesture?.recorder || gesture.recorder.state === "inactive") return;
+    if (gesture.limitTimer) window.clearTimeout(gesture.limitTimer);
+    gesture.discard = discard;
+    state.phase = CAPTURE_BROWSER_STATES.FINALIZING;
+    updateCaptureControls();
+    gesture.recorder.stop();
+  }
+
+  async function uploadRecording(
+    blob,
+    clientSegmentId,
+    { allowConflictRecovery = true } = {},
+  ) {
+    const existingPending = state.pendingUpload;
+    const pendingUpload = existingPending &&
+      existingPending.blob === blob &&
+      existingPending.clientSegmentId === clientSegmentId
+      ? existingPending
+      : { blob, clientSegmentId };
+    state.pendingUpload = pendingUpload;
+    state.phase = CAPTURE_BROWSER_STATES.UPLOADING;
+    updateCaptureControls();
+    setCaptureStatus("正在安全保存原始录音…");
+    try {
+      await flushDraft({ ensureDraft: true });
+      if (!state.draft) throw new Error("Draft 尚未就绪");
+      const uploadedSegment = await rawApi(
+        `/api/capture-draft/voice-segments/${encodeURIComponent(clientSegmentId)}?revision=${state.draft.revision}`,
+        {
+          method: "PUT",
+          body: blob,
+          headers: { "Content-Type": blob.type || "application/octet-stream" },
+        },
+      );
+      state.voiceSegmentStatuses.set(
+        uploadedSegment.id,
+        uploadedSegment.transcription_status,
+      );
+      if (state.pendingUpload === pendingUpload) state.pendingUpload = null;
+      state.revisionConflict = null;
+      state.phase = CAPTURE_BROWSER_STATES.POLLING;
+      setCaptureStatus("原始录音已安全保存，正在转写…", "success");
+      await refreshDraft({ polling: true });
+    } catch (error) {
+      if (
+        allowConflictRecovery &&
+        isDraftRevisionConflict(error) &&
+        state.pendingUpload === pendingUpload
+      ) {
+        state.phase = CAPTURE_BROWSER_STATES.UPLOADING;
+        updateCaptureControls();
+        try {
+          const outcome = await recoverVoiceUploadRevisionConflict({
+            pendingUpload,
+            localText: textarea.value,
+            loadServerDraft: () => api("/api/capture-draft"),
+            isRetained: (candidate) => state.pendingUpload === candidate,
+            adoptEquivalent: (serverDraft, voiceAvailable) => {
+              state.draft = serverDraft;
+              state.voiceAvailable = voiceAvailable;
+              state.dirty = false;
+              state.revisionConflict = null;
+              clearCaptureDraft();
+            },
+            requireChoice: (serverDraft, voiceAvailable) => {
+              if (state.autosaveTimer) window.clearTimeout(state.autosaveTimer);
+              state.autosaveTimer = null;
+              state.draft = serverDraft;
+              state.voiceAvailable = voiceAvailable;
+              state.dirty = true;
+              state.revisionConflict = { serverDraft };
+              state.phase = CAPTURE_BROWSER_STATES.REVISION_CONFLICT;
+              writeSafetyBuffer();
+              setCaptureStatus(
+                "服务器 Draft 与本页文字不同；录音仍保留，请明确选择文字版本。",
+                "error",
+              );
+              updateCaptureControls();
+            },
+            retryPendingUpload: (retained) => uploadRecording(
+              retained.blob,
+              retained.clientSegmentId,
+              { allowConflictRecovery: false },
+            ),
+          });
+          if (outcome !== "cancelled") return;
+        } catch (recoveryError) {
+          error = recoveryError;
+        }
+      }
+      state.phase = CAPTURE_BROWSER_STATES.OPEN;
+      setCaptureStatus(`录音尚未得到服务器确认，已保留在本页：${error.message}`, "error");
+      updateCaptureControls();
+    }
+  }
+
+  async function beginVoiceGesture(event) {
+    if (voiceButton.disabled || state.gesture) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setCaptureStatus("此浏览器暂不支持录音；仍可继续输入文字。", "error");
+      return;
+    }
+    event.preventDefault();
+    const gesture = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      released: false,
+      cancelArmed: false,
+      recorder: null,
+      stream: null,
+      chunks: [],
+      discard: false,
+      limitTimer: null,
+    };
+    state.gesture = gesture;
+    voiceButton.setPointerCapture?.(event.pointerId);
+    state.phase = CAPTURE_BROWSER_STATES.REQUESTING_MIC;
+    updateCaptureControls();
+    setCaptureStatus("正在请求麦克风权限…");
+    // Permission is requested synchronously from pointerdown's user gesture.
+    let mediaPromise;
+    try {
+      mediaPromise = navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (_) {
+      abandonVoiceGesture(gesture, "浏览器无法请求麦克风；仍可继续输入文字。");
+      return;
+    }
+    const flushPromise = flushDraft({ ensureDraft: true });
+    const [mediaResult, flushResult] = await Promise.allSettled([
+      mediaPromise,
+      flushPromise,
+    ]);
+    if (mediaResult.status !== "fulfilled") {
+      state.gesture = null;
+      state.phase = CAPTURE_BROWSER_STATES.OPEN;
+      setCaptureStatus("没有获得麦克风权限；仍可继续输入文字。", "error");
+      updateCaptureControls();
+      return;
+    }
+    const stream = mediaResult.value;
+    if (
+      flushResult.status !== "fulfilled" || gesture.released ||
+      gesture.cancelArmed || state.disposed || state.gesture !== gesture
+    ) {
+      stopTracks(stream);
+      state.gesture = null;
+      state.phase = CAPTURE_BROWSER_STATES.OPEN;
+      if (!state.disposed) {
+        setCaptureStatus(gesture.released ? "已取消录音。" : "Draft 未保存，未开始录音。", gesture.released ? "" : "error");
+        updateCaptureControls();
+      }
+      return;
+    }
+    gesture.stream = stream;
+    let recorder;
+    try {
+      recorder = new MediaRecorder(stream);
+    } catch (_) {
+      abandonVoiceGesture(
+        gesture,
+        "浏览器无法使用默认录音格式；原文 Draft 已保留。",
+      );
+      return;
+    }
+    gesture.recorder = recorder;
+    recorder.addEventListener("dataavailable", (dataEvent) => {
+      if (dataEvent.data?.size) gesture.chunks.push(dataEvent.data);
+    });
+    recorder.addEventListener("error", () => {
+      gesture.failureMessage = "录音过程发生错误，没有上传不完整音频。";
+      if (recorder.state === "inactive") {
+        abandonVoiceGesture(gesture, gesture.failureMessage);
+      } else {
+        finishRecording(true);
+      }
+    }, { once: true });
+    recorder.addEventListener("stop", async () => {
+      stopTracks(stream);
+      if (gesture.limitTimer) window.clearTimeout(gesture.limitTimer);
+      const shouldDiscard = gesture.discard || state.disposed;
+      const chunks = gesture.chunks;
+      const mediaType = recorder.mimeType || chunks[0]?.type || "application/octet-stream";
+      state.gesture = null;
+      state.phase = CAPTURE_BROWSER_STATES.OPEN;
+      if (shouldDiscard) {
+        if (!state.disposed) {
+          setCaptureStatus(
+            gesture.failureMessage || "录音已取消，没有上传。",
+            gesture.failureMessage ? "error" : "success",
+          );
+          updateCaptureControls();
+        }
+        return;
+      }
+      const blob = new Blob(chunks, { type: mediaType });
+      if (!blob.size) {
+        setCaptureStatus("没有录到可上传的音频；请重试。", "error");
+        updateCaptureControls();
+        return;
+      }
+      const clientSegmentId = globalThis.crypto?.randomUUID?.() ||
+        `voice-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      await uploadRecording(blob, clientSegmentId);
+    }, { once: true });
+    try {
+      recorder.start();
+    } catch (_) {
+      abandonVoiceGesture(
+        gesture,
+        "浏览器无法启动录音；原文 Draft 已保留。",
+      );
+      return;
+    }
+    gesture.limitTimer = window.setTimeout(() => {
+      gesture.released = true;
+      finishRecording(false);
+    }, VOICE_MAX_RECORDING_MS);
+    state.phase = CAPTURE_BROWSER_STATES.RECORDING;
+    setCaptureStatus("正在录音；松手完成，上滑后松手取消。");
+    updateCaptureControls();
+  }
+
+  function releaseVoiceGesture(event, forceCancel = false) {
+    const gesture = state.gesture;
+    if (!gesture || event.pointerId !== gesture.pointerId || gesture.released) return;
+    gesture.released = true;
+    if (forceCancel) gesture.cancelArmed = true;
+    try {
+      voiceButton.releasePointerCapture?.(event.pointerId);
+    } catch (_) {
+      // Capture may already have been released by the browser.
+    }
+    if (gesture.recorder) finishRecording(gesture.cancelArmed);
+  }
+
+  textarea.addEventListener("input", () => {
+    state.userTypedDuringBootstrap = state.phase === CAPTURE_BROWSER_STATES.BOOTSTRAPPING;
+    state.dirty = true;
+    if (state.revisionConflict) {
+      state.phase = CAPTURE_BROWSER_STATES.REVISION_CONFLICT;
+      setCaptureStatus("本页文字已更新；请选择要保留的文字版本。", "error");
+    } else if (state.savePending) {
+      state.savePending = false;
+      state.phase = CAPTURE_BROWSER_STATES.REVISION_CONFLICT;
+      setCaptureStatus("最终保存结果尚未确认；新文字只保留在本地，请先刷新确认。", "error");
+    } else {
+      state.phase = CAPTURE_BROWSER_STATES.DIRTY;
+      setCaptureStatus("正在等待持久保存…");
+      scheduleAutosave();
+    }
+    writeSafetyBuffer();
+    updateCaptureControls();
+  });
+  textarea.addEventListener("blur", () => {
+    void flushDraft({ quiet: true });
+  });
+  voiceButton.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    void beginVoiceGesture(event);
+  });
+  voiceButton.addEventListener("pointermove", (event) => {
+    const gesture = state.gesture;
+    if (!gesture || gesture.pointerId !== event.pointerId || gesture.released) return;
+    gesture.cancelArmed = voiceGestureCancelArmed(gesture.startY, event.clientY);
+    if (gesture.recorder) {
+      state.phase = gesture.cancelArmed
+        ? CAPTURE_BROWSER_STATES.CANCEL_ARMED
+        : CAPTURE_BROWSER_STATES.RECORDING;
+      updateCaptureControls();
+    }
+  });
+  voiceButton.addEventListener("pointerup", (event) => releaseVoiceGesture(event));
+  voiceButton.addEventListener("pointercancel", (event) => releaseVoiceGesture(event, true));
+  voiceButton.addEventListener("lostpointercapture", (event) => releaseVoiceGesture(event, true));
+
+  segmentList.addEventListener("click", async (event) => {
+    const retry = event.target.closest(".voice-segment-retry");
+    const remove = event.target.closest(".voice-segment-delete");
+    const target = retry || remove;
+    if (!target) return;
+    const segmentId = Number(target.dataset.segmentId);
+    target.disabled = true;
+    if (remove && !window.confirm("永久删除这段原始录音吗？此操作不可恢复。")) {
+      target.disabled = false;
+      return;
+    }
+    try {
+      if (retry) {
+        const retriedSegment = await api(`/api/voice-segments/${segmentId}/retry`, {
+          method: "POST",
+        });
+        state.voiceSegmentStatuses.set(
+          retriedSegment.id,
+          retriedSegment.transcription_status,
+        );
+        setCaptureStatus("正在重试转写…");
+      } else {
+        await api(`/api/voice-segments/${segmentId}`, { method: "DELETE" });
+        setCaptureStatus("失败录音已删除，可以重新录制。", "success");
+      }
+      await refreshDraft({ polling: Boolean(retry) });
+    } catch (error) {
+      setCaptureStatus(`操作未完成：${error.message}`, "error");
+      target.disabled = false;
+    }
+  });
+
+  pendingUploadActions.querySelector(".pending-upload-retry").addEventListener("click", () => {
+    if (
+      state.pendingUpload &&
+      !state.revisionConflict &&
+      state.phase !== CAPTURE_BROWSER_STATES.UPLOADING
+    ) {
+      void uploadRecording(state.pendingUpload.blob, state.pendingUpload.clientSegmentId);
+    }
+  });
+  pendingUploadActions.querySelector(".pending-upload-delete").addEventListener("click", () => {
+    if (!window.confirm("删除这段尚未上传的录音吗？此操作不可恢复。")) return;
+    state.pendingUpload = null;
+    setCaptureStatus(
+      state.revisionConflict
+        ? "未上传录音已删除；仍需选择要保留的 Draft 文字。"
+        : "未上传录音已删除。",
+      state.revisionConflict ? "error" : "success",
+    );
+    updateCaptureControls();
+  });
+
+  revisionConflictPanel.addEventListener("click", (event) => {
+    const keepLocal = event.target.closest(".conflict-keep-local");
+    const useServer = event.target.closest(".conflict-use-server");
+    if ((!keepLocal && !useServer) || !state.revisionConflict) return;
+    const pendingUpload = state.pendingUpload;
+    const serverDraft = state.revisionConflict.serverDraft;
+    if (useServer) {
+      if (!serverDraft) return;
+      textarea.value = serverDraft.current_text;
+      state.draft = serverDraft;
+      state.dirty = false;
+      clearCaptureDraft();
+    } else {
+      state.draft = serverDraft;
+      state.dirty = true;
+      writeSafetyBuffer();
+    }
+    state.revisionConflict = null;
+    state.phase = pendingUpload || state.dirty
+      ? CAPTURE_BROWSER_STATES.DIRTY
+      : CAPTURE_BROWSER_STATES.OPEN;
+    updateCaptureControls();
+    if (pendingUpload) {
+      void uploadRecording(pendingUpload.blob, pendingUpload.clientSegmentId);
+    } else if (keepLocal) {
+      void flushDraft();
+    } else {
+      setCaptureStatus("已采用服务器 Draft。", "success");
+    }
+  });
+
+  discardButton.addEventListener("click", async () => {
+    if (!window.confirm("永久丢弃当前 Draft、未保存文字和其中的原始录音吗？")) return;
+    if (state.pendingUpload) {
+      state.pendingUpload = null;
+    }
+    state.revisionConflict = null;
+    discardButton.disabled = true;
+    try {
+      if (state.draft && !state.savePending) {
+        await api(`/api/capture-draft?revision=${state.draft.revision}`, {
+          method: "DELETE",
+        });
+      }
+      state.draft = null;
+      state.voiceSegmentStatuses = new Map();
+      state.dirty = false;
+      state.savePending = false;
+      textarea.value = "";
+      clearCaptureDraft();
+      setCaptureStatus("Draft 已丢弃。", "success");
+      updateCaptureControls();
+    } catch (error) {
+      setCaptureStatus(`Draft 未丢弃，本地文字仍保留：${error.message}`, "error");
+      discardButton.disabled = false;
+    }
+  });
+
+  const visibilityHandler = () => {
+    if (document.visibilityState === "hidden") {
+      writeSafetyBuffer();
+      void flushDraft({ quiet: true });
+    }
+  };
+  const beforeUnloadHandler = (event) => {
+    writeSafetyBuffer();
+    if (state.pendingUpload || state.revisionConflict) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  };
+  document.addEventListener("visibilitychange", visibilityHandler);
+  window.addEventListener("beforeunload", beforeUnloadHandler);
+
+  activeCaptureController = {
+    location: `${window.location.pathname}${window.location.search}`,
+    flush: flushDraft,
+    deferSessionExpiredRedirect() {
+      if (!state.pendingUpload && !state.gesture) return false;
+      setCaptureStatus(
+        "登录状态已失效；尚未确认的录音仍保留在本页，请先重试或明确删除。",
+        "error",
+      );
+      return true;
+    },
+    async prepareNavigation() {
+      if (state.pendingUpload || state.revisionConflict) {
+        setCaptureStatus(
+          state.pendingUpload
+            ? "录音尚未安全上传；请先重试上传或明确删除。"
+            : "Draft 文字冲突尚未解决；请先明确选择文字版本。",
+          "error",
+        );
+        return false;
+      }
+      await flushDraft({ quiet: true }).catch(() => null);
+      return true;
+    },
+    dispose() {
+      state.disposed = true;
+      if (state.autosaveTimer) window.clearTimeout(state.autosaveTimer);
+      if (state.statusPollTimer) window.clearTimeout(state.statusPollTimer);
+      if (state.completionFeedbackTimer) {
+        window.clearTimeout(state.completionFeedbackTimer);
+      }
+      if (state.gesture?.recorder && state.gesture.recorder.state !== "inactive") {
+        state.gesture.discard = true;
+        state.gesture.recorder.stop();
+      } else {
+        stopTracks(state.gesture?.stream);
+      }
+      document.removeEventListener("visibilitychange", visibilityHandler);
+      window.removeEventListener("beforeunload", beforeUnloadHandler);
+    },
+  };
 
   function renderQuickConfirmation() {
     const items = quickItems.filter(
@@ -1745,18 +2744,42 @@ function renderCapture() {
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const originalText = textarea.value.trim();
-    if (!originalText) return;
+    if (!textarea.value.trim()) return;
+    if (
+      state.pendingUpload || state.revisionConflict || state.gesture ||
+      captureHasActiveSegment(state.draft) ||
+      captureHasFailedSegment(state.draft)
+    ) {
+      setCaptureStatus("请先完成、重试或明确删除当前录音，再保存。", "error");
+      return;
+    }
     button.disabled = true;
     button.setAttribute("aria-busy", "true");
     button.textContent = "保存中…";
-    status.dataset.kind = "";
-    status.textContent = "正在保存原文…";
+    setCaptureStatus("正在最终保存…");
     try {
-      await api("/api/inputs", {
+      if (!state.savePending) {
+        await flushDraft({ ensureDraft: true });
+      }
+      if (!state.draft) {
+        throw new Error("Draft 尚未建立；本地文字仍保留。");
+      }
+      state.phase = CAPTURE_BROWSER_STATES.SAVING;
+      state.savePending = true;
+      state.dirty = false;
+      writeSafetyBuffer({ savePending: true });
+      updateCaptureControls();
+      await api("/api/capture-draft/save", {
         method: "POST",
-        body: JSON.stringify({ original_text: originalText, input_method: "text" }),
+        body: JSON.stringify({
+          draft_id: state.draft.id,
+          revision: state.draft.revision,
+        }),
       });
+      state.draft = null;
+      state.dirty = false;
+      state.savePending = false;
+      state.phase = CAPTURE_BROWSER_STATES.OPEN;
       textarea.value = "";
       clearCaptureDraft();
       status.dataset.kind = "success";
@@ -1770,14 +2793,24 @@ function renderCapture() {
         }
       }, 1800);
     } catch (error) {
-      status.dataset.kind = "error";
-      status.textContent = `尚未保存，输入仍保留：${error.message}`;
+      state.phase = CAPTURE_BROWSER_STATES.OPEN;
+      const definiteRejection = error instanceof ApiError &&
+        [404, 409, 422].includes(error.status);
+      if (definiteRejection) {
+        state.savePending = false;
+        writeSafetyBuffer({ savePending: false });
+        await refreshDraft();
+      } else if (state.savePending) {
+        writeSafetyBuffer({ savePending: true });
+      }
+      setCaptureStatus(`最终保存尚未确认，输入仍保留：${error.message}`, "error");
     } finally {
-      button.disabled = false;
       button.removeAttribute("aria-busy");
       button.textContent = "保存";
+      updateCaptureControls();
     }
   });
+  void bootstrapDraft();
   void loadQuickConfirmation();
 }
 
@@ -1786,12 +2819,24 @@ function inputStatusCard(input, failed = false) {
     ? `<span class="tag unknown">${escapeHtml(labels[input.failure_type] || input.failure_type)}</span>`
     : "";
   const failureMessage = input.failure_message || "未记录具体原因；请重新整理以获取诊断。";
+  const originalAudio = failed && input.voice_segment_ids?.length
+    ? `<div class="saved-capture-audio">
+        <strong>原始录音</strong>
+        ${input.voice_segment_ids.map((segmentId, index) =>
+          voiceAudioMarkup(segmentId, `播放失败 Capture 的第 ${index + 1} 段原始录音`)
+        ).join("")}
+      </div>`
+    : "";
   return `
     <article class="status-card ${failed ? "failed" : "pending"}">
       <p class="original-preview">${escapeHtml(input.original_text)}</p>
       <p class="muted">${failed ? "整理失败，原文已安全保存。" : "原文已保存，正在整理。"}</p>
       ${failed ? `<div class="failure-reason">${failureLabel}<span>${escapeHtml(failureMessage)}</span></div>` : ""}
-      ${failed ? `<button class="secondary-button retry-button" data-input-id="${input.id}">重新整理</button>` : ""}
+      ${originalAudio}
+      ${failed ? `<div class="failed-capture-actions">
+        <button class="secondary-button retry-button" data-input-id="${input.id}">重新整理</button>
+        <button class="text-button delete-input-button" data-input-id="${input.id}">删除 Capture</button>
+      </div>` : ""}
     </article>`;
 }
 
@@ -1879,6 +2924,20 @@ async function renderDashboard({ silent = false } = {}) {
         button.disabled = true;
         try {
           await api(`/api/inputs/${button.dataset.inputId}/retry`, { method: "POST" });
+          await renderDashboard({ silent: true });
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = error.message;
+        }
+      });
+    });
+
+    document.querySelectorAll(".delete-input-button").forEach((button) => {
+      button.addEventListener("click", async () => {
+        if (!window.confirm("永久删除这条失败 Capture、原文和原始录音吗？此操作不可恢复。")) return;
+        button.disabled = true;
+        try {
+          await api(`/api/inputs/${button.dataset.inputId}`, { method: "DELETE" });
           await renderDashboard({ silent: true });
         } catch (error) {
           button.disabled = false;
@@ -2482,6 +3541,11 @@ async function renderDetail(
 }
 
 function renderRoute() {
+  if (activeCaptureController) {
+    const previousCaptureController = activeCaptureController;
+    activeCaptureController = null;
+    previousCaptureController.dispose();
+  }
   if (pollTimer) window.clearTimeout(pollTimer);
   pollTimer = null;
   document.body.classList.remove("editing-fields");
