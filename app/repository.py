@@ -124,7 +124,10 @@ class Repository:
         )
 
     @staticmethod
-    def _input_from_row(row: sqlite3.Row) -> ItemInputPublic:
+    def _input_from_row(
+        row: sqlite3.Row,
+        voice_segment_ids: list[int] | None = None,
+    ) -> ItemInputPublic:
         return ItemInputPublic(
             id=row["id"],
             item_id=row["item_id"],
@@ -134,7 +137,26 @@ class Repository:
             failure_type=row["failure_type"],
             failure_message=row["failure_message"],
             created_time=datetime.fromisoformat(row["created_time"]),
+            voice_segment_ids=voice_segment_ids or [],
         )
+
+    @staticmethod
+    def _voice_segment_ids(
+        connection: sqlite3.Connection,
+        input_id: int,
+        user_id: int,
+    ) -> list[int]:
+        return [
+            int(row["id"])
+            for row in connection.execute(
+                """
+                SELECT id FROM voice_segments
+                WHERE item_input_id = ? AND user_id = ?
+                ORDER BY position ASC, id ASC
+                """,
+                (input_id, user_id),
+            )
+        ]
 
     def create_input(
         self,
@@ -188,9 +210,12 @@ class Repository:
                 "SELECT * FROM item_inputs WHERE id = ? AND user_id = ?",
                 (input_id, user_id),
             ).fetchone()
-        if row is None:
-            raise NotFoundError("input not found")
-        return self._input_from_row(row)
+            if row is None:
+                raise NotFoundError("input not found")
+            return self._input_from_row(
+                row,
+                self._voice_segment_ids(connection, input_id, user_id),
+            )
 
     def list_inputs_for_item(
         self, item_id: int, user_id: int
@@ -204,7 +229,13 @@ class Repository:
                 """,
                 (item_id, user_id),
             ).fetchall()
-        return [self._input_from_row(row) for row in rows]
+            return [
+                self._input_from_row(
+                    row,
+                    self._voice_segment_ids(connection, int(row["id"]), user_id),
+                )
+                for row in rows
+            ]
 
     def list_unlinked_inputs(
         self, statuses: Iterable[ProcessingStatus], user_id: int
@@ -222,7 +253,13 @@ class Repository:
                 """,
                 [user_id, *status_values],
             ).fetchall()
-        return [self._input_from_row(row) for row in rows]
+            return [
+                self._input_from_row(
+                    row,
+                    self._voice_segment_ids(connection, int(row["id"]), user_id),
+                )
+                for row in rows
+            ]
 
     def system_list_pending_inputs(self) -> list[SystemPendingInput]:
         """Return all queued inputs for trusted startup recovery only."""
@@ -308,7 +345,47 @@ class Repository:
                 "SELECT * FROM item_inputs WHERE id = ? AND user_id = ?",
                 (input_id, user_id),
             ).fetchone()
-        return self._input_from_row(updated)
+            voice_segment_ids = self._voice_segment_ids(
+                connection,
+                input_id,
+                user_id,
+            )
+        return self._input_from_row(updated, voice_segment_ids)
+
+    def delete_failed_unlinked_input(self, input_id: int, user_id: int) -> None:
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM item_inputs WHERE id = ? AND user_id = ?",
+                (input_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("input not found")
+            if (
+                row["item_id"] is not None
+                or row["processing_status"] != ProcessingStatus.FAILED.value
+            ):
+                raise InvalidOperationError(
+                    "only failed unlinked Captures can be deleted"
+                )
+            storage_keys = [
+                str(segment["storage_key"])
+                for segment in connection.execute(
+                    """
+                    SELECT storage_key FROM voice_segments
+                    WHERE item_input_id = ? AND user_id = ?
+                    """,
+                    (input_id, user_id),
+                )
+            ]
+            VoiceDeletionLedger.record(
+                connection,
+                storage_keys,
+                "failed_input_delete",
+            )
+            connection.execute(
+                "DELETE FROM item_inputs WHERE id = ? AND user_id = ?",
+                (input_id, user_id),
+            )
 
     def get_item(self, item_id: int, user_id: int) -> PersonalItemPublic:
         with self.database.connection() as connection:

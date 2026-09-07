@@ -38,6 +38,30 @@ class ProcessingStatus(str, Enum):
     FAILED = "failed"
 
 
+class VoiceTranscriptionStatus(str, Enum):
+    PENDING = "pending"
+    TRANSCRIBING = "transcribing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class VoiceFailureCode(str, Enum):
+    CONFIGURATION = "configuration"
+    NETWORK = "network"
+    TIMEOUT = "timeout"
+    AUTHENTICATION = "authentication"
+    QUOTA_RATE_LIMIT = "quota_rate_limit"
+    PROVIDER_REJECTED = "provider_rejected"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    INVALID_RESPONSE = "invalid_response"
+    MEDIA_PROBE = "media_probe"
+    UNSUPPORTED_MEDIA = "unsupported_media"
+    CONVERSION = "conversion"
+    INTERRUPTED = "interrupted"
+    INTERNAL = "internal"
+    DRAFT_TEXT_LIMIT = "draft_text_limit"
+
+
 class FailureType(str, Enum):
     CONFIGURATION = "configuration"
     NETWORK = "network"
@@ -268,6 +292,51 @@ class ItemInputPublic(StrictModel):
     failure_type: FailureType | None = None
     failure_message: str | None = Field(default=None, max_length=500)
     created_time: datetime
+    voice_segment_ids: list[int] = Field(default_factory=list)
+
+
+class VoiceSegmentPublic(StrictModel):
+    id: int
+    position: int
+    client_segment_id: str
+    original_size_bytes: int
+    client_content_type: str | None
+    detected_container: str | None
+    detected_codec: str | None
+    sample_rate_hz: int | None
+    channels: int | None
+    duration_ms: int | None
+    transcription_status: VoiceTranscriptionStatus
+    provider_transcript: str | None
+    failure_code: VoiceFailureCode | None
+    failure_message: str | None = Field(default=None, max_length=500)
+    attempt_count: int
+    created_time: datetime
+    updated_time: datetime
+
+
+class CaptureDraftPublic(StrictModel):
+    id: int
+    current_text: str
+    revision: int
+    created_time: datetime
+    updated_time: datetime
+    voice_segments: list[VoiceSegmentPublic] = Field(default_factory=list)
+
+
+class CaptureDraftResponse(StrictModel):
+    draft: CaptureDraftPublic | None
+    voice_available: bool = False
+
+
+class CaptureDraftPutRequest(StrictModel):
+    current_text: str = Field(max_length=10_000)
+    revision: int = Field(ge=0)
+
+
+class CaptureDraftSaveRequest(StrictModel):
+    draft_id: int = Field(gt=0)
+    revision: int = Field(ge=0)
 
 
 class PersonalItemPublic(StrictModel):

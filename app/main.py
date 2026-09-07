@@ -11,6 +11,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
+    Request,
     Response,
     status,
 )
@@ -60,6 +61,7 @@ from app.services.voice_media import VoiceMediaProcessor
 from app.services.voice_storage import VoiceStorage
 from app.services.voice_transcription import ASRProvider, VoiceTranscriptionService
 from app.voice_repository import VoiceCaptureRepository
+from app.voice_routes import create_voice_router, drain_voice_deletions
 from app.voice_runtime import VoiceRuntime, validate_voice_runtime
 
 
@@ -234,6 +236,13 @@ def create_app(
             require_csrf_validated_session,
         )
     )
+    app.include_router(
+        create_voice_router(
+            voice_repository,
+            require_current_user,
+            require_csrf_current_user,
+        )
+    )
 
     def add_reminder_state(
         items: list[DashboardItem],
@@ -328,6 +337,24 @@ def create_app(
             current_user.id,
         )
         return item_input
+
+    @app.delete(
+        "/api/inputs/{input_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def delete_failed_input(
+        input_id: int,
+        request: Request,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> Response:
+        try:
+            repository.delete_failed_unlinked_input(input_id, current_user.id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidOperationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        drain_voice_deletions(request)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post(
         "/api/items/{item_id}/reprocess",

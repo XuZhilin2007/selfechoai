@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.database import Database
-from app.repository import NotFoundError
+from app.repository import NotFoundError, Repository
+from app.schemas import ItemInputPublic
 from app.services.voice_deletions import VoiceDeletionLedger
 from app.services.voice_media import MediaMetadata
 from app.services.voice_storage import StoredOriginal
@@ -86,6 +87,12 @@ class VoiceSegmentUploadResult:
 class PendingVoiceSegment:
     segment_id: int
     user_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class FinalSaveResult:
+    item_input: ItemInputPublic
+    created: bool
 
 
 def utc_now_iso() -> str:
@@ -281,6 +288,112 @@ class VoiceCaptureRepository:
                 (row["id"], user_id),
             )
         return True
+
+    def save_draft(
+        self,
+        user_id: int,
+        draft_id: int,
+        expected_revision: int,
+    ) -> FinalSaveResult:
+        if draft_id <= 0:
+            raise ValueError("draft_id must be positive")
+        if expected_revision < 0:
+            raise ValueError("expected_revision must be non-negative")
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM item_inputs
+                WHERE user_id = ? AND source_draft_id = ?
+                """,
+                (user_id, draft_id),
+            ).fetchone()
+            if existing is not None:
+                segment_ids = Repository._voice_segment_ids(
+                    connection,
+                    int(existing["id"]),
+                    user_id,
+                )
+                return FinalSaveResult(
+                    item_input=Repository._input_from_row(existing, segment_ids),
+                    created=False,
+                )
+
+            draft = connection.execute(
+                """
+                SELECT * FROM capture_drafts
+                WHERE id = ? AND user_id = ?
+                """,
+                (draft_id, user_id),
+            ).fetchone()
+            if draft is None:
+                raise NotFoundError("Capture Draft not found")
+            if int(draft["revision"]) != expected_revision:
+                raise DraftRevisionConflictError("Capture Draft revision is stale")
+            current_text = str(draft["current_text"])
+            if not current_text.strip():
+                raise DraftBlockedError("Capture Draft text must not be blank")
+
+            segments = connection.execute(
+                """
+                SELECT * FROM voice_segments
+                WHERE draft_id = ? AND user_id = ?
+                ORDER BY position ASC, id ASC
+                """,
+                (draft_id, user_id),
+            ).fetchall()
+            incomplete = [
+                str(segment["transcription_status"])
+                for segment in segments
+                if segment["transcription_status"] != "succeeded"
+            ]
+            if incomplete:
+                if "failed" in incomplete:
+                    raise DraftBlockedError(
+                        "failed Voice Segments must be retried or deleted before Save"
+                    )
+                raise DraftBlockedError(
+                    "Voice transcription must finish before Save"
+                )
+
+            input_method = "voice" if segments else "text"
+            cursor = connection.execute(
+                """
+                INSERT INTO item_inputs (
+                    user_id, item_id, source_draft_id, original_text,
+                    input_method, processing_status, created_time
+                ) VALUES (?, NULL, ?, ?, ?, 'pending', ?)
+                """,
+                (user_id, draft_id, current_text, input_method, now),
+            )
+            input_id = int(cursor.lastrowid)
+            updated = connection.execute(
+                """
+                UPDATE voice_segments
+                SET draft_id = NULL, item_input_id = ?, updated_time = ?
+                WHERE draft_id = ? AND user_id = ?
+                """,
+                (input_id, now, draft_id, user_id),
+            )
+            if updated.rowcount != len(segments):
+                raise RuntimeError("Voice Segment reparent count changed during Save")
+            deleted = connection.execute(
+                "DELETE FROM capture_drafts WHERE id = ? AND user_id = ?",
+                (draft_id, user_id),
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError("Capture Draft changed during Save")
+            row = connection.execute(
+                "SELECT * FROM item_inputs WHERE id = ? AND user_id = ?",
+                (input_id, user_id),
+            ).fetchone()
+            return FinalSaveResult(
+                item_input=Repository._input_from_row(
+                    row,
+                    [int(segment["id"]) for segment in segments],
+                ),
+                created=True,
+            )
 
     def create_pending_segment(
         self,
