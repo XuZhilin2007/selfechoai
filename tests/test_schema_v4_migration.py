@@ -12,7 +12,7 @@ from app.database import (
     REQUIRED_V4_INDEXES,
     SCHEMA_V3,
     SCHEMA_V3_VERSION,
-    SCHEMA_VERSION,
+    SCHEMA_V4_VERSION,
 )
 from app.migrations import v004_reminders
 from app.migrations.v004_reminders import (
@@ -244,12 +244,20 @@ def test_v3_database_migrates_to_v4_without_losing_community_data(tmp_path: Path
         "reminder_deliveries": 0,
     }
     assert REQUIRED_V4_INDEXES <= indexes
-    assert version == SCHEMA_VERSION
+    assert version == SCHEMA_V4_VERSION
     assert foreign_key_errors == []
     assert integrity == "ok"
 
     database = Database(database_path)
-    database.initialize()
+    with database.connection() as validation_connection:
+        tables = {
+            row["name"]
+            for row in validation_connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        Database._validate_v4_schema(validation_connection, tables)
     migrated_session = AuthRepository(database).get_session_by_token_hash(
         "synthetic-session-token-hash"
     )

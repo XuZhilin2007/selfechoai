@@ -8,16 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.database import (
+    CAPTURE_DRAFTS_TABLE_SQL,
     Database,
-    PUSH_SUBSCRIPTIONS_TABLE_SQL,
-    REMINDER_DELIVERIES_TABLE_SQL,
-    REMINDERS_TABLE_SQL,
-    SCHEMA_V3_VERSION,
+    REQUIRED_V4_INDEXES,
+    REQUIRED_V5_INDEXES,
     SCHEMA_V4_VERSION,
-    USER_SESSIONS_OWNERSHIP_INDEX_SQL,
-    V4_INDEXES_SQL,
+    SCHEMA_VERSION,
+    V5_INDEXES_SQL,
+    V5_PRE_VOICE_INDEXES_SQL,
+    VOICE_FILE_DELETIONS_TABLE_SQL,
+    VOICE_SEGMENTS_TABLE_SQL,
 )
-from app.time_utils import validate_timezone_name
 
 
 class MigrationError(RuntimeError):
@@ -32,6 +33,9 @@ class MigrationPreflight:
     personal_item_count: int
     item_input_count: int
     user_session_count: int
+    reminder_count: int
+    push_subscription_count: int
+    reminder_delivery_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,15 +44,17 @@ class MigrationResult:
     personal_item_count: int
     item_input_count: int
     user_session_count: int
+    reminder_count: int
+    push_subscription_count: int
+    reminder_delivery_count: int
 
 
-def inspect_v3_database(database_path: Path) -> MigrationPreflight:
-    """Validate a Community schema-v3 database through a read-only connection."""
+def inspect_v4_database(database_path: Path) -> MigrationPreflight:
+    """Validate a Community v4 database through a read-only connection."""
 
     database_path = database_path.expanduser().resolve()
     if not database_path.is_file():
         raise MigrationError(f"database file does not exist: {database_path}")
-
     try:
         connection = sqlite3.connect(
             f"{database_path.as_uri()}?mode=ro",
@@ -70,13 +76,12 @@ def inspect_v3_database(database_path: Path) -> MigrationPreflight:
         connection.close()
 
 
-def migrate_v3_to_v4(database_path: Path) -> MigrationResult:
-    """Explicitly migrate a stopped, backed-up Community v3 database to v4."""
+def migrate_v4_to_v5(database_path: Path) -> MigrationResult:
+    """Explicitly migrate a stopped, backed-up Community v4 database to v5."""
 
     database_path = database_path.expanduser().resolve()
     if not database_path.is_file():
         raise MigrationError(f"database file does not exist: {database_path}")
-
     try:
         connection = sqlite3.connect(database_path, timeout=10)
     except sqlite3.DatabaseError as exc:
@@ -88,42 +93,26 @@ def migrate_v3_to_v4(database_path: Path) -> MigrationResult:
     try:
         _validate_source_database(connection)
         preflight = _preflight_from_connection(database_path, connection)
-
         connection.execute("BEGIN IMMEDIATE")
         try:
             connection.execute(
                 """
-                ALTER TABLE users
-                ADD COLUMN default_reminder_time TEXT NOT NULL DEFAULT '09:00'
-                CHECK (
-                    length(default_reminder_time) = 5
-                    AND default_reminder_time GLOB '[0-2][0-9]:[0-5][0-9]'
-                    AND substr(default_reminder_time, 1, 2) BETWEEN '00' AND '23'
-                )
+                ALTER TABLE item_inputs
+                ADD COLUMN source_draft_id INTEGER
+                CHECK (source_draft_id IS NULL OR source_draft_id > 0)
                 """
             )
-            connection.execute(
-                """
-                ALTER TABLE personal_items
-                ADD COLUMN reminder_prompt_dismissed_at TEXT
-                """
-            )
-            _execute_statements(connection, USER_SESSIONS_OWNERSHIP_INDEX_SQL)
-            connection.execute(REMINDERS_TABLE_SQL)
-            connection.execute(PUSH_SUBSCRIPTIONS_TABLE_SQL)
-            connection.execute(REMINDER_DELIVERIES_TABLE_SQL)
-            _execute_statements(connection, V4_INDEXES_SQL)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_V4_VERSION}")
+            connection.execute(CAPTURE_DRAFTS_TABLE_SQL)
+            _execute_statements(connection, V5_PRE_VOICE_INDEXES_SQL)
+            connection.execute(VOICE_SEGMENTS_TABLE_SQL)
+            connection.execute(VOICE_FILE_DELETIONS_TABLE_SQL)
+            _execute_statements(connection, V5_INDEXES_SQL)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
             _validate_migrated_data(connection, preflight)
-            Database._validate_v4_schema(connection, _table_names(connection))
-
-            foreign_key_errors = connection.execute(
-                "PRAGMA foreign_key_check"
-            ).fetchall()
-            if foreign_key_errors:
+            Database._validate_v5_schema(connection, _table_names(connection))
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
                 raise MigrationError("foreign key validation failed after migration")
-
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
                 raise MigrationError(
@@ -139,6 +128,9 @@ def migrate_v3_to_v4(database_path: Path) -> MigrationResult:
             personal_item_count=preflight.personal_item_count,
             item_input_count=preflight.item_input_count,
             user_session_count=preflight.user_session_count,
+            reminder_count=preflight.reminder_count,
+            push_subscription_count=preflight.push_subscription_count,
+            reminder_delivery_count=preflight.reminder_delivery_count,
         )
     except MigrationError:
         raise
@@ -154,33 +146,37 @@ def migrate_v3_to_v4(database_path: Path) -> MigrationResult:
 
 def _validate_source_database(connection: sqlite3.Connection) -> None:
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version != SCHEMA_V3_VERSION:
+    if version != SCHEMA_V4_VERSION:
         raise MigrationError(
-            f"expected database schema version {SCHEMA_V3_VERSION}, got {version}"
+            f"expected database schema version {SCHEMA_V4_VERSION}, got {version}"
         )
 
     tables = _table_names(connection)
     try:
-        Database._validate_v3_schema(connection, tables)
+        Database._validate_v4_schema(connection, tables)
     except RuntimeError as exc:
         raise MigrationError(str(exc)) from exc
 
     unexpected_tables = {
-        "reminders",
-        "push_subscriptions",
-        "reminder_deliveries",
+        "capture_drafts",
+        "voice_segments",
+        "voice_file_deletions",
     } & tables
     if unexpected_tables:
         names = ", ".join(sorted(unexpected_tables))
-        raise MigrationError(f"version 3 database contains v4 tables: {names}")
+        raise MigrationError(f"version 4 database contains v5 tables: {names}")
 
-    for row in connection.execute("SELECT id, timezone FROM users ORDER BY id"):
-        try:
-            validate_timezone_name(row["timezone"])
-        except ValueError as exc:
-            raise MigrationError(
-                f"user id {row['id']} has an invalid IANA timezone"
-            ) from exc
+    item_input_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(item_inputs)")
+    }
+    if "source_draft_id" in item_input_columns:
+        raise MigrationError("version 4 item_inputs contains the v5 source_draft_id")
+
+    existing_indexes = _index_names(connection)
+    unexpected_indexes = (REQUIRED_V5_INDEXES - REQUIRED_V4_INDEXES) & existing_indexes
+    if unexpected_indexes:
+        names = ", ".join(sorted(unexpected_indexes))
+        raise MigrationError(f"version 4 database contains v5 indexes: {names}")
 
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     if integrity != "ok":
@@ -198,18 +194,23 @@ def _validate_migrated_data(
         "personal_items": preflight.personal_item_count,
         "item_inputs": preflight.item_input_count,
         "user_sessions": preflight.user_session_count,
+        "reminders": preflight.reminder_count,
+        "push_subscriptions": preflight.push_subscription_count,
+        "reminder_deliveries": preflight.reminder_delivery_count,
     }
     for table_name, expected_count in expected_counts.items():
         if _row_count(connection, table_name) != expected_count:
             raise MigrationError(f"{table_name} row count changed during migration")
 
-    if connection.execute(
-        """
-        SELECT COUNT(*) FROM users
-        WHERE default_reminder_time != '09:00'
-        """
-    ).fetchone()[0]:
-        raise MigrationError("default reminder time backfill failed")
+    for table_name in ("capture_drafts", "voice_segments", "voice_file_deletions"):
+        if _row_count(connection, table_name) != 0:
+            raise MigrationError(f"new table {table_name} was not empty")
+
+    legacy_sources = connection.execute(
+        "SELECT COUNT(*) FROM item_inputs WHERE source_draft_id IS NOT NULL"
+    ).fetchone()[0]
+    if legacy_sources:
+        raise MigrationError("legacy item_inputs source_draft_id backfill is not NULL")
 
 
 def _preflight_from_connection(
@@ -218,11 +219,14 @@ def _preflight_from_connection(
 ) -> MigrationPreflight:
     return MigrationPreflight(
         database_path=database_path,
-        schema_version=SCHEMA_V3_VERSION,
+        schema_version=SCHEMA_V4_VERSION,
         user_count=_row_count(connection, "users"),
         personal_item_count=_row_count(connection, "personal_items"),
         item_input_count=_row_count(connection, "item_inputs"),
         user_session_count=_row_count(connection, "user_sessions"),
+        reminder_count=_row_count(connection, "reminders"),
+        push_subscription_count=_row_count(connection, "push_subscriptions"),
+        reminder_delivery_count=_row_count(connection, "reminder_deliveries"),
     )
 
 
@@ -234,10 +238,18 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {
         row["name"]
         for row in connection.execute(
-            """
-            SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-            """
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+
+
+def _index_names(connection: sqlite3.Connection) -> set[str]:
+    return {
+        row["name"]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
         )
     }
 
@@ -250,13 +262,13 @@ def _execute_statements(connection: sqlite3.Connection, sql: str) -> None:
 
 def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Explicitly migrate a stopped SelfEcho schema v3 database to v4."
+        description="Explicitly migrate a stopped SelfEcho schema v4 database to v5."
     )
     parser.add_argument(
         "--database",
         type=Path,
         required=True,
-        help="Path to the stopped schema v3 SQLite database",
+        help="Path to the stopped schema v4 SQLite database",
     )
     parser.add_argument(
         "--check-only",
@@ -272,36 +284,40 @@ def main(
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
 ) -> int:
-    parser = _build_argument_parser()
-    arguments = parser.parse_args(argv)
-
+    arguments = _build_argument_parser().parse_args(argv)
     try:
-        preflight = inspect_v3_database(arguments.database)
+        preflight = inspect_v4_database(arguments.database)
         output_fn(f"Database: {preflight.database_path}")
         output_fn(f"Schema version: {preflight.schema_version}")
         output_fn(f"Users: {preflight.user_count}")
         output_fn(f"Personal Items: {preflight.personal_item_count}")
         output_fn(f"Item Inputs: {preflight.item_input_count}")
         output_fn(f"User Sessions: {preflight.user_session_count}")
+        output_fn(f"Reminders: {preflight.reminder_count}")
+        output_fn(f"Push Subscriptions: {preflight.push_subscription_count}")
+        output_fn(f"Reminder Deliveries: {preflight.reminder_delivery_count}")
         if arguments.check_only:
             output_fn("Preflight passed. No database changes were made.")
             return 0
 
-        output_fn("A validated, recoverable schema v3 backup is required.")
+        output_fn("A validated, recoverable schema v4 backup is required.")
         confirmation = input_fn(
-            'Type "MIGRATE V3 TO V4" to execute the transaction: '
+            'Type "MIGRATE V4 TO V5" to execute the transaction: '
         ).strip()
-        if confirmation != "MIGRATE V3 TO V4":
+        if confirmation != "MIGRATE V4 TO V5":
             output_fn("Migration cancelled. No database changes were made.")
             return 2
 
-        result = migrate_v3_to_v4(preflight.database_path)
+        result = migrate_v4_to_v5(preflight.database_path)
         output_fn("Migration completed successfully.")
         output_fn(f"Users preserved: {result.user_count}")
         output_fn(f"Personal Items preserved: {result.personal_item_count}")
         output_fn(f"Item Inputs preserved: {result.item_input_count}")
         output_fn(f"User Sessions preserved: {result.user_session_count}")
-        output_fn(f"Schema version is now {SCHEMA_V4_VERSION}.")
+        output_fn(f"Reminders preserved: {result.reminder_count}")
+        output_fn(f"Push Subscriptions preserved: {result.push_subscription_count}")
+        output_fn(f"Reminder Deliveries preserved: {result.reminder_delivery_count}")
+        output_fn(f"Schema version is now {SCHEMA_VERSION}.")
         return 0
     except (MigrationError, ValueError) as exc:
         output_fn(f"ERROR: {exc}")

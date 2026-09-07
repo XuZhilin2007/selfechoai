@@ -12,7 +12,7 @@ from app.database import (
     Database,
     DatabaseVersionError,
     SCHEMA_V3_VERSION,
-    SCHEMA_VERSION,
+    SCHEMA_V4_VERSION,
 )
 from app.main import create_app
 from app.migrations import v003_auth
@@ -364,7 +364,7 @@ def test_v2_to_v3_to_v4_migration_chain_preserves_data(tmp_path: Path):
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     connection.close()
 
-    assert version == SCHEMA_VERSION
+    assert version == SCHEMA_V4_VERSION
     assert owner["default_reminder_time"] == "09:00"
     assert item["title"] == "需要保留 ID 的事项"
     assert item["extra_information"] == '{"constraint":"原始背景不能丢失"}'

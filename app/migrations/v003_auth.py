@@ -11,7 +11,7 @@ from pathlib import Path
 
 from app.auth import hash_password, normalize_email
 from app.database import (
-    ITEM_INPUTS_TABLE_SQL,
+    ITEM_INPUTS_V4_TABLE_SQL,
     PERSONAL_ITEMS_V3_TABLE_SQL,
     SCHEMA_V3_VERSION,
     USERS_V3_TABLE_SQL,
@@ -185,7 +185,7 @@ def migrate_v2_to_v3(database_path: Path, owner: OwnerUser) -> MigrationResult:
 
             connection.execute(USERS_V3_TABLE_SQL)
             connection.execute(PERSONAL_ITEMS_V3_TABLE_SQL)
-            connection.execute(ITEM_INPUTS_TABLE_SQL)
+            connection.execute(ITEM_INPUTS_V4_TABLE_SQL)
             connection.execute(USER_SESSIONS_TABLE_SQL)
 
             owner_cursor = connection.execute(

@@ -20,6 +20,7 @@ from app.schemas import (
     ReminderCreationCandidate,
     UserItemPatch,
 )
+from app.services.voice_deletions import VoiceDeletionLedger
 
 if TYPE_CHECKING:
     from app.reminder_repository import ReminderRepository
@@ -695,6 +696,26 @@ class Repository:
                 raise InvalidOperationError(
                     "an item must be in trash before permanent deletion"
                 )
+            storage_keys = [
+                str(segment["storage_key"])
+                for segment in connection.execute(
+                    """
+                    SELECT voice_segments.storage_key
+                    FROM voice_segments
+                    JOIN item_inputs
+                      ON item_inputs.id = voice_segments.item_input_id
+                     AND item_inputs.user_id = voice_segments.user_id
+                    WHERE item_inputs.item_id = ?
+                      AND item_inputs.user_id = ?
+                    """,
+                    (item_id, user_id),
+                )
+            ]
+            VoiceDeletionLedger.record(
+                connection,
+                storage_keys,
+                "item_permanent_delete",
+            )
             connection.execute(
                 "DELETE FROM personal_items WHERE id = ? AND user_id = ?",
                 (item_id, user_id),

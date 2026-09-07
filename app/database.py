@@ -7,7 +7,8 @@ from typing import Iterator
 
 
 SCHEMA_V3_VERSION = 3
-SCHEMA_VERSION = 4
+SCHEMA_V4_VERSION = 4
+SCHEMA_VERSION = 5
 
 USERS_V3_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -81,11 +82,36 @@ CREATE TABLE IF NOT EXISTS personal_items (
 );
 """
 
+ITEM_INPUTS_V4_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS item_inputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    item_id INTEGER,
+    original_text TEXT NOT NULL CHECK (length(trim(original_text)) > 0),
+    input_method TEXT NOT NULL CHECK (input_method IN ('text', 'voice')),
+    processing_status TEXT NOT NULL CHECK (
+        processing_status IN ('pending', 'processing', 'succeeded', 'failed')
+    ),
+    failure_type TEXT CHECK (
+        failure_type IS NULL OR failure_type IN (
+            'configuration', 'network', 'api', 'invalid_output', 'internal'
+        )
+    ),
+    failure_message TEXT,
+    created_time TEXT NOT NULL,
+    FOREIGN KEY (item_id, user_id)
+        REFERENCES personal_items(id, user_id) ON DELETE CASCADE
+);
+"""
+
 ITEM_INPUTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS item_inputs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     item_id INTEGER,
+    source_draft_id INTEGER CHECK (
+        source_draft_id IS NULL OR source_draft_id > 0
+    ),
     original_text TEXT NOT NULL CHECK (length(trim(original_text)) > 0),
     input_method TEXT NOT NULL CHECK (input_method IN ('text', 'voice')),
     processing_status TEXT NOT NULL CHECK (
@@ -234,7 +260,7 @@ SCHEMA_V3 = "\n".join(
     (
         USERS_V3_TABLE_SQL,
         PERSONAL_ITEMS_V3_TABLE_SQL,
-        ITEM_INPUTS_TABLE_SQL,
+        ITEM_INPUTS_V4_TABLE_SQL,
         USER_SESSIONS_TABLE_SQL,
         V3_INDEXES_SQL,
         f"PRAGMA user_version = {SCHEMA_V3_VERSION};",
@@ -265,6 +291,152 @@ SCHEMA_V4 = "\n".join(
     (
         USERS_TABLE_SQL,
         PERSONAL_ITEMS_TABLE_SQL,
+        ITEM_INPUTS_V4_TABLE_SQL,
+        USER_SESSIONS_TABLE_SQL,
+        V3_INDEXES_SQL,
+        USER_SESSIONS_OWNERSHIP_INDEX_SQL,
+        REMINDERS_TABLE_SQL,
+        PUSH_SUBSCRIPTIONS_TABLE_SQL,
+        REMINDER_DELIVERIES_TABLE_SQL,
+        V4_INDEXES_SQL,
+        f"PRAGMA user_version = {SCHEMA_V4_VERSION};",
+    )
+)
+
+CAPTURE_DRAFTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS capture_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE RESTRICT,
+    current_text TEXT NOT NULL DEFAULT '' CHECK (length(current_text) <= 10000),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    created_time TEXT NOT NULL,
+    updated_time TEXT NOT NULL,
+    UNIQUE (id, user_id)
+);
+"""
+
+VOICE_SEGMENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS voice_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    draft_id INTEGER,
+    item_input_id INTEGER,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    client_segment_id TEXT NOT NULL CHECK (length(trim(client_segment_id)) > 0),
+    storage_key TEXT NOT NULL UNIQUE CHECK (length(trim(storage_key)) > 0),
+    original_size_bytes INTEGER NOT NULL CHECK (original_size_bytes > 0),
+    original_sha256 TEXT NOT NULL CHECK (length(original_sha256) = 64),
+    client_content_type TEXT,
+    detected_container TEXT,
+    detected_codec TEXT,
+    sample_rate_hz INTEGER CHECK (sample_rate_hz IS NULL OR sample_rate_hz > 0),
+    channels INTEGER CHECK (channels IS NULL OR channels > 0),
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms > 0),
+    transcription_status TEXT NOT NULL CHECK (
+        transcription_status IN ('pending', 'transcribing', 'succeeded', 'failed')
+    ),
+    asr_input_kind TEXT CHECK (
+        asr_input_kind IS NULL OR asr_input_kind IN ('original_direct', 'derived_wav')
+    ),
+    provider TEXT NOT NULL CHECK (provider = 'alibaba'),
+    model TEXT NOT NULL CHECK (model = 'qwen-audio-3.0-asr-flash'),
+    provider_transcript TEXT,
+    provider_request_id TEXT,
+    failure_code TEXT CHECK (
+        failure_code IS NULL OR failure_code IN (
+            'configuration', 'network', 'timeout', 'authentication',
+            'quota_rate_limit', 'provider_rejected', 'provider_unavailable',
+            'invalid_response', 'media_probe', 'unsupported_media',
+            'conversion', 'interrupted', 'internal', 'draft_text_limit'
+        )
+    ),
+    failure_message TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    created_time TEXT NOT NULL,
+    updated_time TEXT NOT NULL,
+    transcription_started_time TEXT,
+    transcription_finished_time TEXT,
+    FOREIGN KEY (draft_id, user_id)
+        REFERENCES capture_drafts(id, user_id) ON DELETE CASCADE,
+    FOREIGN KEY (item_input_id, user_id)
+        REFERENCES item_inputs(id, user_id) ON DELETE CASCADE,
+    CHECK ((draft_id IS NOT NULL) != (item_input_id IS NOT NULL)),
+    CHECK (
+        (transcription_status = 'pending'
+            AND provider_transcript IS NULL
+            AND failure_code IS NULL
+            AND transcription_started_time IS NULL
+            AND transcription_finished_time IS NULL)
+        OR (transcription_status = 'transcribing'
+            AND provider_transcript IS NULL
+            AND failure_code IS NULL
+            AND transcription_started_time IS NOT NULL
+            AND transcription_finished_time IS NULL)
+        OR (transcription_status = 'succeeded'
+            AND provider_transcript IS NOT NULL
+            AND length(trim(provider_transcript)) > 0
+            AND failure_code IS NULL
+            AND transcription_finished_time IS NOT NULL)
+        OR (transcription_status = 'failed'
+            AND failure_code IS NOT NULL
+            AND failure_message IS NOT NULL
+            AND transcription_finished_time IS NOT NULL)
+    )
+);
+"""
+
+VOICE_FILE_DELETIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS voice_file_deletions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    storage_key TEXT NOT NULL UNIQUE CHECK (length(trim(storage_key)) > 0),
+    reason TEXT NOT NULL CHECK (
+        reason IN (
+            'segment_delete', 'draft_discard', 'failed_input_delete',
+            'item_permanent_delete', 'orphan_cleanup'
+        )
+    ),
+    created_time TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    last_attempt_time TEXT,
+    last_error TEXT
+);
+"""
+
+V5_PRE_VOICE_INDEXES_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_item_inputs_id_user
+    ON item_inputs(id, user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_item_inputs_user_source_draft
+    ON item_inputs(user_id, source_draft_id)
+    WHERE source_draft_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_capture_drafts_user_updated
+    ON capture_drafts(user_id, updated_time);
+"""
+
+V5_INDEXES_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_voice_segments_user_client
+    ON voice_segments(user_id, client_segment_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_voice_segments_draft_position
+    ON voice_segments(draft_id, position)
+    WHERE draft_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_voice_segments_input_position
+    ON voice_segments(item_input_id, position)
+    WHERE item_input_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_voice_segments_draft_active
+    ON voice_segments(draft_id)
+    WHERE draft_id IS NOT NULL
+      AND transcription_status IN ('pending', 'transcribing');
+CREATE INDEX IF NOT EXISTS idx_voice_segments_user_draft
+    ON voice_segments(user_id, draft_id, position);
+CREATE INDEX IF NOT EXISTS idx_voice_segments_user_input
+    ON voice_segments(user_id, item_input_id, position);
+CREATE INDEX IF NOT EXISTS idx_voice_file_deletions_created
+    ON voice_file_deletions(created_time, id);
+"""
+
+SCHEMA_V5 = "\n".join(
+    (
+        USERS_TABLE_SQL,
+        PERSONAL_ITEMS_TABLE_SQL,
         ITEM_INPUTS_TABLE_SQL,
         USER_SESSIONS_TABLE_SQL,
         V3_INDEXES_SQL,
@@ -273,6 +445,11 @@ SCHEMA_V4 = "\n".join(
         PUSH_SUBSCRIPTIONS_TABLE_SQL,
         REMINDER_DELIVERIES_TABLE_SQL,
         V4_INDEXES_SQL,
+        CAPTURE_DRAFTS_TABLE_SQL,
+        V5_PRE_VOICE_INDEXES_SQL,
+        VOICE_SEGMENTS_TABLE_SQL,
+        VOICE_FILE_DELETIONS_TABLE_SQL,
+        V5_INDEXES_SQL,
         f"PRAGMA user_version = {SCHEMA_VERSION};",
     )
 )
@@ -394,6 +571,71 @@ REQUIRED_V4_INDEXES = REQUIRED_V3_INDEXES | {
     "uq_reminder_deliveries_pair",
 }
 
+REQUIRED_V5_COLUMNS = {
+    **REQUIRED_V4_COLUMNS,
+    "item_inputs": REQUIRED_V4_COLUMNS["item_inputs"] | {"source_draft_id"},
+    "capture_drafts": {
+        "id",
+        "user_id",
+        "current_text",
+        "revision",
+        "created_time",
+        "updated_time",
+    },
+    "voice_segments": {
+        "id",
+        "user_id",
+        "draft_id",
+        "item_input_id",
+        "position",
+        "client_segment_id",
+        "storage_key",
+        "original_size_bytes",
+        "original_sha256",
+        "client_content_type",
+        "detected_container",
+        "detected_codec",
+        "sample_rate_hz",
+        "channels",
+        "duration_ms",
+        "transcription_status",
+        "asr_input_kind",
+        "provider",
+        "model",
+        "provider_transcript",
+        "provider_request_id",
+        "failure_code",
+        "failure_message",
+        "attempt_count",
+        "created_time",
+        "updated_time",
+        "transcription_started_time",
+        "transcription_finished_time",
+    },
+    "voice_file_deletions": {
+        "id",
+        "storage_key",
+        "reason",
+        "created_time",
+        "attempt_count",
+        "last_attempt_time",
+        "last_error",
+    },
+}
+
+REQUIRED_V5_INDEXES = REQUIRED_V4_INDEXES | {
+    "idx_item_inputs_id_user",
+    "uq_item_inputs_user_source_draft",
+    "idx_capture_drafts_user_updated",
+    "uq_voice_segments_user_client",
+    "uq_voice_segments_draft_position",
+    "uq_voice_segments_input_position",
+    "uq_voice_segments_draft_active",
+    "idx_voice_segments_user_draft",
+    "idx_voice_segments_user_input",
+    "idx_voice_file_deletions_created",
+}
+
 
 class DatabaseVersionError(RuntimeError):
     pass
@@ -417,7 +659,7 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        """Create a new v4 database or validate an existing v4 database.
+        """Create a new v5 database or validate an existing v5 database.
 
         Upgrading an existing database is intentionally not performed here.
         Existing installations must use an explicit, backup-aware migration.
@@ -436,7 +678,7 @@ class Database:
             }
 
             if version == 0 and not existing_tables:
-                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V4}\nCOMMIT;")
+                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V5}\nCOMMIT;")
                 return
 
             if version != SCHEMA_VERSION:
@@ -445,7 +687,7 @@ class Database:
                     f"migration to version {SCHEMA_VERSION}"
                 )
 
-            self._validate_v4_schema(connection, existing_tables)
+            self._validate_v5_schema(connection, existing_tables)
 
     @staticmethod
     def _validate_v3_schema(
@@ -466,9 +708,21 @@ class Database:
         Database._validate_schema(
             connection,
             existing_tables,
-            version=SCHEMA_VERSION,
+            version=SCHEMA_V4_VERSION,
             required_columns=REQUIRED_V4_COLUMNS,
             required_indexes=REQUIRED_V4_INDEXES,
+        )
+
+    @staticmethod
+    def _validate_v5_schema(
+        connection: sqlite3.Connection, existing_tables: set[str]
+    ) -> None:
+        Database._validate_schema(
+            connection,
+            existing_tables,
+            version=SCHEMA_VERSION,
+            required_columns=REQUIRED_V5_COLUMNS,
+            required_indexes=REQUIRED_V5_INDEXES,
         )
 
     @staticmethod
