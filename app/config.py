@@ -14,11 +14,15 @@ from dotenv import dotenv_values
 from pydantic import SecretStr
 from py_vapid import Vapid02
 
+from app.voice_contracts import DEFAULT_VOICE_MAX_UPLOAD_BYTES
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATABASE_PATH = Path("data/selfecho.db")
 LEGACY_DATABASE_PATH = Path("data/personal_ai_inbox.db")
 _BASE64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+MAX_VOICE_UPLOAD_BYTES = 64 * 1024 * 1024
+MAX_VOICE_ASR_TIMEOUT_SECONDS = 120.0
 
 
 def _decode_base64url(value: str, *, field_name: str) -> bytes:
@@ -143,6 +147,17 @@ class Settings:
     reminder_poll_interval_seconds: float = 30.0
     reminder_batch_size: int = 100
     reminder_sending_stale_seconds: int = 300
+    voice_asr_enabled: bool = False
+    voice_storage_root: Path | None = None
+    voice_max_upload_bytes: int = DEFAULT_VOICE_MAX_UPLOAD_BYTES
+    ffprobe_path: Path | None = None
+    ffmpeg_path: Path | None = None
+    alibaba_asr_api_url: str = (
+        "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+        "multimodal-generation/generation"
+    )
+    alibaba_api_key: SecretStr = SecretStr("")
+    voice_asr_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if (
@@ -180,6 +195,27 @@ class Settings:
         if not 1 <= self.reminder_sending_stale_seconds <= 86_400:
             raise ValueError(
                 "REMINDER_SENDING_STALE_SECONDS must be between 1 and 86400"
+            )
+        if not isinstance(self.voice_max_upload_bytes, int) or isinstance(
+            self.voice_max_upload_bytes, bool
+        ):
+            raise ValueError("VOICE_MAX_UPLOAD_BYTES must be an integer")
+        if not 1 <= self.voice_max_upload_bytes <= MAX_VOICE_UPLOAD_BYTES:
+            raise ValueError(
+                "VOICE_MAX_UPLOAD_BYTES must be between 1 and "
+                f"{MAX_VOICE_UPLOAD_BYTES}"
+            )
+        if (
+            isinstance(self.voice_asr_timeout_seconds, bool)
+            or not isinstance(self.voice_asr_timeout_seconds, (int, float))
+            or not math.isfinite(self.voice_asr_timeout_seconds)
+            or not 0
+            < self.voice_asr_timeout_seconds
+            <= MAX_VOICE_ASR_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "VOICE_ASR_TIMEOUT_SECONDS must be greater than 0 and at most "
+                f"{int(MAX_VOICE_ASR_TIMEOUT_SECONDS)}"
             )
 
     @classmethod
@@ -230,6 +266,9 @@ class Settings:
         if session_expiration_seconds <= 0:
             raise ValueError("AUTH_SESSION_EXPIRATION_SECONDS must be positive")
         session_cookie_secure = read_bool("AUTH_COOKIE_SECURE", "false")
+        voice_storage_value = read("VOICE_STORAGE_ROOT").strip()
+        ffprobe_value = read("FFPROBE_PATH").strip()
+        ffmpeg_value = read("FFMPEG_PATH").strip()
         return cls(
             database_path=(
                 Path(database_value) if database_value else default_database_path()
@@ -277,5 +316,26 @@ class Settings:
             reminder_batch_size=int(read("REMINDER_BATCH_SIZE", "100")),
             reminder_sending_stale_seconds=int(
                 read("REMINDER_SENDING_STALE_SECONDS", "300")
+            ),
+            voice_asr_enabled=read_bool("VOICE_ASR_ENABLED", "false"),
+            voice_storage_root=(
+                Path(voice_storage_value) if voice_storage_value else None
+            ),
+            voice_max_upload_bytes=int(
+                read(
+                    "VOICE_MAX_UPLOAD_BYTES",
+                    str(DEFAULT_VOICE_MAX_UPLOAD_BYTES),
+                )
+            ),
+            ffprobe_path=Path(ffprobe_value) if ffprobe_value else None,
+            ffmpeg_path=Path(ffmpeg_value) if ffmpeg_value else None,
+            alibaba_asr_api_url=read(
+                "ALIBABA_ASR_API_URL",
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+                "multimodal-generation/generation",
+            ).strip(),
+            alibaba_api_key=SecretStr(read("ALIBABA_API_KEY").strip()),
+            voice_asr_timeout_seconds=float(
+                read("VOICE_ASR_TIMEOUT_SECONDS", "30")
             ),
         )

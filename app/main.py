@@ -45,6 +45,7 @@ from app.schemas import (
     UserItemPatch,
 )
 from app.services.ai import AIService, AIServiceError, create_ai_service
+from app.services.alibaba_asr import AlibabaASRClient
 from app.services.processing import InputProcessingService
 from app.services.push_security import PushEndpointPolicy
 from app.services.push_subscriptions import PushSubscriptionService
@@ -54,16 +55,25 @@ from app.services.reminder_delivery import (
 )
 from app.services.reminders import ReminderService
 from app.services.web_push import WebPushService
+from app.services.voice_deletions import VoiceDeletionLedger
+from app.services.voice_media import VoiceMediaProcessor
+from app.services.voice_storage import VoiceStorage
+from app.services.voice_transcription import ASRProvider, VoiceTranscriptionService
+from app.voice_repository import VoiceCaptureRepository
+from app.voice_runtime import VoiceRuntime, validate_voice_runtime
 
 
 def create_app(
     settings: Settings | None = None,
     ai_service: AIService | None = None,
     push_endpoint_policy: PushEndpointPolicy | None = None,
+    voice_asr_provider: ASRProvider | None = None,
+    voice_media_processor: VoiceMediaProcessor | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
     database = Database(settings.database_path)
     repository = Repository(database)
+    voice_repository = VoiceCaptureRepository(database)
     auth_repository = AuthRepository(database)
     reminder_repository = ReminderRepository(database)
     reminder_service = ReminderService(
@@ -101,7 +111,45 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        voice_paths = validate_voice_runtime(settings)
         database.initialize()
+        voice_runtime: VoiceRuntime | None = None
+        if voice_paths is None:
+            voice_repository.system_recover_interrupted_segments()
+        else:
+            voice_storage = VoiceStorage(
+                voice_paths.storage_root,
+                settings.voice_max_upload_bytes,
+            )
+            voice_deletion_ledger = VoiceDeletionLedger(database, voice_storage)
+            media_processor = voice_media_processor or VoiceMediaProcessor(
+                ffprobe_path=voice_paths.ffprobe_path,
+                ffmpeg_path=voice_paths.ffmpeg_path,
+                tmp_root=voice_storage.tmp_root,
+            )
+            asr_provider = voice_asr_provider or AlibabaASRClient(
+                api_url=settings.alibaba_asr_api_url,
+                api_key=settings.alibaba_api_key.get_secret_value(),
+                timeout_seconds=settings.voice_asr_timeout_seconds,
+            )
+            voice_transcription_service = VoiceTranscriptionService(
+                voice_repository,
+                voice_storage,
+                media_processor,
+                asr_provider,
+            )
+            voice_runtime = VoiceRuntime(
+                voice_repository,
+                voice_transcription_service,
+                voice_deletion_ledger,
+            )
+            application.state.voice_storage = voice_storage
+            application.state.voice_deletion_ledger = voice_deletion_ledger
+            application.state.voice_transcription_service = (
+                voice_transcription_service
+            )
+            application.state.voice_runtime = voice_runtime
+            await voice_runtime.start()
         repository.system_recover_interrupted_inputs()
         for pending_input in repository.system_list_pending_inputs():
             task = asyncio.create_task(
@@ -124,6 +172,8 @@ def create_app(
         try:
             yield
         finally:
+            if voice_runtime is not None:
+                await voice_runtime.stop()
             if reminder_worker_task is not None:
                 reminder_worker_task.cancel()
                 await asyncio.gather(
@@ -144,6 +194,11 @@ def create_app(
     app.state.database = database
     app.state.settings = settings
     app.state.repository = repository
+    app.state.voice_repository = voice_repository
+    app.state.voice_storage = None
+    app.state.voice_deletion_ledger = None
+    app.state.voice_transcription_service = None
+    app.state.voice_runtime = None
     app.state.processor = processor
     app.state.auth_repository = auth_repository
     app.state.auth_service = auth_service

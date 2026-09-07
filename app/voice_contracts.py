@@ -14,6 +14,13 @@ DEFAULT_VOICE_MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 ALIBABA_ASR_PROVIDER = "alibaba"
 ALIBABA_ASR_MODEL = "qwen-audio-3.0-asr-flash"
 
+# Only the tuple proven by the approved v0.5 browser acceptance evidence is
+# eligible for direct Provider submission. Other decodable media is normalized.
+DIRECT_CONTAINER_ALIASES = frozenset({"matroska", "webm"})
+DIRECT_CODEC = "opus"
+DIRECT_SAMPLE_RATE_HZ = 48_000
+DIRECT_CHANNELS = 1
+
 CLIENT_SEGMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 

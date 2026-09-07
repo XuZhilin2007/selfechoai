@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from app.database import Database
 from app.repository import NotFoundError
 from app.services.voice_deletions import VoiceDeletionLedger
+from app.services.voice_media import MediaMetadata
 from app.services.voice_storage import StoredOriginal
 from app.voice_contracts import (
     ALIBABA_ASR_MODEL,
@@ -79,6 +80,12 @@ class CaptureDraftRecord:
 class VoiceSegmentUploadResult:
     segment: VoiceSegmentRecord
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PendingVoiceSegment:
+    segment_id: int
+    user_id: int
 
 
 def utc_now_iso() -> str:
@@ -422,6 +429,265 @@ class VoiceCaptureRepository:
             )
         return cursor.rowcount == 1
 
+    def set_media_metadata(
+        self,
+        segment_id: int,
+        user_id: int,
+        metadata: MediaMetadata,
+    ) -> bool:
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE voice_segments
+                SET detected_container = ?, detected_codec = ?,
+                    sample_rate_hz = ?, channels = ?, duration_ms = ?,
+                    updated_time = ?
+                WHERE id = ? AND user_id = ?
+                  AND transcription_status = 'transcribing'
+                """,
+                (
+                    metadata.container,
+                    metadata.codec,
+                    metadata.sample_rate_hz,
+                    metadata.channels,
+                    metadata.duration_ms,
+                    utc_now_iso(),
+                    segment_id,
+                    user_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def set_asr_input_kind(
+        self,
+        segment_id: int,
+        user_id: int,
+        input_kind: str,
+    ) -> bool:
+        if input_kind not in {"original_direct", "derived_wav"}:
+            raise ValueError("invalid ASR input kind")
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE voice_segments
+                SET asr_input_kind = ?, updated_time = ?
+                WHERE id = ? AND user_id = ?
+                  AND transcription_status = 'transcribing'
+                """,
+                (input_kind, utc_now_iso(), segment_id, user_id),
+            )
+        return cursor.rowcount == 1
+
+    def complete_transcription(
+        self,
+        segment_id: int,
+        user_id: int,
+        *,
+        transcript: str,
+        provider_request_id: str,
+    ) -> VoiceSegmentRecord | None:
+        if not isinstance(transcript, str) or not transcript.strip():
+            raise ValueError("transcript must not be blank")
+        if not isinstance(provider_request_id, str) or not provider_request_id.strip():
+            raise ValueError("provider_request_id must not be blank")
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            segment = connection.execute(
+                """
+                SELECT * FROM voice_segments
+                WHERE id = ? AND user_id = ?
+                  AND transcription_status = 'transcribing'
+                """,
+                (segment_id, user_id),
+            ).fetchone()
+            if segment is None or segment["draft_id"] is None:
+                return None
+            draft = connection.execute(
+                "SELECT * FROM capture_drafts WHERE id = ? AND user_id = ?",
+                (segment["draft_id"], user_id),
+            ).fetchone()
+            if draft is None:
+                return None
+
+            appended = _append_transcript(str(draft["current_text"]), transcript)
+            if len(appended) > MAX_CAPTURE_TEXT_LENGTH:
+                connection.execute(
+                    """
+                    UPDATE voice_segments
+                    SET transcription_status = 'failed',
+                        provider_transcript = ?, provider_request_id = ?,
+                        failure_code = 'draft_text_limit',
+                        failure_message = ?, updated_time = ?,
+                        transcription_finished_time = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (
+                        transcript,
+                        provider_request_id,
+                        "转写已完成，但加入 Draft 后会超过 10,000 字；请缩短文字后重试。",
+                        now,
+                        now,
+                        segment_id,
+                        user_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE capture_drafts
+                    SET current_text = ?, revision = revision + 1, updated_time = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (appended, now, draft["id"], user_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE voice_segments
+                    SET transcription_status = 'succeeded',
+                        provider_transcript = ?, provider_request_id = ?,
+                        failure_code = NULL, failure_message = NULL,
+                        updated_time = ?, transcription_finished_time = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (
+                        transcript,
+                        provider_request_id,
+                        now,
+                        now,
+                        segment_id,
+                        user_id,
+                    ),
+                )
+            row = connection.execute(
+                "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
+                (segment_id, user_id),
+            ).fetchone()
+            return self._segment_from_row(row)
+
+    def mark_segment_failed(
+        self,
+        segment_id: int,
+        user_id: int,
+        *,
+        failure_code: str,
+        failure_message: str,
+    ) -> bool:
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE voice_segments
+                SET transcription_status = 'failed',
+                    failure_code = ?, failure_message = ?,
+                    updated_time = ?, transcription_finished_time = ?
+                WHERE id = ? AND user_id = ?
+                  AND transcription_status = 'transcribing'
+                """,
+                (
+                    failure_code,
+                    failure_message[:500],
+                    now,
+                    now,
+                    segment_id,
+                    user_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def retry_failed_segment(
+        self,
+        segment_id: int,
+        user_id: int,
+    ) -> tuple[VoiceSegmentRecord, bool]:
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            segment = connection.execute(
+                "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
+                (segment_id, user_id),
+            ).fetchone()
+            if segment is None:
+                raise NotFoundError("Voice Segment not found")
+            if segment["draft_id"] is None:
+                raise DraftBlockedError("saved Voice Segment cannot be retried here")
+            if segment["transcription_status"] != "failed":
+                raise DraftBlockedError("only failed Voice Segments can be retried")
+            draft = connection.execute(
+                "SELECT * FROM capture_drafts WHERE id = ? AND user_id = ?",
+                (segment["draft_id"], user_id),
+            ).fetchone()
+            if draft is None:
+                raise NotFoundError("Capture Draft not found")
+
+            if (
+                segment["failure_code"] == "draft_text_limit"
+                and segment["provider_transcript"] is not None
+            ):
+                appended = _append_transcript(
+                    str(draft["current_text"]),
+                    str(segment["provider_transcript"]),
+                )
+                if len(appended) > MAX_CAPTURE_TEXT_LENGTH:
+                    raise DraftTextLimitError(
+                        "Capture Draft is still too long for the completed transcript"
+                    )
+                connection.execute(
+                    """
+                    UPDATE capture_drafts
+                    SET current_text = ?, revision = revision + 1, updated_time = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (appended, now, draft["id"], user_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE voice_segments
+                    SET transcription_status = 'succeeded',
+                        failure_code = NULL, failure_message = NULL,
+                        updated_time = ?, transcription_finished_time = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (now, now, segment_id, user_id),
+                )
+                row = connection.execute(
+                    "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
+                    (segment_id, user_id),
+                ).fetchone()
+                return self._segment_from_row(row), False
+
+            active = connection.execute(
+                """
+                SELECT 1 FROM voice_segments
+                WHERE draft_id = ? AND user_id = ? AND id != ?
+                  AND transcription_status IN ('pending', 'transcribing')
+                """,
+                (draft["id"], user_id, segment_id),
+            ).fetchone()
+            if active is not None:
+                raise DraftBlockedError(
+                    "another Voice Segment is still being transcribed"
+                )
+            connection.execute(
+                """
+                UPDATE voice_segments
+                SET transcription_status = 'pending',
+                    asr_input_kind = NULL,
+                    provider_transcript = NULL,
+                    provider_request_id = NULL,
+                    failure_code = NULL,
+                    failure_message = NULL,
+                    updated_time = ?,
+                    transcription_started_time = NULL,
+                    transcription_finished_time = NULL
+                WHERE id = ? AND user_id = ?
+                """,
+                (now, segment_id, user_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
+                (segment_id, user_id),
+            ).fetchone()
+            return self._segment_from_row(row), True
+
     def delete_failed_segment(self, segment_id: int, user_id: int) -> None:
         with self.database.transaction() as connection:
             segment = connection.execute(
@@ -443,3 +709,44 @@ class VoiceCaptureRepository:
                 "DELETE FROM voice_segments WHERE id = ? AND user_id = ?",
                 (segment_id, user_id),
             )
+
+    def system_recover_interrupted_segments(self) -> int:
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE voice_segments
+                SET transcription_status = 'failed',
+                    failure_code = 'interrupted',
+                    failure_message = '转写被服务重启中断；原始录音已保留，请手动重试。',
+                    updated_time = ?, transcription_finished_time = ?
+                WHERE transcription_status = 'transcribing'
+                """,
+                (now, now),
+            )
+        return cursor.rowcount
+
+    def system_list_pending_segments(self) -> list[PendingVoiceSegment]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, user_id FROM voice_segments
+                WHERE transcription_status = 'pending' AND draft_id IS NOT NULL
+                ORDER BY created_time ASC, id ASC
+                """
+            ).fetchall()
+        return [
+            PendingVoiceSegment(
+                segment_id=int(row["id"]),
+                user_id=int(row["user_id"]),
+            )
+            for row in rows
+        ]
+
+
+def _append_transcript(current_text: str, transcript: str) -> str:
+    if not current_text:
+        return transcript
+    if current_text[-1].isspace() or transcript[:1].isspace():
+        return current_text + transcript
+    return current_text + "\n" + transcript
