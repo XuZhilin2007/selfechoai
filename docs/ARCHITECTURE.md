@@ -1,6 +1,6 @@
 # SelfEcho AI Architecture
 
-本文描述 Community Edition v0.4.0 的当前实现，不代表托管服务的基础设施设计。
+本文描述 Community Edition v0.5.0 的当前实现，不代表托管服务的基础设施设计。
 
 ## System Overview
 
@@ -12,9 +12,11 @@ FastAPI application
         ├── Capture / Item APIs
         ├── Reminder / Reminder-settings APIs
         ├── Push configuration / subscription APIs
+        ├── Voice Capture / transcription APIs（可选，默认关闭）
         ├── Background AI processing
         ├── 可选嵌入式 Reminder worker（定时 due 扫描 + Web Push 投递）
-        ├── SQLite schema v4
+        ├── SQLite schema v5
+        ├── 可选外部 Voice 存储 + Alibaba ASR boundary
         └── DeepSeek or OpenAI provider boundary
 ~~~
 
@@ -26,6 +28,8 @@ FastAPI application
 - app/services/push_security.py 在出站前校验 Push endpoint；app/services/web_push.py 执行受限的出站 Web Push。
 - app/services/reminder_delivery.py 是嵌入式 worker 的 due 扫描与投递逻辑。
 - app/auth.py、app/auth_repository.py 和 app/auth_routes.py 处理认证、Session 和用户数据边界。
+- app/voice_contracts.py 定义 Voice 领域常量；app/voice_repository.py 与 app/voice_routes.py 处理 Capture Draft、Voice Segment 与音频访问的持久化和 API。
+- app/voice_runtime.py 是单实例 Voice 任务协调器；app/services/voice_storage.py 管理外部 Original Audio 存储；app/services/voice_media.py 执行 ffprobe/ffmpeg 媒体处理；app/services/alibaba_asr.py 与 app/services/voice_transcription.py 隔离 ASR Provider；app/services/voice_deletions.py 维护音频删除 ledger。
 - app/services/processing.py 负责从已保存输入触发 AI 整理。
 - app/services/ai.py 和 app/services/deepseek.py 隔离外部 LLM Provider。
 - app/static/ 是无前端构建步骤的 Vanilla JavaScript PWA。
@@ -50,6 +54,39 @@ background provider call
 原始输入在 Provider 调用前提交。AI 失败不会删除输入；失败记录可重试。启动时，应用会恢复被中断的 processing 状态，并重新调度仍 pending 的输入。
 
 AI 输出通过 Pydantic schema 验证。Provider 只负责提取和组织信息；重要性、计划与最终行动仍由用户确认。向已有事项补充输入或重新整理时，服务会使用该事项的输入历史。
+
+## Voice Capture Flow（可选，默认关闭）
+
+Voice 由 `VOICE_ASR_ENABLED=false` 默认关闭。关闭时不需要 Voice 存储、ffmpeg/ffprobe 或 Alibaba 凭据，文本 Capture 与其余功能不受影响。
+
+~~~text
+Capture Draft（可编辑草稿）
+        │ press-and-hold（上滑取消，最长 60 秒）
+        ▼
+Voice Segment 上传（WebM/Opus via MediaRecorder）
+        │ durable segment 记录 + Original Audio 写入外部 Voice 存储
+        ▼
+ffprobe 检测 → 视容器/编码决定是否 ffmpeg 归一化
+        │
+        ▼
+Alibaba ASR（固定模型 qwen-audio-3.0-asr-flash）
+        │
+        ├── success: transcript 追加进可编辑 Draft（由用户自行修订）
+        └── failure: 显式失败状态，可 Retry / Delete，不自动重试
+        │
+        ▼
+Final Save（存在未解决的 Voice 失败时被阻止）
+        │
+        ▼
+既有 AI Structuring（DeepSeek/OpenAI provider，与 ASR 边界分离）
+~~~
+
+- Capture Draft 与 Voice Segment 都按 user 隔离；音频访问只属于创建它的认证用户。
+- Original Audio 存储在 `VOICE_STORAGE_ROOT`（Git checkout 之外的可写绝对路径），不进入 SQLite；SQLite 只保存 segment 状态、元数据与存储引用。
+- ffmpeg 归一化是可选处理步骤，ffprobe 检测决定是否需要；两个二进制都由运维自行安装并提供路径。
+- 转写成功只把 transcript 写回 Draft，不触发 AI Structuring；AI Structuring 仍由 Final Save 后的既有处理链路执行。
+- 删除走的 voice_file_deletions ledger：用户删除先记录意图，实际音频文件删除由运行时逐步 drain；启动时也会恢复被中断的 segment 并 drain 待删除文件。关闭 Voice 不会删除已存储的音频。
+- 前端音频元素以 preload="metadata" 做尽力而为的媒体元数据预加载；原生时长展示可能因浏览器而异，以服务端检测的持久化元数据为准。
 
 ## Reminder Flow
 
@@ -84,7 +121,7 @@ Capture / Manual action
 
 ## Multi-user Isolation
 
-schema v4 为 users、user_sessions、personal_items、item_inputs、reminders、push_subscriptions 和 reminder_deliveries 建立显式所有权关系。业务 API 从已验证 Session 获取 current user，Repository 查询和修改同时使用记录 ID 与 user_id；Reminder、Push 订阅和投递记录同样按 user_id 隔离，Push 订阅还绑定创建它的 Session。跨用户访问按不存在处理，并由 API 与 Repository 测试覆盖。
+schema v5 为 users、user_sessions、personal_items、item_inputs、reminders、push_subscriptions、reminder_deliveries、capture_drafts、voice_segments 和 voice_file_deletions 建立显式所有权关系。业务 API 从已验证 Session 获取 current user，Repository 查询和修改同时使用记录 ID 与 user_id；Reminder、Push 订阅和投递记录同样按 user_id 隔离，Push 订阅还绑定创建它的 Session。Capture Draft 与 Voice Segment（含音频访问）同样按 user_id 隔离。跨用户访问按不存在处理，并由 API 与 Repository 测试覆盖。
 
 这是应用层与数据库关系共同形成的隔离边界，不等同于面向不可信租户的完整托管平台安全认证。部署者仍需保护数据库文件、备份和主机权限。
 
@@ -109,12 +146,13 @@ schema v4 为 users、user_sessions、personal_items、item_inputs、reminders�
 
 - 默认数据库是 data/selfecho.db。
 - SQLite 启用 foreign_keys、busy_timeout 和 WAL。
-- 新空数据库直接初始化为 schema v4。
+- 新空数据库直接初始化为 schema v5。
 - 应用启动只验证已有数据库版本和必需结构，不执行隐式升级；遇到不支持的旧版本会拒绝启动并提示显式迁移。
-- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移：`--check-only` 只读预检；正式迁移要求停止使用且已备份的数据库、输入确认文字、单事务执行，并通过迁移后行数守恒、schema 结构、foreign key 和 integrity 检查。
-- app/migrations/v003_auth.py 保留通用的 v2 到 v3 显式迁移实现，属于历史兼容层，不存在直接 v2→v4 路径。
+- app/migrations/v005_voice_capture.py 提供显式的 v4→v5 迁移：`--check-only` 只读预检；正式迁移要求停止使用且已备份的数据库、输入 `MIGRATE V4 TO V5` 确认文字、单事务执行，并通过迁移后行数守恒、schema 结构、foreign key 和 integrity 检查。
+- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。schema v3 数据库必须顺序迁移 v3→v4→v5，不存在直接 v3→v5 路径。
+- app/migrations/v003_auth.py 保留通用的 v2 到 v3 显式迁移实现，属于历史兼容层。
 
-数据库、WAL/SHM、备份和真实数据不属于公开发行物。
+Voice Original Audio 存储在 `VOICE_STORAGE_ROOT` 指定的外部目录，不在 SQLite 内；数据库迁移不涉及也不重建历史音频文件。数据库、Voice 存储、WAL/SHM、备份和真实数据不属于公开发行物。
 
 ## PWA and Caching
 
@@ -129,6 +167,8 @@ DeepSeek 与 OpenAI Responses API 是可选 Provider。没有 Key 时，数据�
 启用 Provider 后，用户原文及整理所需的事项上下文会离开本机并发送给所选第三方；包含提醒意图或时间表达的文本参与 Reminder 提取，同样属于这条数据流。部署者必须自行评估供应商的数据保留、地域、账户安全和费用。AI_DEBUG_OUTPUT 可能包含个人输入或模型结果，不应在共享或生产环境启用。
 
 Web Push 推送载荷为通用内容，不含 Personal Item 标题或正文。Push 订阅的 endpoint、p256dh 与 auth 材料是运维敏感数据，存储在自托管实例的 SQLite 中；数据库备份应按敏感数据保护。
+
+Voice ASR 是独立的 Provider 边界。启用 Voice 后，浏览器录音经自托管实例发送到所配置的 Alibaba DashScope ASR 端点（固定模型 `qwen-audio-3.0-asr-flash`），Alibaba 接收转写所需的音频；凭据由部署者自行提供并保护。AI Structuring 不使用 Alibaba，仍走上述 DeepSeek/OpenAI 边界。Original Audio 与 transcript 属于敏感用户数据，其外部存储、备份和凭据都由部署者保护。
 
 ## Community Edition vs Hosted Service
 

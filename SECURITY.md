@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-SelfEcho AI Community Edition 目前仍处于早期阶段，仅维护当前 0.4.x 系列。
+SelfEcho AI Community Edition 目前仍处于早期阶段，仅维护当前 0.5.x 系列。
 
 | Version | Supported |
 | --- | --- |
-| 0.4.x | Yes |
-| < 0.4 | No |
+| 0.5.x | Yes |
+| < 0.5 | No |
 
 ## Reporting a Vulnerability
 
@@ -22,9 +22,9 @@ SelfEcho AI Community Edition 目前仍处于早期阶段，仅维护当前 0.4.
 Community Edition 提供应用代码和本地运行默认值，不提供托管安全承诺。每个部署者负责自己的：
 
 - 操作系统、反向代理、TLS、网络访问控制与安全更新；
-- 数据库、备份、日志、文件权限和数据保留策略；
+- 数据库、Voice 存储、备份、日志、文件权限和数据保留策略；
 - APP_ORIGIN、HTTPS Cookie、注册模式和邀请代码配置；
-- DeepSeek、OpenAI 或其他外部服务的账户、费用与隐私设置。
+- DeepSeek、OpenAI、Alibaba 或其他外部服务的账户、费用与隐私设置。
 
 生产部署必须使用 HTTPS，并将 AUTH_COOKIE_SECURE 设为 true。不要公开 .env、数据库、WAL/SHM、备份、日志或真实截图。
 
@@ -32,7 +32,7 @@ Community Edition 提供应用代码和本地运行默认值，不提供托管�
 
 ## Web Push Security（Community self-hosting）
 
-Community v0.4.0 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+Community v0.5.0 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
 
 ### VAPID
 
@@ -68,4 +68,24 @@ Push 订阅保存于自托管实例的 SQLite，包含 endpoint、p256dh 和 aut
 
 ### Deployment
 
-Community v0.4.0 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
+Community v0.5.0 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
+
+## Voice Capture Security（Community self-hosting）
+
+Community v0.5.0 的 Voice Capture 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+
+### ASR Provider boundary
+
+- 启用 Voice 后，浏览器录音经自托管实例发送到所配置的 Alibaba DashScope ASR 端点用于转写。Voice 不是完全本地的功能：Alibaba 会接收转写所需的录音音频。
+- ALIBABA_API_KEY 是秘密凭据：只保存在未跟踪的本地 `.env` 中，绝不提交到 Git，也不写入示例、日志或截图。
+- 配置加载与运行时要求 ASR 端点为 HTTPS 且不含用户凭据信息；转写文本（transcript）与 Original Audio 一样属于敏感用户数据。
+
+### Voice storage
+
+- Original Audio 存储在 `VOICE_STORAGE_ROOT` 指定的外部目录（Git checkout 之外的可写绝对路径），不进入 SQLite。
+- 存储目录应与数据库一致地设置文件权限、保护和备份策略；之后停用 Voice 不会删除已存储的音频文件，已有 Voice 存储应保持完整。
+- 音频访问只对创建该 Voice Segment 的认证用户开放，跨用户访问按不存在处理；数据库备份、Voice 存储和 Provider 凭据都可能包含敏感个人信息，须按敏感数据保护。
+
+### Media tools
+
+- ffmpeg 与 ffprobe 由运维自行安装并提供可执行路径，SelfEcho 不捆绑也不重新分发；这些二进制自身的安全更新属于部署者的系统维护责任。

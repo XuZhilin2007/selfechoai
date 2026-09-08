@@ -4,7 +4,7 @@
 
 SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Personal Items，同时保留原始输入和用户的最终决策权。AI 负责提取与组织信息，不替用户决定重要性、计划或行动。
 
-**Status:** Community Edition 0.4.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.5.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
@@ -22,11 +22,12 @@ SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Person
 - 一次性 Reminder：可手动创建，也可由 AI 从自然语言提取意图与时间表达，并按用户时区确定性解析；歧义时间表达会停留在 `needs_confirmation` 状态
 - 应用内 due 回退，即使不配置任何通知，Reminder 依然可用
 - 可选 Web Push（默认关闭）：使用自托管者自己的 VAPID 密钥、浏览器订阅生命周期、Service Worker 送达，以及用于定时投递的嵌入式 Reminder worker
+- 可选 Voice Capture（默认关闭）：按住录音、上滑取消，转写文本追加到可编辑的 Capture Draft，失败片段可显式重试或删除
 - 移动端优先的 Web/PWA 界面
 - Login、Logout、服务端 Session 与 CSRF 防护
 - 默认关闭注册和可选 Invite registration
 - Multi-user 数据所有权隔离
-- SQLite schema v4，以及保留的通用 v2→v3 migration 实现
+- SQLite schema v5，并保留显式迁移实现
 
 Planner、日历集成和自治 Agent 尚未实现。
 
@@ -49,12 +50,35 @@ Web Push 可选且默认关闭：
 
 Web Push 自托管还有额外的安全与部署考量，见 [Security Policy](SECURITY.md)。
 
+## Voice Capture
+
+Voice Capture 可选且默认关闭（`VOICE_ASR_ENABLED=false`）。关闭 Voice 时，文本 Capture、认证、Reminder 和 Web Push 正常可用，也不需要 Alibaba Key、ffmpeg、ffprobe 或 Voice 存储。
+
+流程延续现有 Capture 纪律：
+
+- 按住开始录音；松开结束；录音过程中上滑取消。
+- 单次录音最长 60 秒。
+- 转写文本追加到可编辑的 Capture Draft，最终保存前由你自己修改。
+- 失败的 Voice Segment 可显式重试或删除；转写不会自动重试。
+- 存在未解决的 Voice 失败时，Final Save 会被阻止。
+- 触发 AI Structuring 的是 Final Save 保存的最终编辑文本；转写成功本身不会触发 AI 处理。
+- Original Audio 按 Voice Capture 生命周期保留，并在 Final Save 后继续与已保存输入关联。
+
+启用 Voice 需要运维配置：
+
+- `VOICE_STORAGE_ROOT`：Git checkout 之外的可写绝对路径。Voice Original Audio 存储在这里，不进入 SQLite。应像对待数据库一样保护和备份该存储；之后关闭 Voice 不会删除已存储的音频，已有 Voice 存储应保持原样。
+- `FFPROBE_PATH` 与 `FFMPEG_PATH`：由运维自行安装的媒体工具路径。SelfEcho 不捆绑也不重新分发 ffmpeg/ffprobe 二进制。
+- `ALIBABA_ASR_API_URL` 与 `ALIBABA_API_KEY`：你自己的 Alibaba DashScope 端点与凭据。转写模型固定为 `qwen-audio-3.0-asr-flash`。
+
+启用 Voice 后，浏览器音频会从你自托管的 SelfEcho 实例发送到所配置的 Alibaba ASR 端点，Alibaba 接收转写所需的音频。这是与 AI Structuring 不同的 Provider 边界与凭据：AI Structuring 仍在 Final Save 后使用所配置的 DeepSeek/OpenAI 兼容 Provider，Alibaba 不用于 AI Structuring。Original Audio、转写文本、数据库、Voice 存储、备份和 Provider 凭据都可能包含敏感个人信息，应按敏感数据保护。
+
 ## Requirements
 
 - Python 3.11 或更高版本
 - 支持 SQLite 的本地环境
 - 现代浏览器
 - 可选：自己的 DeepSeek 或 OpenAI API Key；首次创建用户和登录不需要 Provider Key
+- 可选，仅 Voice 需要：运维自行安装的 ffmpeg 与 ffprobe，以及自己的 Alibaba DashScope Key；Voice 保持关闭时不需要
 
 ## Quick Start
 
@@ -107,7 +131,7 @@ python -m app.bootstrap
 Bootstrap 会：
 
 - 使用 `.env` 中 `APP_DATABASE_PATH` 指定的 SQLite 数据库；
-- 在数据库不存在时初始化 schema v4；
+- 在数据库不存在时初始化 schema v5；
 - 只在 user count 为 0 时创建一个普通用户；
 - 通过 `getpass` 读取并确认 password；
 - 使用与应用相同的用户约束和 Argon2id password hashing；
@@ -173,32 +197,35 @@ AI_MODEL=
 
 - 默认数据库：`data/selfecho.db`
 - SQLite 数据属于当前 self-host instance
+- Voice Original Audio（启用 Voice 时）存储在 `VOICE_STORAGE_ROOT` 下，不进入 SQLite；应与数据库一致地保护和备份该存储
 - `.env`、`data/`、`*.db`、WAL/SHM 和日志均被 Git 忽略
 - Community Edition 不附带 Production 数据或从真实数据生成的 seed
-- 空数据库会直接初始化为 schema v4
+- 空数据库会直接初始化为 schema v5
 
 不要把数据库、备份、日志或包含个人内容的截图提交到 Git。
 
-## 从 v0.3.0 升级
+## 从 v0.4.0 升级
 
-v0.3.0 的数据库是 schema v3；v0.4.0 使用 schema v4。启动不会自动迁移——遇到不支持的旧版本会直接拒绝启动。
+v0.4.0 的数据库是 schema v4；v0.5.0 使用 schema v5。启动不会自动迁移——遇到不支持的旧版本会直接拒绝启动。
 
 1. 停止应用，备份数据库文件及其 WAL/SHM 伴生文件。
 2. 先用只读检查预览迁移：
 
 ```bash
-python -m app.migrations.v004_reminders --database data/selfecho.db --check-only
+python -m app.migrations.v005_voice_capture --database data/selfecho.db --check-only
 ```
 
-3. 执行显式 v3→v4 迁移。正式迁移开始前需要输入确认文字：
+3. 执行显式 v4→v5 迁移。正式迁移开始前需要输入确认文字：
 
 ```bash
-python -m app.migrations.v004_reminders --database data/selfecho.db
+python -m app.migrations.v005_voice_capture --database data/selfecho.db
 ```
 
-4. 迁移成功完成后再启动 v0.4.0。
+确认文字为 `MIGRATE V4 TO V5`。
 
-不存在直接 v2→v4 的升级路径；保留的 v2→v3 migration 只是历史实现。
+4. 迁移成功完成后再启动 v0.5.0。
+
+仍在 schema v3（v0.3.0）的数据库必须顺序迁移：先 v3→v4（`python -m app.migrations.v004_reminders`），再按上述步骤 v4→v5。不存在直接 v3→v5 的路径；保留的 v2→v3 migration 只是历史实现。
 
 ## Tests
 
@@ -206,7 +233,7 @@ python -m app.migrations.v004_reminders --database data/selfecho.db
 python -m pytest
 ```
 
-测试覆盖 Capture、原始输入持久化、DeepSeek/OpenAI 模拟响应、Authentication、Session、CSRF、Invite、Migration、Multi-user isolation、Reminder、时间表达解析、Web Push 安全与订阅、PWA，以及 first-user bootstrap 和 local/production Cookie 行为。JavaScript 与 Service Worker 合同测试位于 `tests/*.mjs`，使用 Node 内置 test runner 运行。
+测试覆盖 Capture、原始输入持久化、DeepSeek/OpenAI 模拟响应、Authentication、Session、CSRF、Invite、Migration、Multi-user isolation、Reminder、时间表达解析、Web Push 安全与订阅、Voice Capture 合同（草稿生命周期、转写、存储、删除 ledger）、PWA，以及 first-user bootstrap 和 local/production Cookie 行为。JavaScript 与 Service Worker 合同测试位于 `tests/*.mjs`，使用 Node 内置 test runner 运行。
 
 ## Current Limitations
 
@@ -217,7 +244,7 @@ python -m pytest
 - 没有正式管理后台或角色系统
 - 定时 Web Push 尽力而为：at-most-once，不保证送达
 - 单应用实例与 origin-root 部署；没有官方 Docker 镜像或二进制分发
-- Voice Capture 不属于 Public v0.4.0
+- Voice Capture 的真机验证有限。浏览器/设备麦克风、MediaRecorder、PWA 与原生媒体控件行为可能存在差异。原生音频时长在播放前的展示可能因浏览器而异；这不表示已持久化的 Original Audio 或服务端检测到的时长无效
 
 ## Architecture
 
@@ -225,8 +252,9 @@ python -m pytest
 Vanilla JavaScript PWA (含 Service Worker push 处理)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite (schema v4)
+          ├── SQLite (schema v5)
           ├── DeepSeek / OpenAI provider abstraction
+          ├── 可选 Voice Capture → 外部 Voice 存储 → Alibaba ASR
           └── 可选嵌入式 Reminder worker → Web Push
 ```
 

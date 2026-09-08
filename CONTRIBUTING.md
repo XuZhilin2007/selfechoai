@@ -25,12 +25,13 @@ Windows PowerShell 可用 Copy-Item .env.example .env，并通过 .venv\Scripts\
 
 ## Scope and Quality
 
-- 保持 Capture、AI Structuring、事项管理、Reminder 与 PWA 的当前 MVP 范围。
+- 保持 Capture、AI Structuring、事项管理、Reminder、可选 Voice Capture 与 PWA 的当前 MVP 范围。
 - 不要把所有 Personal Item 强制转成传统 Todo。
 - 原始输入必须先保存；未知信息不能由 AI 猜测补全。
 - 涉及 Authentication、Session、CSRF 或 Repository 查询时，必须补充或更新安全测试与多用户隔离测试。
 - Reminder 变更必须保持 per-user ownership，并补充或更新所有权/隔离测试。
 - 数据库 schema 或迁移变更必须携带迁移与回归测试。
+- Voice 变更必须保持 per-user 所有权隔离与 VOICE_STORAGE_ROOT 路径 containment；测试只使用合成媒体 fixture，不得提交真实个人录音或真实 Alibaba 凭据；保留失败显式可恢复（Retry/Delete、不自动重试）与删除 lifecycle 语义；麦克风资源与前端录音状态必须正确清理。
 - Push 变更必须保持 Session 与用户隔离；订阅数据不能跨用户或跨 Session 可见。
 - 出站 endpoint / 安全逻辑变更必须附带 SSRF 回归测试。
 - 前端 Push 或 Service Worker 变更需要运行 JS/SW 合同测试（Node 内置 test runner）。
@@ -40,7 +41,7 @@ Windows PowerShell 可用 Copy-Item .env.example .env，并通过 .venv\Scripts\
 
 ## Test Data and Secrets
 
-只使用合成测试数据。不要提交真实用户文本、数据库、备份、日志、Cookie、邀请代码、API Key、.env 或由真实数据生成的截图。示例中的邮箱、Token 和 Provider 响应必须明显是虚构值。Push 相关 fixture 只能使用合成的 endpoint 与 VAPID 材料，不得出现真实推送端点、真实密钥或个人数据。
+只使用合成测试数据。不要提交真实用户文本、数据库、备份、日志、Cookie、邀请代码、API Key、.env 或由真实数据生成的截图。示例中的邮箱、Token 和 Provider 响应必须明显是虚构值。Push 相关 fixture 只能使用合成的 endpoint 与 VAPID 材料，不得出现真实推送端点、真实密钥或个人数据。Voice 相关测试只使用合成的媒体 fixture 与合成凭据，不得提交真实个人录音或真实 Alibaba Key。
 
 提交 Pull Request 前至少运行：
 

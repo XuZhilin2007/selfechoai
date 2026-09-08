@@ -158,5 +158,5 @@ def test_project_declares_frozen_pywebpush_and_retains_tzdata():
 
     assert "pywebpush==2.4.0" in dependencies
     assert "tzdata>=2025.2" in dependencies
-    assert project["project"]["version"] == "0.4.0"
+    assert project["project"]["version"] == "0.5.0"
     assert importlib.metadata.version("pywebpush") == "2.4.0"

@@ -4,7 +4,7 @@
 
 SelfEcho AI helps you capture ideas quickly and uses AI to organize them into structured Personal Items, while always preserving the original input and leaving every final decision to you. AI extracts and organizes information; it does not decide what matters, what to plan, or what to do next.
 
-**Status:** Community Edition 0.4.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.5.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
@@ -22,11 +22,12 @@ Scattered thoughts often appear earlier than conventional tasks, and they carry 
 - One-time Reminders, created manually or extracted by AI from natural language and resolved deterministically in your timezone; ambiguous time expressions stay in a `needs_confirmation` state
 - In-app due fallback, so Reminders remain usable without any notification setup
 - Optional Web Push (disabled by default) with your own VAPID keys, browser subscription lifecycle, Service Worker delivery, and an embedded Reminder worker for scheduled multi-device delivery
+- Optional Voice Capture (disabled by default): press-and-hold recording with upward cancel, transcription appended to the editable Capture Draft, and explicit retry/delete for failed segments
 - Mobile-first Web/PWA interface
 - Login, logout, server-side sessions, and CSRF protection
 - Registration closed by default, with optional invite registration
 - Multi-user data ownership isolation
-- SQLite schema v4, including a preserved generic v2→v3 migration implementation
+- SQLite schema v5, with preserved explicit migration implementations
 
 Planner, calendar integration, and autonomous agents are not implemented yet.
 
@@ -49,12 +50,35 @@ Web Push is optional and disabled by default:
 
 Web Push self-hosting has additional security and deployment considerations; see [Security Policy](SECURITY.md).
 
+## Voice Capture
+
+Voice Capture is optional and disabled by default (`VOICE_ASR_ENABLED=false`). With Voice disabled, text Capture, authentication, Reminders, and Web Push work normally; no Alibaba credential, ffmpeg, ffprobe, or Voice storage is required.
+
+The flow preserves the existing Capture discipline:
+
+- Press and hold to record; release to finish; slide upward while recording to cancel.
+- A recording is capped at 60 seconds.
+- The transcript is appended to the editable Capture Draft; you revise it yourself before Final Save.
+- A failed Voice Segment can be retried or deleted explicitly; transcription is never retried automatically.
+- Final Save stays blocked while a Voice Segment failure is unresolved.
+- Saving the final edited text is what triggers AI Structuring. Successful transcription never triggers AI processing by itself.
+- Original Audio is retained according to the Voice Capture lifecycle and remains associated with the saved input after Final Save.
+
+Enabling Voice requires operator configuration:
+
+- `VOICE_STORAGE_ROOT`: an absolute writable path outside the Git checkout. Voice Original Audio is stored there, outside SQLite. Protect and back up this storage consistently with the database. Disabling Voice later does not delete previously stored audio; keep existing Voice storage intact.
+- `FFPROBE_PATH` and `FFMPEG_PATH`: paths to operator-installed media tools. SelfEcho does not bundle or redistribute ffmpeg/ffprobe binaries.
+- `ALIBABA_ASR_API_URL` and `ALIBABA_API_KEY`: your own Alibaba DashScope endpoint and credential. The transcription model is fixed to `qwen-audio-3.0-asr-flash`.
+
+When Voice is enabled, browser audio is sent from your self-hosted SelfEcho instance to the configured Alibaba ASR endpoint, which receives the audio required for transcription. This is a separate provider boundary and credential from AI Structuring, which still uses the configured DeepSeek/OpenAI-compatible provider after Final Save. Alibaba is not used for AI Structuring. Original Audio, transcripts, the database, Voice storage, backups, and provider credentials can all contain sensitive personal information and must be protected accordingly.
+
 ## Requirements
 
 - Python 3.11 or later
 - A local environment with SQLite support
 - A modern browser
 - Optional: your own DeepSeek or OpenAI API key; creating the first user and signing in do not require a provider key
+- Optional, Voice only: operator-installed ffmpeg and ffprobe plus your own Alibaba DashScope credential; not required while Voice stays disabled
 
 ## Quick Start
 
@@ -107,7 +131,7 @@ python -m app.bootstrap
 Bootstrap will:
 
 - use the SQLite database configured via `APP_DATABASE_PATH` in `.env`;
-- initialize schema v4 when the database does not exist yet;
+- initialize schema v5 when the database does not exist yet;
 - create one regular user only when the user count is 0;
 - read and confirm the password through `getpass`;
 - apply the same user constraints and Argon2id password hashing as the application;
@@ -173,32 +197,35 @@ Even without a provider key, you can still initialize the database, create a use
 
 - Default database: `data/selfecho.db`
 - SQLite data belongs to the current self-hosted instance
+- Voice Original Audio (when Voice is enabled) is stored under `VOICE_STORAGE_ROOT`, outside SQLite; protect and back up that storage consistently with the database
 - `.env`, `data/`, `*.db`, WAL/SHM files, and logs are ignored by Git
 - The Community Edition ships no production data and no seeds derived from real data
-- Empty databases are initialized directly to schema v4
+- Empty databases are initialized directly to schema v5
 
 Never commit databases, backups, logs, or screenshots containing personal content to Git.
 
-## Upgrade from v0.3.0
+## Upgrade from v0.4.0
 
-A v0.3.0 database uses schema v3; v0.4.0 uses schema v4. Startup does not migrate automatically — it refuses to start on an unsupported schema version.
+A v0.4.0 database uses schema v4; v0.5.0 uses schema v5. Startup does not migrate automatically — it refuses to start on an unsupported schema version.
 
 1. Stop the application and back up the database file together with its WAL/SHM companions.
 2. Preview the migration with a read-only check:
 
 ```bash
-python -m app.migrations.v004_reminders --database data/selfecho.db --check-only
+python -m app.migrations.v005_voice_capture --database data/selfecho.db --check-only
 ```
 
-3. Run the explicit v3→v4 migration. It asks for a typed confirmation before it starts:
+3. Run the explicit v4→v5 migration. It asks for a typed confirmation before it starts:
 
 ```bash
-python -m app.migrations.v004_reminders --database data/selfecho.db
+python -m app.migrations.v005_voice_capture --database data/selfecho.db
 ```
 
-4. Start v0.4.0 only after the migration has completed successfully.
+The confirmation phrase is `MIGRATE V4 TO V5`.
 
-There is no direct v2→v4 upgrade path; the preserved v2→v3 migration remains a historical implementation detail.
+4. Start v0.5.0 only after the migration has completed successfully.
+
+Databases still on schema v3 (v0.3.0) must migrate sequentially: v3→v4 with `python -m app.migrations.v004_reminders`, then v4→v5 as above. There is no direct v3→v5 path, and the preserved v2→v3 migration remains a historical implementation detail.
 
 ## Tests
 
@@ -206,7 +233,7 @@ There is no direct v2→v4 upgrade path; the preserved v2→v3 migration remains
 python -m pytest
 ```
 
-Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses, authentication, sessions, CSRF, invites, migrations, multi-user isolation, Reminders, temporal parsing, Web Push security and subscriptions, PWA behavior, plus first-user bootstrap and local/production cookie handling. The JavaScript and Service Worker contract tests live in `tests/*.mjs` and run with the Node test runner.
+Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses, authentication, sessions, CSRF, invites, migrations, multi-user isolation, Reminders, temporal parsing, Web Push security and subscriptions, Voice Capture contracts (draft lifecycle, transcription, storage, deletion ledger), PWA behavior, plus first-user bootstrap and local/production cookie handling. The JavaScript and Service Worker contract tests live in `tests/*.mjs` and run with the Node test runner.
 
 ## Current Limitations
 
@@ -217,7 +244,7 @@ Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses,
 - No formal admin console or role system
 - Scheduled Web Push is best-effort: at-most-once, no guaranteed delivery
 - Single application instance and origin-root deployment; no official Docker image or binary distribution
-- Voice Capture is not part of Public v0.4.0
+- Voice Capture has limited real-device validation. Browser/device microphone, MediaRecorder, PWA, and native media-control behavior may vary. Native audio duration presentation may vary by browser before playback; this does not indicate that the persisted Original Audio or server-detected duration is invalid
 
 ## Architecture
 
@@ -225,8 +252,9 @@ Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses,
 Vanilla JavaScript PWA (incl. Service Worker push handling)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite (schema v4)
+          ├── SQLite (schema v5)
           ├── DeepSeek / OpenAI provider abstraction
+          ├── optional Voice Capture → external Voice storage → Alibaba ASR
           └── optional embedded Reminder worker → Web Push
 ```
 

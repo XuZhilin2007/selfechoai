@@ -146,16 +146,32 @@ def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
         "WEB_PUSH_VAPID_SUBJECT",
         "WEB_PUSH_TIMEOUT_SECONDS",
         "WEB_PUSH_TEST_SEND_ENABLED",
+        "VOICE_ASR_ENABLED",
+        "VOICE_STORAGE_ROOT",
+        "VOICE_MAX_UPLOAD_BYTES",
+        "FFPROBE_PATH",
+        "FFMPEG_PATH",
+        "ALIBABA_ASR_API_URL",
+        "ALIBABA_API_KEY",
+        "VOICE_ASR_TIMEOUT_SECONDS",
     ]:
         assert setting in environment_example
     assert "WEB_PUSH_ENABLED=false" in environment_example
     assert "WEB_PUSH_TEST_SEND_ENABLED=false" in environment_example
     assert "REMINDER_WORKER_ENABLED=false" in environment_example
+    assert "VOICE_ASR_ENABLED=false" in environment_example
+    assert "VOICE_MAX_UPLOAD_BYTES=16777216" in environment_example
+    assert "VOICE_STORAGE_ROOT=" in environment_example
+    assert "ALIBABA_API_KEY=" in environment_example
     assert "python -m app.bootstrap" in readme
     assert "hash_invite_code" in readme
     assert "http://127.0.0.1:8000" in readme
     assert "APP_ORIGIN=http://127.0.0.1:8000" in environment_example
     assert "AUTH_COOKIE_SECURE=false" in environment_example
+    assert "python -m app.migrations.v005_voice_capture" in readme
+    assert "qwen-audio-3.0-asr-flash" in readme
+    assert "does not bundle or redistribute ffmpeg/ffprobe" in readme
+    assert "limited real-device validation" in readme
     assert "data/personal_ai_inbox.db" not in readme
     assert "C:\\Users\\" not in readme
     assert not (repository_root / "docs" / "LOCAL_DEVELOPMENT.md").exists()

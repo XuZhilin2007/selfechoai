@@ -28,6 +28,8 @@
 
 ## Current Release Boundary
 
-v0.4.0 提供 Capture、AI Structuring、事项生命周期管理、多用户认证隔离、Web/PWA 使用体验，以及作为当前辅助能力的一次性 Reminder。Reminder 可以手动创建，也可以由 AI 提取意图与时间表达后经应用确定性解析生成；歧义时间可以保持 `needs_confirmation` 状态，而不必被强行确定。Personal Item 不会被强制变成传统 Todo，Reminder 只辅助用户在合适的时间回看与行动。完成或回收事项会取消其活跃 Reminder；恢复事项不会复活已取消的 Reminder。可选 Web Push 与嵌入式 Reminder worker 只影响提醒的送达方式，不改变上述语义。
+v0.5.0 提供 Capture、AI Structuring、事项生命周期管理、多用户认证隔离、Web/PWA 使用体验，以及作为当前辅助能力的一次性 Reminder。Reminder 可以手动创建，也可以由 AI 提取意图与时间表达后经应用确定性解析生成；歧义时间可以保持 `needs_confirmation` 状态，而不必被强行确定。Personal Item 不会被强制变成传统 Todo，Reminder 只辅助用户在合适的时间回看与行动。完成或回收事项会取消其活跃 Reminder；恢复事项不会复活已取消的 Reminder。可选 Web Push 与嵌入式 Reminder worker 只影响提醒的送达方式，不改变上述语义。
 
-Flexible Planning Assistant、日历集成和自治 Agent 仍是未来方向，Voice Capture 不属于 Public v0.4.0；这些不应在文档中描述为已完成功能。
+可选 Voice Capture（默认关闭）延续同一原则：先捕获，保留原始用户输入，AI 只辅助而不决定。按住录音、上滑取消；转写文本只追加进可编辑的 Capture Draft，最终内容在 Final Save 前由用户修改确认；失败的转写保持显式状态，可重试或删除，原始录音不会因此静默丢失，转写成功也不会替用户触发 AI 整理。
+
+Flexible Planning Assistant、日历集成和自治 Agent 仍是未来方向；这些不应在文档中描述为已完成功能。
