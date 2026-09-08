@@ -108,7 +108,7 @@ def test_service_worker_push_click_and_cache_privacy_contract(client_factory):
     client = client_factory(FunctionAIService(lambda text, existing: None))
     service_worker = client.get("/service-worker.js").text
 
-    assert "selfecho-ai-community-v0.4-stage5-1" in service_worker
+    assert "selfecho-ai-community-v0.5" in service_worker
     assert 'addEventListener("push"' in service_worker
     assert 'addEventListener("notificationclick"' in service_worker
     assert "registration.showNotification" in service_worker
