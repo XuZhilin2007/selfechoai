@@ -1791,7 +1791,7 @@ async function recoverVoiceUploadRevisionConflict({
 }
 
 function voiceAudioMarkup(segmentId, label = "播放原始录音") {
-  return `<audio class="voice-audio" controls preload="none" aria-label="${escapeHtml(label)}" src="/api/voice-segments/${segmentId}/audio"></audio>`;
+  return `<audio class="voice-audio" controls preload="metadata" aria-label="${escapeHtml(label)}" src="/api/voice-segments/${segmentId}/audio"></audio>`;
 }
 
 function renderCapture() {
