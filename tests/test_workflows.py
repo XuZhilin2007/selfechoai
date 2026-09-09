@@ -570,7 +570,9 @@ def test_pwa_routes_and_health_start(client_factory):
     assert client.get("/api/health").json() == {"message": "ok"}
     shell = client.get("/capture").text
     assert "SelfEcho" in shell
-    assert client.get("/openapi.json").json()["info"]["title"] == "SelfEcho AI"
+    openapi_info = client.get("/openapi.json").json()["info"]
+    assert openapi_info["title"] == "SelfEcho AI"
+    assert openapi_info["version"] == "0.6.0"
     manifest_response = client.get("/static/manifest.webmanifest")
     assert manifest_response.status_code == 200
     manifest = json.loads(manifest_response.text)

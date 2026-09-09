@@ -146,6 +146,16 @@ def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
         "WEB_PUSH_VAPID_SUBJECT",
         "WEB_PUSH_TIMEOUT_SECONDS",
         "WEB_PUSH_TEST_SEND_ENABLED",
+        "EMAIL_REMINDER_PROVIDER_ENABLED",
+        "TENCENT_SES_REGION",
+        "TENCENTCLOUD_SECRET_ID",
+        "TENCENTCLOUD_SECRET_KEY",
+        "TENCENT_SES_FROM_EMAIL_ADDRESS",
+        "TENCENT_SES_VERIFICATION_TEMPLATE_ID",
+        "TENCENT_SES_REMINDER_TEMPLATE_ID",
+        "TENCENT_SES_TEST_TEMPLATE_ID",
+        "TENCENT_SES_TIMEOUT_SECONDS",
+        "EMAIL_VERIFICATION_CODE_PEPPER",
         "VOICE_ASR_ENABLED",
         "VOICE_STORAGE_ROOT",
         "VOICE_MAX_UPLOAD_BYTES",
@@ -158,6 +168,7 @@ def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
         assert setting in environment_example
     assert "WEB_PUSH_ENABLED=false" in environment_example
     assert "WEB_PUSH_TEST_SEND_ENABLED=false" in environment_example
+    assert "EMAIL_REMINDER_PROVIDER_ENABLED=false" in environment_example
     assert "REMINDER_WORKER_ENABLED=false" in environment_example
     assert "VOICE_ASR_ENABLED=false" in environment_example
     assert "VOICE_MAX_UPLOAD_BYTES=16777216" in environment_example
@@ -169,6 +180,8 @@ def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
     assert "APP_ORIGIN=http://127.0.0.1:8000" in environment_example
     assert "AUTH_COOKIE_SECURE=false" in environment_example
     assert "python -m app.migrations.v005_voice_capture" in readme
+    assert "python -m app.migrations.v006_email_reminders" in readme
+    assert "MIGRATE PUBLIC V5 TO V6" in readme
     assert "qwen-audio-3.0-asr-flash" in readme
     assert "does not bundle or redistribute ffmpeg/ffprobe" in readme
     assert "limited real-device validation" in readme

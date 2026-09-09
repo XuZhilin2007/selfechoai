@@ -1,6 +1,6 @@
 # SelfEcho AI Architecture
 
-本文描述 Community Edition v0.5.0 的当前实现，不代表托管服务的基础设施设计。
+本文描述 Community Edition v0.6.0 的当前实现，不代表托管服务的基础设施设计。
 
 ## System Overview
 
@@ -12,10 +12,12 @@ FastAPI application
         ├── Capture / Item APIs
         ├── Reminder / Reminder-settings APIs
         ├── Push configuration / subscription APIs
+        ├── Email Reminder settings / verification / Test Email APIs
         ├── Voice Capture / transcription APIs（可选，默认关闭）
         ├── Background AI processing
-        ├── 可选嵌入式 Reminder worker（定时 due 扫描 + Web Push 投递）
-        ├── SQLite schema v5
+        ├── 可选嵌入式 Reminder worker（定时 due 扫描 + Push / Email 投递）
+        ├── SQLite schema v6
+        ├── 可选 Tencent SES Email Provider boundary
         ├── 可选外部 Voice 存储 + Alibaba ASR boundary
         └── DeepSeek or OpenAI provider boundary
 ~~~
@@ -26,7 +28,9 @@ FastAPI application
 - app/services/temporal_parser.py 负责时间表达的确定性解析；app/time_utils.py 处理 IANA 时区校验与 UTC 序列化。
 - app/push_routes.py 与 app/services/push_subscriptions.py 处理浏览器 Push 订阅生命周期。
 - app/services/push_security.py 在出站前校验 Push endpoint；app/services/web_push.py 执行受限的出站 Web Push。
-- app/services/reminder_delivery.py 是嵌入式 worker 的 due 扫描与投递逻辑。
+- app/email_routes.py、app/email_repository.py 与 app/services/email_reminders.py 处理账户级 Email 设置、所有权验证、Test Email、Email delivery ledger 与发送前重新验证。
+- app/services/tencent_ses.py 是 Tencent SES adapter；业务代码不直接接触 Tencent SDK 对象。
+- app/services/reminder_delivery.py 是嵌入式 worker 的 due 扫描以及独立 Push/Email 投递协调逻辑。
 - app/auth.py、app/auth_repository.py 和 app/auth_routes.py 处理认证、Session 和用户数据边界。
 - app/voice_contracts.py 定义 Voice 领域常量；app/voice_repository.py 与 app/voice_routes.py 处理 Capture Draft、Voice Segment 与音频访问的持久化和 API。
 - app/voice_runtime.py 是单实例 Voice 任务协调器；app/services/voice_storage.py 管理外部 Original Audio 存储；app/services/voice_media.py 执行 ffprobe/ffmpeg 媒体处理；app/services/alibaba_asr.py 与 app/services/voice_transcription.py 隔离 ASR Provider；app/services/voice_deletions.py 维护音频删除 ledger。
@@ -97,7 +101,9 @@ Capture / Manual action
         → Reminder persistence
         → scheduled / needs_confirmation
         → due
-        → in-app fallback / optional Web Push
+        ├── in-app fallback
+        ├── optional Web Push delivery intent
+        └── optional Email delivery intent
 ~~~
 
 - Reminder 是一次性的，没有循环提醒。
@@ -105,7 +111,8 @@ Capture / Manual action
 - 无法解析或歧义的时间表达保持 `needs_confirmation`，不会由 AI 猜测补全。
 - 用户可以手动创建、改期或取消 Reminder。
 - 事项被完成或移入回收站时，其活跃 Reminder（`needs_confirmation` / `scheduled`）被取消；事项恢复到 active 不会复活已取消的 Reminder。
-- 到期由两种途径呈现：应用访问时的惰性 due 转移与应用内展示；以及可选的定时 Web Push。
+- Reminder 第一次进入 due lifecycle 的同一 transaction 中，系统按当时的外部渠道 eligibility 独立建立 Push 与 Email delivery intent；两者不存在 fallback 或互相触发。
+- 到期既可由应用访问时的惰性 due 转移并显示于应用内，也可由启用的 worker 定时扫描并尝试外部 Push/Email。worker 关闭不影响应用内 due lifecycle。
 
 ## Authentication and Request Protection
 
@@ -121,7 +128,7 @@ Capture / Manual action
 
 ## Multi-user Isolation
 
-schema v5 为 users、user_sessions、personal_items、item_inputs、reminders、push_subscriptions、reminder_deliveries、capture_drafts、voice_segments 和 voice_file_deletions 建立显式所有权关系。业务 API 从已验证 Session 获取 current user，Repository 查询和修改同时使用记录 ID 与 user_id；Reminder、Push 订阅和投递记录同样按 user_id 隔离，Push 订阅还绑定创建它的 Session。Capture Draft 与 Voice Segment（含音频访问）同样按 user_id 隔离。跨用户访问按不存在处理，并由 API 与 Repository 测试覆盖。
+schema v6 为 users、user_sessions、personal_items、item_inputs、reminders、push_subscriptions、reminder_deliveries、capture_drafts、voice_segments、voice_file_deletions、email_reminder_settings、email_verification_challenges 和 reminder_email_deliveries 建立显式所有权关系。业务 API 从已验证 Session 获取 current user，Repository 查询和修改同时使用记录 ID 与 user_id；Reminder、Push/Email 设置与投递记录同样按 user_id 隔离，Push 订阅还绑定创建它的 Session。Capture Draft 与 Voice Segment（含音频访问）同样按 user_id 隔离。跨用户访问按不存在处理，并由 API 与 Repository 测试覆盖。
 
 这是应用层与数据库关系共同形成的隔离边界，不等同于面向不可信租户的完整托管平台安全认证。部署者仍需保护数据库文件、备份和主机权限。
 
@@ -134,29 +141,66 @@ schema v5 为 users、user_sessions、personal_items、item_inputs、reminders�
 - 推送载荷是通用内容并指向 /dashboard，不包含 Personal Item 标题、正文或其他用户标识。
 - Service Worker 处理 push 与 notificationclick 事件；认证状态和私有事项不进入 Service Worker Cache。
 
+## Email Reminder Architecture
+
+Email Reminder 是与 Web Push 并列的独立账户级渠道，不是每条 Reminder 上的 selectable field。根据当前账户设置、浏览器订阅与 Provider runtime，一个账户可以形成 Push only、Email only、Both 或 Neither / in-app only。Push failure 不触发 Email，Email failure 也不触发 Push。
+
+### Account settings and verification
+
+- `email_reminder_settings` 保存用户当前 Email address、verification/enabled/health 状态、暂停原因与 Test Email 限流 metadata。Login Email 不会自动复制为 Reminder Email。
+- 设置新地址后状态为 pending；修改地址会重新要求验证、使未完成 challenge 失效，并 suppress 仍待发送到旧地址的 queued/retry delivery。
+- `email_verification_challenges` 保存 10 分钟有效期、发送状态、尝试次数和 Provider metadata。六位验证码以 `EMAIL_VERIFICATION_CODE_PEPPER`、user ID 与规范化地址为上下文生成 HMAC；raw code 不写入数据库。
+- 验证邮件 resend 有 60 秒 cooldown、同一地址每小时 5 次和账户每小时 10 次限制；每个 challenge 最多接受 5 次验证码尝试。Provider 已接受或结果 unknown 的 challenge 才可用于确认。
+- 用户的 `enabled` 意愿与 Provider availability 分开保存；地址已验证、enabled、健康且 Provider 可用时，公开状态才是 effective active。
+
+### Due-time enqueue and channel isolation
+
+Reminder 从 `scheduled` 首次原子转换为 `due` 时：
+
+- Push ledger `reminder_deliveries` 按当时有效的 active subscription 独立扇出；
+- Email ledger `reminder_email_deliveries` 仅在 Provider runtime 可用，且当时账户 Email enabled、已验证、健康、用户 active 时创建一条 delivery，并保存 `destination_email` snapshot；
+- 当时未建立的 Email delivery 以后不会因开启渠道或完成验证而 backfill；
+- 已保存的 destination snapshot 不会因为用户后来更换地址而重定向。
+
+Email delivery 真正出站前会两次按当前数据重新检查 destination 是否仍匹配、verification/enabled/health 是否仍有效，以及 user、Personal Item 和 Reminder 是否仍 active/due。失败的检查将 delivery 终态化为 `suppressed`，不会改投其他地址或渠道。
+
+### Tencent provider and delivery ledger
+
+- v0.6.0 的唯一正式 Email adapter 是 `TencentSesEmailSender`。Operator 提供自己的 Tencent Cloud SES account、credentials、sender identity 与 templates；公开代码不内置 Hosted Service 配置。
+- 普通 Reminder 出站只传 `destination` 与由 `APP_ORIGIN` 形成的通用 `/dashboard` URL；调用边界没有 title、item ID 或 reminder ID 参数。
+- 明确发生在 Provider acceptance 前的 retryable failure 最多进行 4 次尝试，间隔为 60、180、360 秒，并受 Reminder due 后 15 分钟 TTL 限制。Permanent failure 进入 `failed`；有歧义的网络/Provider 结果进入 `unknown`，不自动重发。
+- 腾讯 API 返回 Message ID 与 Request ID 时，ledger 状态记为 `accepted`，但这不等于 recipient delivered。worker 最多进行 3 次有界状态查询；pending/deferred 状态按 5 分钟、60 分钟间隔复查。Provider blacklist、unsubscribe、complaint 等信号可暂停当前 destination 并 suppress 其待发送 delivery。
+- Test Email 不进入 normal Reminder delivery ledger；它只针对当前 verified/healthy address，受独立的 60 秒 cooldown 和每小时 5 次限制。Normal Email enabled 不是 Test Email 前提，但 Provider 与可选 Test template 必须 available。
+
+### Configuration fail-closed boundary
+
+`EMAIL_REMINDER_PROVIDER_ENABLED=false` 时，Email 专用配置不参与解析，也不会创建 Tencent client；Authentication、Capture、应用内 Reminder、单独配置的 Push 与 Voice 均不依赖 Tencent network。主动启用后，Secret ID/Key、sender、Verification/Reminder template、verification pepper 和有效 region/timeout 缺一即拒绝启动。`TENCENT_SES_TEST_TEMPLATE_ID` 是唯一可选模板；缺失时仅 Test Email 不可用。
+
 ## Reminder Worker
 
 - worker 是嵌入在应用进程内的轮询循环，必须通过 `REMINDER_WORKER_ENABLED=true` 显式启用；支持的单机拓扑是单应用实例。
-- 每轮 sweep：将超时的 `sending` 投递对账为 `unknown` → 认领到期的 scheduled Reminder（`due`）并按其活跃订阅扇出创建 `queued` 投递 → 将不再可用的目标终态化 → 逐条领取 `queued → sending` 并出站投递。
-- 每次投递都记录在 reminder_deliveries ledger 中，含 provider_status；provider 拒绝且订阅已失效（如 410）时同时失效订阅记录。
-- 语义是 at-most-once：`sent` / `failed` / `unknown` 均为终态，没有自动重试；`unknown` 表示 Provider 结果不确定。
-- worker 未启用时，应用访问触发的惰性 due 转移和应用内 fallback 仍然可用；Web Push 不可用或未配置也不影响 Reminder 使用。
+- 每轮 sweep 先协调独立渠道：将超时的 Push/Email `sending` 对账为 `unknown` → 认领到期的 scheduled Reminder 并原子记录当时符合条件的 Push/Email intent → 分别处理两个 ledger。
+- Push 每次投递记录在 `reminder_deliveries`，含 `provider_status`；Provider 拒绝且订阅已失效（如 410）时同时失效订阅记录。Push 是 at-most-once：`sent` / `failed` / `unknown` 都是终态，不自动重试。
+- Email 每次投递记录在 `reminder_email_deliveries`；发送前重新验证 destination 与账户/事项/Reminder 状态，只对明确 retryable 的 pre-acceptance failure 做有限重试，并对 accepted message 做有限状态对账。Ambiguous result 进入 `unknown` 而不盲目重发。
+- worker 未启用时，应用访问触发的惰性 due 转移和应用内 fallback 仍然可用；但不会执行 scheduled Push 或 Email。任何一个外部渠道不可用都不会触发另一个渠道。
 
 ## Database and Migration
 
 - 默认数据库是 data/selfecho.db。
 - SQLite 启用 foreign_keys、busy_timeout 和 WAL。
-- 新空数据库直接初始化为 schema v5。
+- 新空数据库直接初始化为 schema v6。
 - 应用启动只验证已有数据库版本和必需结构，不执行隐式升级；遇到不支持的旧版本会拒绝启动并提示显式迁移。
+- schema v6 在 v5 基础上新增 `email_reminder_settings`（账户 Email 设置）、`email_verification_challenges`（验证 challenge 与 HMAC）和 `reminder_email_deliveries`（包含 destination snapshot 与 Provider 状态的 durable ledger）。`CURRENT_SCHEMA_VERSION = 6`。
+- app/migrations/v006_email_reminders.py 提供显式 v5→v6 迁移：`python -m app.migrations.v006_email_reminders --database data/selfecho.db --check-only` 做只读预检；正式迁移去掉 `--check-only`，要求应用已停止、存在经过验证且可恢复的备份，并输入精确文字 `MIGRATE PUBLIC V5 TO V6`。迁移在单一 transaction 中创建三个新表与索引，同时验证旧表行数、schema、foreign key 与 integrity。
 - app/migrations/v005_voice_capture.py 提供显式的 v4→v5 迁移：`--check-only` 只读预检；正式迁移要求停止使用且已备份的数据库、输入 `MIGRATE V4 TO V5` 确认文字、单事务执行，并通过迁移后行数守恒、schema 结构、foreign key 和 integrity 检查。
-- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。schema v3 数据库必须顺序迁移 v3→v4→v5，不存在直接 v3→v5 路径。
+- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。旧数据库必须顺序迁移 v3→v4→v5→v6，不存在跨版本直达路径。
 - app/migrations/v003_auth.py 保留通用的 v2 到 v3 显式迁移实现，属于历史兼容层。
 
 Voice Original Audio 存储在 `VOICE_STORAGE_ROOT` 指定的外部目录，不在 SQLite 内；数据库迁移不涉及也不重建历史音频文件。数据库、Voice 存储、WAL/SHM、备份和真实数据不属于公开发行物。
 
 ## PWA and Caching
 
-FastAPI 同源提供 API、静态资源和单页应用入口。Service Worker 只缓存 App Shell：HTML、CSS、JavaScript、Manifest 和图标；以 /api/ 开头的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
+FastAPI 同源提供 API、静态资源和单页应用入口。Service Worker 使用 `selfecho-ai-community-v0.6` cache namespace，只缓存 App Shell：HTML、CSS、JavaScript、Manifest 和图标；以 /api/ 开头的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
 
 登录用户的 Capture 草稿临时保存在 sessionStorage，并按用户区分。认证状态和私有事项不写入 Service Worker Cache。Service Worker 文件自身以 no-cache 响应，便于更新缓存版本。
 
@@ -167,6 +211,10 @@ DeepSeek 与 OpenAI Responses API 是可选 Provider。没有 Key 时，数据�
 启用 Provider 后，用户原文及整理所需的事项上下文会离开本机并发送给所选第三方；包含提醒意图或时间表达的文本参与 Reminder 提取，同样属于这条数据流。部署者必须自行评估供应商的数据保留、地域、账户安全和费用。AI_DEBUG_OUTPUT 可能包含个人输入或模型结果，不应在共享或生产环境启用。
 
 Web Push 推送载荷为通用内容，不含 Personal Item 标题或正文。Push 订阅的 endpoint、p256dh 与 auth 材料是运维敏感数据，存储在自托管实例的 SQLite 中；数据库备份应按敏感数据保护。
+
+Tencent SES Email 是另一个可选 Provider boundary。验证邮件会向 Tencent 发送 recipient Email、六位 verification code 与技术性 Provider metadata；普通 Reminder 只发送 recipient Email、通用 subject/content、由 `APP_ORIGIN` 构造的通用 Dashboard URL 与技术性 Provider metadata。普通 Reminder 不发送 Personal Item title/body、原始 Capture、item ID、reminder ID 或 item-specific link；Test Email template 不接收 dynamic variable。Tencent 接受 API request 不等于 recipient 已送达。
+
+Self-host SQLite 会持久化当前 Reminder Email、verification/challenge metadata、destination snapshot 与 Provider message/status metadata，部署者须将其视为 PII/敏感运维数据。Raw verification code 不持久化，只保存含 operator-owned pepper 的 HMAC。Email 凭据、sender 和 template 都由 Community operator 提供；账户删除沿用应用现有数据生命周期，当前没有额外宣称自动 retention、challenge cleanup 或独立 GDPR 删除子系统。
 
 Voice ASR 是独立的 Provider 边界。启用 Voice 后，浏览器录音经自托管实例发送到所配置的 Alibaba DashScope ASR 端点（固定模型 `qwen-audio-3.0-asr-flash`），Alibaba 接收转写所需的音频；凭据由部署者自行提供并保护。AI Structuring 不使用 Alibaba，仍走上述 DeepSeek/OpenAI 边界。Original Audio 与 transcript 属于敏感用户数据，其外部存储、备份和凭据都由部署者保护。
 

@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-SelfEcho AI Community Edition 目前仍处于早期阶段，仅维护当前 0.5.x 系列。
+SelfEcho AI Community Edition 目前仍处于早期阶段，仅维护当前 0.6.x 系列。
 
 | Version | Supported |
 | --- | --- |
-| 0.5.x | Yes |
-| < 0.5 | No |
+| 0.6.x | Yes |
+| < 0.6 | No |
 
 ## Reporting a Vulnerability
 
@@ -24,7 +24,7 @@ Community Edition 提供应用代码和本地运行默认值，不提供托管�
 - 操作系统、反向代理、TLS、网络访问控制与安全更新；
 - 数据库、Voice 存储、备份、日志、文件权限和数据保留策略；
 - APP_ORIGIN、HTTPS Cookie、注册模式和邀请代码配置；
-- DeepSeek、OpenAI、Alibaba 或其他外部服务的账户、费用与隐私设置。
+- DeepSeek、OpenAI、Tencent SES、Alibaba 或其他外部服务的账户、费用与隐私设置。
 
 生产部署必须使用 HTTPS，并将 AUTH_COOKIE_SECURE 设为 true。不要公开 .env、数据库、WAL/SHM、备份、日志或真实截图。
 
@@ -32,7 +32,7 @@ Community Edition 提供应用代码和本地运行默认值，不提供托管�
 
 ## Web Push Security（Community self-hosting）
 
-Community v0.5.0 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+Community v0.6.0 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
 
 ### VAPID
 
@@ -68,11 +68,30 @@ Push 订阅保存于自托管实例的 SQLite，包含 endpoint、p256dh 和 aut
 
 ### Deployment
 
-Community v0.5.0 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
+Community v0.6.0 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
+
+## Email Reminder Security（Community self-hosting）
+
+Community v0.6.0 的 Email Reminder 是可选功能，默认通过 `EMAIL_REMINDER_PROVIDER_ENABLED=false` 关闭。关闭时不解析 Email 专用配置、不创建 Tencent client，也不需要 Tencent credentials、sender、template、verification pepper 或 Tencent network access。
+
+### Tencent SES credentials and templates
+
+- v0.6.0 只正式支持 Tencent SES。Secret ID/Key 与 `EMAIL_VERIFICATION_CODE_PEPPER` 都是秘密，只能保存在未跟踪的本地 `.env`，不得写入模板、日志、截图或 Git。
+- Sender identity 和所有 template 均由 self-host operator 自行创建与验证，不应复用或依赖 Hosted Service 的 sender、template ID 或 domain。
+- 主动启用 Provider 后，必需配置缺失或 region/timeout 无效会 fail closed。Test Email template 可选；缺失时普通 Reminder 仍可工作，但 Test Email 不可用。
+
+### Email data and provider boundary
+
+- 验证时，Tencent 接收 recipient Email、verification code 与技术性 metadata；普通 Reminder 只发送 recipient Email、generic Reminder subject/content、generic dashboard URL 与技术性 metadata。
+- 普通 Reminder 不发送 Personal Item title/body、original Capture、item ID、reminder ID 或 item-specific direct link。
+- SQLite 保存当前 Reminder Email、verification/challenge metadata、destination snapshot 与 Provider message/status metadata，数据库和备份应按含 PII 的敏感数据保护。
+- Raw verification code 不持久化；数据库保存含 operator-owned pepper 的 HMAC。验证码会过期，并对 resend 与 confirmation attempt 限流。
+- Tencent 接受 API request 不能证明 recipient 已收到邮件。Ambiguous result 保留为 `unknown`；状态对账次数有限，不能视为送达保证。
+- `REMINDER_WORKER_ENABLED=true` 是 scheduled Email/Push 的必要条件；worker 关闭时应用内 due lifecycle 仍可使用。
 
 ## Voice Capture Security（Community self-hosting）
 
-Community v0.5.0 的 Voice Capture 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+Community v0.6.0 的 Voice Capture 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
 
 ### ASR Provider boundary
 

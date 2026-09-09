@@ -24,11 +24,16 @@
 - 每条输入、事项和 Session 都必须有明确的用户边界。
 - 默认不公开注册；自托管者显式决定首位用户和后续注册方式。
 - Provider 调用只发送完成当前整理所需的内容，日志不应记录原始文本、完整模型输出或秘密。
+- 外部 Reminder 渠道只发送完成投递所需的最少数据；通用 Email Reminder 不发送 Personal Item title/body、原始 Capture、item ID 或 reminder ID。
+- Self-host operator 自行拥有并管理 Tencent SES、Web Push、AI 与 Voice 等外部集成的账户、凭据、配置、费用和 Provider 隐私边界。
+- Provider acceptance 与 recipient delivery 是不同事实；结果不确定时保留 `unknown`，不把不确定性包装成“已送达”。
 - 数据库、备份、日志和截图都可能含个人信息，不能作为公开示例。
 
 ## Current Release Boundary
 
-v0.5.0 提供 Capture、AI Structuring、事项生命周期管理、多用户认证隔离、Web/PWA 使用体验，以及作为当前辅助能力的一次性 Reminder。Reminder 可以手动创建，也可以由 AI 提取意图与时间表达后经应用确定性解析生成；歧义时间可以保持 `needs_confirmation` 状态，而不必被强行确定。Personal Item 不会被强制变成传统 Todo，Reminder 只辅助用户在合适的时间回看与行动。完成或回收事项会取消其活跃 Reminder；恢复事项不会复活已取消的 Reminder。可选 Web Push 与嵌入式 Reminder worker 只影响提醒的送达方式，不改变上述语义。
+v0.6.0 提供 Capture、AI Structuring、事项生命周期管理、多用户认证隔离、Web/PWA 使用体验，以及作为当前辅助能力的一次性 Reminder。Reminder 可以手动创建，也可以由 AI 提取意图与时间表达后经应用确定性解析生成；歧义时间可以保持 `needs_confirmation` 状态，而不必被强行确定。Personal Item 不会被强制变成传统 Todo，Reminder 只辅助用户在合适的时间回看与行动。完成或回收事项会取消其活跃 Reminder；恢复事项不会复活已取消的 Reminder。
+
+可选 Web Push 与 Email Reminder 是彼此独立、显式的外部渠道，不存在隐藏 fallback；渠道 eligibility 在 Reminder 第一次进入 due lifecycle 时确定，不是 AI 决策，也不是每条 Reminder 的隐式选择。Email 默认关闭，只在用户设置并验证独立 Reminder Email、自托管者配置 Tencent SES、且 Reminder worker 已启用时参与定时投递。任何外部渠道不可用都不改变应用内 due Reminder 的存在与展示。
 
 可选 Voice Capture（默认关闭）延续同一原则：先捕获，保留原始用户输入，AI 只辅助而不决定。按住录音、上滑取消；转写文本只追加进可编辑的 Capture Draft，最终内容在 Final Save 前由用户修改确认；失败的转写保持显式状态，可重试或删除，原始录音不会因此静默丢失，转写成功也不会替用户触发 AI 整理。
 
