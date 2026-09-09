@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATABASE_PATH = Path("data/selfecho.db")
 LEGACY_DATABASE_PATH = Path("data/personal_ai_inbox.db")
 _BASE64URL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+_TENCENT_REGION_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$")
 MAX_VOICE_UPLOAD_BYTES = 64 * 1024 * 1024
 MAX_VOICE_ASR_TIMEOUT_SECONDS = 120.0
 
@@ -147,6 +148,16 @@ class Settings:
     reminder_poll_interval_seconds: float = 30.0
     reminder_batch_size: int = 100
     reminder_sending_stale_seconds: int = 300
+    email_reminder_provider_enabled: bool = False
+    tencent_ses_region: str = "ap-guangzhou"
+    tencentcloud_secret_id: SecretStr = SecretStr("")
+    tencentcloud_secret_key: SecretStr = SecretStr("")
+    tencent_ses_from_email_address: str = ""
+    tencent_ses_verification_template_id: int | None = None
+    tencent_ses_reminder_template_id: int | None = None
+    tencent_ses_test_template_id: int | None = None
+    tencent_ses_timeout_seconds: float = 10.0
+    email_verification_code_pepper: SecretStr = SecretStr("")
     voice_asr_enabled: bool = False
     voice_storage_root: Path | None = None
     voice_max_upload_bytes: int = DEFAULT_VOICE_MAX_UPLOAD_BYTES
@@ -196,6 +207,77 @@ class Settings:
             raise ValueError(
                 "REMINDER_SENDING_STALE_SECONDS must be between 1 and 86400"
             )
+        if self.email_reminder_provider_enabled:
+            if not _TENCENT_REGION_PATTERN.fullmatch(self.tencent_ses_region):
+                raise ValueError(
+                    "TENCENT_SES_REGION must be a non-empty Tencent region name"
+                )
+            if not math.isfinite(self.tencent_ses_timeout_seconds) or not (
+                0 < self.tencent_ses_timeout_seconds <= 60
+            ):
+                raise ValueError(
+                    "TENCENT_SES_TIMEOUT_SECONDS must be greater than 0 "
+                    "and at most 60"
+                )
+            if (
+                not self.tencent_ses_from_email_address.strip()
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in self.tencent_ses_from_email_address
+                )
+            ):
+                raise ValueError(
+                    "TENCENT_SES_FROM_EMAIL_ADDRESS must be non-empty and "
+                    "contain no control characters"
+                )
+            missing = [
+                name
+                for name, value in (
+                    (
+                        "TENCENTCLOUD_SECRET_ID",
+                        self.tencentcloud_secret_id.get_secret_value(),
+                    ),
+                    (
+                        "TENCENTCLOUD_SECRET_KEY",
+                        self.tencentcloud_secret_key.get_secret_value(),
+                    ),
+                    (
+                        "TENCENT_SES_VERIFICATION_TEMPLATE_ID",
+                        self.tencent_ses_verification_template_id,
+                    ),
+                    (
+                        "TENCENT_SES_REMINDER_TEMPLATE_ID",
+                        self.tencent_ses_reminder_template_id,
+                    ),
+                    (
+                        "EMAIL_VERIFICATION_CODE_PEPPER",
+                        self.email_verification_code_pepper.get_secret_value(),
+                    ),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "Email Reminder provider is enabled but required settings "
+                    f"are missing: {', '.join(missing)}"
+                )
+            for name, value in (
+                (
+                    "TENCENT_SES_VERIFICATION_TEMPLATE_ID",
+                    self.tencent_ses_verification_template_id,
+                ),
+                (
+                    "TENCENT_SES_REMINDER_TEMPLATE_ID",
+                    self.tencent_ses_reminder_template_id,
+                ),
+                ("TENCENT_SES_TEST_TEMPLATE_ID", self.tencent_ses_test_template_id),
+            ):
+                if value is not None and (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value <= 0
+                ):
+                    raise ValueError(f"{name} must be a positive integer")
         if not isinstance(self.voice_max_upload_bytes, int) or isinstance(
             self.voice_max_upload_bytes, bool
         ):
@@ -266,6 +348,47 @@ class Settings:
         if session_expiration_seconds <= 0:
             raise ValueError("AUTH_SESSION_EXPIRATION_SECONDS must be positive")
         session_cookie_secure = read_bool("AUTH_COOKIE_SECURE", "false")
+        email_provider_enabled = read_bool(
+            "EMAIL_REMINDER_PROVIDER_ENABLED", "false"
+        )
+        email_region = "ap-guangzhou"
+        email_secret_id = ""
+        email_secret_key = ""
+        email_from_address = ""
+        email_verification_template_id: int | None = None
+        email_reminder_template_id: int | None = None
+        email_test_template_id: int | None = None
+        email_timeout_seconds = 10.0
+        email_verification_pepper = ""
+        if email_provider_enabled:
+            def read_template_id(name: str) -> int | None:
+                raw_value = read(name).strip()
+                if not raw_value:
+                    return None
+                value = int(raw_value)
+                if value <= 0:
+                    raise ValueError(f"{name} must be a positive integer")
+                return value
+
+            email_region = read("TENCENT_SES_REGION", "ap-guangzhou").strip()
+            email_secret_id = read("TENCENTCLOUD_SECRET_ID").strip()
+            email_secret_key = read("TENCENTCLOUD_SECRET_KEY").strip()
+            email_from_address = read("TENCENT_SES_FROM_EMAIL_ADDRESS").strip()
+            email_verification_template_id = read_template_id(
+                "TENCENT_SES_VERIFICATION_TEMPLATE_ID"
+            )
+            email_reminder_template_id = read_template_id(
+                "TENCENT_SES_REMINDER_TEMPLATE_ID"
+            )
+            email_test_template_id = read_template_id(
+                "TENCENT_SES_TEST_TEMPLATE_ID"
+            )
+            email_timeout_seconds = float(
+                read("TENCENT_SES_TIMEOUT_SECONDS", "10")
+            )
+            email_verification_pepper = read(
+                "EMAIL_VERIFICATION_CODE_PEPPER"
+            ).strip()
         voice_storage_value = read("VOICE_STORAGE_ROOT").strip()
         ffprobe_value = read("FFPROBE_PATH").strip()
         ffmpeg_value = read("FFMPEG_PATH").strip()
@@ -317,6 +440,16 @@ class Settings:
             reminder_sending_stale_seconds=int(
                 read("REMINDER_SENDING_STALE_SECONDS", "300")
             ),
+            email_reminder_provider_enabled=email_provider_enabled,
+            tencent_ses_region=email_region,
+            tencentcloud_secret_id=SecretStr(email_secret_id),
+            tencentcloud_secret_key=SecretStr(email_secret_key),
+            tencent_ses_from_email_address=email_from_address,
+            tencent_ses_verification_template_id=email_verification_template_id,
+            tencent_ses_reminder_template_id=email_reminder_template_id,
+            tencent_ses_test_template_id=email_test_template_id,
+            tencent_ses_timeout_seconds=email_timeout_seconds,
+            email_verification_code_pepper=SecretStr(email_verification_pepper),
             voice_asr_enabled=read_bool("VOICE_ASR_ENABLED", "false"),
             voice_storage_root=(
                 Path(voice_storage_value) if voice_storage_value else None

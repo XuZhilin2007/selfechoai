@@ -122,8 +122,8 @@ async function dispatchClick(harness, targetPath) {
   return closed;
 }
 
-test("Stage 5 cache revision precaches only shell assets and removes old cache", async () => {
-  const currentCache = "selfecho-ai-community-v0.5";
+test("v0.6 cache revision precaches only shell assets and removes old cache", async () => {
+  const currentCache = "selfecho-ai-community-v0.6";
   const previousCache = "selfecho-ai-reminder-v0.1-stage3b-3";
   const harness = createHarness({ cacheKeys: [previousCache, currentCache] });
 

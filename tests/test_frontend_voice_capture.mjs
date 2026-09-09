@@ -85,6 +85,9 @@ function createHarness(fetchImpl = async () => ({
       voiceGestureCancelArmed,
       captureHasActiveSegment,
       captureHasFailedSegment,
+      captureDiscardControl,
+      runWithCaptureDiscardPending,
+      voiceSegmentFailureCopy,
       voiceSegmentStatusSnapshot,
       observeVoiceSegmentCompletions,
       applyVoiceCompletionFeedback,
@@ -443,4 +446,120 @@ test("Current Capture Voice Segment audio player preloads media metadata, not no
   const currentCaptureRendering = frontendSource.split("function renderVoiceSegments", 2)[1]
     .split("function renderRevisionConflict", 1)[0];
   assert.match(currentCaptureRendering, /voiceAudioMarkup\(segment\.id/);
+});
+
+test("Discard pending blocks duplicates and restores after success or exception", async () => {
+  const { context } = createHarness();
+  const control = context.__voiceTest.captureDiscardControl;
+  const runPending = context.__voiceTest.runWithCaptureDiscardPending;
+
+  const duringDelete = control({
+    draft: { id: 1 },
+    hasText: true,
+    hasPendingUpload: false,
+    savePending: false,
+    discardPending: true,
+  });
+  assert.equal(duringDelete.hidden, false);
+  assert.equal(duringDelete.disabled, true);
+
+  const afterSuccess = control({
+    draft: null,
+    hasText: false,
+    hasPendingUpload: false,
+    savePending: false,
+    discardPending: false,
+  });
+  assert.equal(afterSuccess.hidden, true);
+  assert.equal(afterSuccess.disabled, false);
+
+  const nextDraft = control({
+    draft: { id: 2 },
+    hasText: true,
+    hasPendingUpload: false,
+    savePending: false,
+    discardPending: false,
+  });
+  assert.equal(nextDraft.hidden, false);
+  assert.equal(nextDraft.disabled, false);
+
+  const state = { discardPending: false };
+  let finishFirst;
+  let operations = 0;
+  let controlUpdates = 0;
+  const first = runPending({
+    state,
+    updateControls() { controlUpdates += 1; },
+    operation() {
+      operations += 1;
+      return new Promise((resolve) => { finishFirst = resolve; });
+    },
+  });
+  assert.equal(state.discardPending, true);
+  assert.equal(await runPending({
+    state,
+    updateControls() { controlUpdates += 1; },
+    operation() { operations += 1; },
+  }), false);
+  assert.equal(operations, 1);
+  finishFirst();
+  assert.equal(await first, true);
+  assert.equal(state.discardPending, false);
+  assert.equal(controlUpdates, 2);
+
+  await assert.rejects(
+    runPending({
+      state,
+      updateControls() { controlUpdates += 1; },
+      async operation() { throw new Error("synthetic discard failure"); },
+    }),
+    /synthetic discard failure/,
+  );
+  assert.equal(state.discardPending, false);
+  assert.equal(controlUpdates, 4);
+
+  const discardFlow = frontendSource.split('discardButton.addEventListener("click"', 2)[1]
+    .split("const visibilityHandler", 1)[0];
+  assert.match(discardFlow, /if \(state\.discardPending\) return;/);
+  assert.match(discardFlow, /runWithCaptureDiscardPending\(\{/);
+  assert.doesNotMatch(discardFlow, /discardButton\.disabled\s*=/);
+});
+
+test("Voice failure copy keeps details only for the safe allowlist", () => {
+  const { context } = createHarness();
+  const copy = context.__voiceTest.voiceSegmentFailureCopy;
+  const generic = "这段录音没有得到可用文字。原始录音已保留。";
+
+  for (const failureCode of [
+    "configuration",
+    "network",
+    "timeout",
+    "authentication",
+    "provider_rejected",
+    "provider_unavailable",
+    "invalid_response",
+    "internal",
+  ]) {
+    assert.equal(
+      copy({ failure_code: failureCode, failure_message: "private provider detail" }),
+      generic,
+    );
+  }
+  assert.equal(copy({}), generic);
+  assert.equal(copy({ failure_code: "media_probe", failure_message: null }), generic);
+
+  for (const failureCode of [
+    "media_probe",
+    "unsupported_media",
+    "conversion",
+    "draft_text_limit",
+  ]) {
+    assert.equal(
+      copy({ failure_code: failureCode, failure_message: "safe actionable copy" }),
+      "safe actionable copy",
+    );
+  }
+
+  assert.match(frontendSource, /请先处理未完成的录音，再保存。/);
+  assert.doesNotMatch(frontendSource, /escapeHtml\(segment\.failure_message/);
 });

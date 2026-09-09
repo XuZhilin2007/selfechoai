@@ -294,6 +294,8 @@ def test_no_subscription_and_lazy_due_create_no_delivery(delivery_context):
     assert context["reminders"].mark_due_reminders(
         context["user"].id,
         as_of=SWEEP_AT,
+        queue_push_deliveries=False,
+        queue_email_deliveries=False,
     ) == 1
     assert context["reminders"].get_reminder(
         second.id,
@@ -709,7 +711,8 @@ def test_due_history_is_not_cancelled_when_item_completes(delivery_context):
     context["reminders"].claim_due_reminders(
         as_of=SWEEP_AT,
         batch_size=10,
-        queue_deliveries=False,
+        queue_push_deliveries=False,
+        queue_email_deliveries=False,
     )
 
     context["items"].update_item(

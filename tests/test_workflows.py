@@ -580,7 +580,7 @@ def test_pwa_routes_and_health_start(client_factory):
     assert service_worker.status_code == 200
     assert service_worker.headers["content-type"].startswith("text/javascript")
     assert service_worker.headers["cache-control"] == "no-cache"
-    assert "selfecho-ai-community-v0.5" in service_worker.text
+    assert "selfecho-ai-community-v0.6" in service_worker.text
     frontend = client.get("/static/app.js").text
     assert "<h1>先记下来</h1>" in frontend
     assert 'class="visually-hidden" for="capture-text">记录内容</label>' in frontend

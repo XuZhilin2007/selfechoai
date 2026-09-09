@@ -1527,6 +1527,18 @@ function renderAccount() {
         </div>
         <button id="notification-device-action" class="secondary-button" type="button" hidden></button>
       </section>
+      <section id="email-reminder-settings" class="email-reminder-settings" aria-labelledby="email-reminder-heading">
+        <div class="email-reminder-heading">
+          <div>
+            <h2 id="email-reminder-heading">Email Reminder</h2>
+            <p class="form-hint">账户级可选邮件提醒，与此设备的 Web Push 独立。</p>
+          </div>
+          <span id="email-reminder-badge" class="settings-badge">读取中</span>
+        </div>
+        <div id="email-reminder-controls">
+          <p class="status-message" role="status">正在读取邮件提醒设置…</p>
+        </div>
+      </section>
       <div class="account-actions">
         <p id="logout-status" class="status-message" role="alert"></p>
         <button id="logout-button" class="secondary-button" type="button">退出登录</button>
@@ -1540,6 +1552,7 @@ function renderAccount() {
   const notificationAction = document.querySelector("#notification-device-action");
   renderNotificationDeviceSettings();
   void initializePushForAuthenticatedUser();
+  void loadEmailReminderSettings();
   notificationAction.addEventListener("click", async () => {
     notificationAction.disabled = true;
     if (["enabled", "cleanup_required"].includes(pushDeviceState.status)) {
@@ -1585,6 +1598,189 @@ function renderAccount() {
       button.disabled = false;
     }
   });
+}
+
+async function loadEmailReminderSettings() {
+  const controls = document.querySelector("#email-reminder-controls");
+  if (!controls) return;
+  try {
+    const settings = await api("/api/email-reminders/settings");
+    renderEmailReminderSettings(settings);
+  } catch (error) {
+    controls.innerHTML = `<p class="status-message" data-kind="error" role="alert">无法读取邮件提醒设置：${escapeHtml(error.message)}</p>`;
+    const badge = document.querySelector("#email-reminder-badge");
+    if (badge) badge.textContent = "不可用";
+  }
+}
+
+function renderEmailReminderSettings(settings, message = "", kind = "") {
+  const controls = document.querySelector("#email-reminder-controls");
+  const badge = document.querySelector("#email-reminder-badge");
+  if (!controls || !badge) return;
+  const address = settings.email_address;
+  const isVerified = settings.verification_status === "verified";
+  const isPaused = settings.health_status === "paused";
+  const stateLabel = isPaused
+    ? "已暂停"
+    : !address
+      ? "未设置"
+      : !isVerified
+        ? "待验证"
+        : settings.enabled
+          ? settings.effective_active ? "已生效" : "意愿已开启"
+          : "已关闭";
+  badge.textContent = stateLabel;
+  badge.dataset.kind = isPaused ? "error" : settings.effective_active ? "success" : "";
+  const addressValue = address || authentication.user?.email || "";
+  const addressHelp = isPaused
+    ? "该地址已被邮件服务暂停；请更换并验证其他邮箱，不能用同一地址自行解除。"
+    : address && !isVerified
+      ? settings.enabled
+        ? "待验证；开启意愿已保留，验证成功且服务可用后恢复生效。"
+        : "待验证；验证成功后仍由你决定是否开启邮件提醒。"
+      : "修改地址后会暂停实际发送，直到新地址验证成功。";
+  const verificationControls = address && !isVerified && !isPaused
+    ? `
+      <div class="email-verification-actions">
+        <button id="email-send-code" class="secondary-button" type="button" ${settings.provider_available ? "" : "disabled"}>发送 / 重发验证码</button>
+        <form id="email-verification-form" class="email-inline-form">
+          <label for="email-verification-code">6 位验证码</label>
+          <input id="email-verification-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required />
+          <button class="primary-button" type="submit">验证</button>
+        </form>
+      </div>`
+    : "";
+  const enabledControls = address && isVerified && !isPaused
+    ? `
+      <div class="email-enabled-row">
+        <div>
+          <strong>Email Reminder 意愿 ${settings.enabled ? "ON" : "OFF"}</strong>
+          <p class="form-hint">实际发送仍要求地址已验证、健康且邮件服务可用；设置只影响首次到期的 Reminder。</p>
+        </div>
+        <button id="email-enabled-toggle" class="${settings.enabled ? "secondary-button" : "primary-button"}" type="button">${settings.enabled ? "关闭邮件提醒" : "开启邮件提醒"}</button>
+      </div>
+      <div class="email-test-row">
+        <button id="email-test-button" class="secondary-button" type="button" ${settings.test_email_available ? "" : "disabled"}>发送测试邮件</button>
+        <p class="form-hint">${settings.test_email_available ? "测试邮件只会提交到当前已验证邮箱。" : "专用测试模板未配置，当前不能发送测试邮件。"}</p>
+      </div>`
+    : "";
+  const providerNotice = settings.provider_available
+    ? ""
+    : '<p class="status-message" data-kind="error">自托管者尚未配置邮件服务，暂时不能发送验证码或提醒。</p>';
+  controls.innerHTML = `
+    <form id="email-address-form" class="email-address-form">
+      <div class="field-group">
+        <label for="email-reminder-address">提醒邮箱</label>
+        <input id="email-reminder-address" name="email_address" type="email" autocomplete="email" maxlength="320" value="${escapeHtml(addressValue)}" required />
+        <p class="field-hint">${escapeHtml(addressHelp)}</p>
+      </div>
+      <button class="secondary-button" type="submit">${address ? "更改邮箱" : "设置邮箱"}</button>
+    </form>
+    ${providerNotice}
+    ${isPaused ? '<p class="status-message" data-kind="error">邮件提醒当前不可用，请更换并验证其他邮箱。</p>' : ""}
+    ${verificationControls}
+    ${enabledControls}
+    <p class="field-hint">正常 Reminder 邮件只包含通用提示与 Dashboard 链接，不包含 Personal Item 标题、正文或 ID。</p>
+    <p id="email-reminder-status" class="status-message" data-kind="${escapeHtml(kind)}" role="status">${escapeHtml(message)}</p>`;
+
+  const addressForm = document.querySelector("#email-address-form");
+  addressForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = addressForm.querySelector("button[type='submit']");
+    const input = document.querySelector("#email-reminder-address");
+    await runEmailSettingsAction(
+      submit,
+      "正在保存提醒邮箱…",
+      async () => api("/api/email-reminders/address", {
+        method: "PUT",
+        body: JSON.stringify({ email_address: input.value }),
+      }),
+      "提醒邮箱已保存，请发送验证码完成验证。",
+    );
+  });
+  document.querySelector("#email-send-code")?.addEventListener("click", async (event) => {
+    await runEmailOperationAction(
+      event.currentTarget,
+      "正在提交验证码邮件…",
+      () => api("/api/email-reminders/verification/send", { method: "POST" }),
+    );
+  });
+  document.querySelector("#email-verification-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = form.querySelector("button[type='submit']");
+    const code = form.querySelector("input[name='code']").value;
+    await runEmailOperationAction(
+      submit,
+      "正在验证…",
+      () => api("/api/email-reminders/verification/confirm", {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      }),
+    );
+  });
+  document.querySelector("#email-enabled-toggle")?.addEventListener("click", async (event) => {
+    await runEmailSettingsAction(
+      event.currentTarget,
+      "正在更新邮件提醒…",
+      () => api("/api/email-reminders/enabled", {
+        method: "PUT",
+        body: JSON.stringify({ enabled: !settings.enabled }),
+      }),
+      settings.enabled ? "邮件提醒已关闭。" : "邮件提醒开启意愿已保存。",
+    );
+  });
+  document.querySelector("#email-test-button")?.addEventListener("click", async (event) => {
+    await runEmailOperationAction(
+      event.currentTarget,
+      "正在提交测试邮件…",
+      () => api("/api/email-reminders/test", { method: "POST" }),
+    );
+  });
+}
+
+async function runEmailSettingsAction(button, pendingMessage, action, successMessage) {
+  const status = document.querySelector("#email-reminder-status");
+  button.disabled = true;
+  if (status) {
+    status.dataset.kind = "";
+    status.textContent = pendingMessage;
+  }
+  try {
+    const settings = await action();
+    renderEmailReminderSettings(settings, successMessage, "success");
+  } catch (error) {
+    button.disabled = false;
+    if (status) {
+      status.dataset.kind = "error";
+      status.textContent = error.message;
+    }
+  }
+}
+
+async function runEmailOperationAction(button, pendingMessage, action) {
+  const status = document.querySelector("#email-reminder-status");
+  button.disabled = true;
+  if (status) {
+    status.dataset.kind = "";
+    status.textContent = pendingMessage;
+  }
+  try {
+    const result = await action();
+    if (result.settings) {
+      renderEmailReminderSettings(result.settings, result.message, "success");
+    } else if (status) {
+      status.dataset.kind = "success";
+      status.textContent = result.message;
+      button.disabled = false;
+    }
+  } catch (error) {
+    button.disabled = false;
+    if (status) {
+      status.dataset.kind = "error";
+      status.textContent = error.message;
+    }
+  }
 }
 
 function safeLoginDestination() {
@@ -1708,6 +1904,57 @@ function captureHasFailedSegment(draft) {
   return Boolean(draft?.voice_segments?.some((segment) =>
     segment.transcription_status === "failed"
   ));
+}
+
+// Generic transcription failures must not expose arbitrary backend/provider
+// details. Only backend codes with already-safe, actionable copy may retain it.
+const VOICE_TRANSCRIPTION_FAILURE_COPY = "这段录音没有得到可用文字。原始录音已保留。";
+const VOICE_DETAILED_FAILURE_CODES = new Set([
+  "media_probe",
+  "unsupported_media",
+  "conversion",
+  "draft_text_limit",
+]);
+
+function voiceSegmentFailureCopy(segment) {
+  if (
+    segment.failure_code &&
+    VOICE_DETAILED_FAILURE_CODES.has(segment.failure_code) &&
+    segment.failure_message
+  ) {
+    return segment.failure_message;
+  }
+  return VOICE_TRANSCRIPTION_FAILURE_COPY;
+}
+
+function captureDiscardControl({
+  draft,
+  hasText,
+  hasPendingUpload,
+  savePending,
+  discardPending,
+}) {
+  return {
+    hidden: Boolean(savePending || (!draft && !hasText && !hasPendingUpload)),
+    disabled: Boolean(discardPending),
+  };
+}
+
+async function runWithCaptureDiscardPending({
+  state,
+  updateControls,
+  operation,
+}) {
+  if (state.discardPending) return false;
+  state.discardPending = true;
+  updateControls();
+  try {
+    await operation();
+    return true;
+  } finally {
+    state.discardPending = false;
+    updateControls();
+  }
 }
 
 function voiceSegmentStatusSnapshot(draft) {
@@ -1861,6 +2108,7 @@ function renderCapture() {
     draft: null,
     dirty: localBuffer.dirty,
     savePending: localBuffer.savePending,
+    discardPending: false,
     voiceAvailable: false,
     autosaveTimer: null,
     statusPollTimer: null,
@@ -1900,7 +2148,7 @@ function renderCapture() {
         failed: "转写未完成",
       }[segment.transcription_status] || segment.transcription_status;
       const failure = segment.transcription_status === "failed"
-        ? `<p class="voice-segment-error">${escapeHtml(segment.failure_message || "转写失败；原始录音已保留。")}</p>
+        ? `<p class="voice-segment-error">${escapeHtml(voiceSegmentFailureCopy(segment))}</p>
            <div class="voice-segment-actions">
              <button class="secondary-button voice-segment-retry" type="button" data-segment-id="${segment.id}">重试</button>
              <button class="text-button voice-segment-delete" type="button" data-segment-id="${segment.id}">删除录音</button>
@@ -1959,8 +2207,15 @@ function renderCapture() {
     button.disabled = transient || hasActive || hasFailed || Boolean(state.pendingUpload) ||
       Boolean(state.revisionConflict) ||
       !textarea.value.trim();
-    discardButton.hidden = state.savePending ||
-      (!state.draft && !textarea.value && !state.pendingUpload);
+    const discardControl = captureDiscardControl({
+      draft: state.draft,
+      hasText: Boolean(textarea.value),
+      hasPendingUpload: Boolean(state.pendingUpload),
+      savePending: state.savePending,
+      discardPending: state.discardPending,
+    });
+    discardButton.hidden = discardControl.hidden;
+    discardButton.disabled = discardControl.disabled;
     pendingUploadActions.hidden = !state.pendingUpload;
     pendingUploadActions.querySelector(".pending-upload-retry").disabled =
       Boolean(state.revisionConflict) || state.phase === CAPTURE_BROWSER_STATES.UPLOADING;
@@ -2013,7 +2268,7 @@ function renderCapture() {
         state.phase = active ? CAPTURE_BROWSER_STATES.POLLING : CAPTURE_BROWSER_STATES.OPEN;
       }
       if (!active && captureHasFailedSegment(state.draft)) {
-        setCaptureStatus("转写未完成：原始录音已保留。请播放、重试或删除。", "error");
+        setCaptureStatus("请先处理未完成的录音，再保存。", "error");
       } else if (!active && polling) {
         setCaptureStatus("转写已加入文本，你可以继续编辑后保存。", "success");
       }
@@ -2546,30 +2801,34 @@ function renderCapture() {
   });
 
   discardButton.addEventListener("click", async () => {
+    if (state.discardPending) return;
     if (!window.confirm("永久丢弃当前 Draft、未保存文字和其中的原始录音吗？")) return;
     if (state.pendingUpload) {
       state.pendingUpload = null;
     }
     state.revisionConflict = null;
-    discardButton.disabled = true;
-    try {
-      if (state.draft && !state.savePending) {
-        await api(`/api/capture-draft?revision=${state.draft.revision}`, {
-          method: "DELETE",
-        });
+    await runWithCaptureDiscardPending({
+      state,
+      updateControls: updateCaptureControls,
+      operation: async () => {
+        try {
+          if (state.draft && !state.savePending) {
+            await api(`/api/capture-draft?revision=${state.draft.revision}`, {
+              method: "DELETE",
+            });
+          }
+          state.draft = null;
+          state.voiceSegmentStatuses = new Map();
+          state.dirty = false;
+          state.savePending = false;
+          textarea.value = "";
+          clearCaptureDraft();
+          setCaptureStatus("Draft 已丢弃。", "success");
+        } catch (error) {
+          setCaptureStatus(`Draft 未丢弃，本地文字仍保留：${error.message}`, "error");
+        }
       }
-      state.draft = null;
-      state.voiceSegmentStatuses = new Map();
-      state.dirty = false;
-      state.savePending = false;
-      textarea.value = "";
-      clearCaptureDraft();
-      setCaptureStatus("Draft 已丢弃。", "success");
-      updateCaptureControls();
-    } catch (error) {
-      setCaptureStatus(`Draft 未丢弃，本地文字仍保留：${error.message}`, "error");
-      discardButton.disabled = false;
-    }
+    });
   });
 
   const visibilityHandler = () => {

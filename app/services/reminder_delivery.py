@@ -8,6 +8,7 @@ from datetime import datetime
 from app.config import Settings
 from app.reminder_repository import ReminderRepository, utc_now
 from app.schemas import ReminderDeliveryStatus, WebPushOutcome
+from app.services.email_reminders import EmailReminderService, EmailSweepResult
 from app.services.web_push import WebPushService, build_reminder_push_payload
 
 
@@ -23,6 +24,15 @@ class ReminderSweepResult:
     failed_deliveries: int
     stale_unknown_deliveries: int
     inactive_target_deliveries: int
+    email_stale_unknown: int = 0
+    email_attempted: int = 0
+    email_accepted: int = 0
+    email_retry_wait: int = 0
+    email_failed: int = 0
+    email_expired: int = 0
+    email_suppressed: int = 0
+    email_ambiguous: int = 0
+    email_status_checks: int = 0
 
 
 class ReminderDeliveryService:
@@ -32,12 +42,16 @@ class ReminderDeliveryService:
         self,
         repository: ReminderRepository,
         web_push_service: WebPushService,
+        email_reminder_service: EmailReminderService | None = None,
         *,
         delivery_enabled: bool = True,
+        email_delivery_enabled: bool = False,
     ) -> None:
         self.repository = repository
         self.web_push_service = web_push_service
-        self.delivery_enabled = delivery_enabled
+        self.email_reminder_service = email_reminder_service
+        self.push_delivery_enabled = delivery_enabled
+        self.email_delivery_enabled = email_delivery_enabled
 
     def run_reminder_sweep_once(
         self,
@@ -59,7 +73,8 @@ class ReminderDeliveryService:
         claim = self.repository.claim_due_reminders(
             as_of=sweep_time,
             batch_size=batch_size,
-            queue_deliveries=self.delivery_enabled,
+            queue_push_deliveries=self.push_delivery_enabled,
+            queue_email_deliveries=self.email_delivery_enabled,
         )
         inactive_targets = self.repository.fail_unusable_queued_deliveries(
             as_of=sweep_time,
@@ -69,7 +84,7 @@ class ReminderDeliveryService:
         attempted = 0
         sent = 0
         failed = inactive_targets
-        if self.delivery_enabled:
+        if self.push_delivery_enabled:
             for _ in range(batch_size):
                 attempt_time = now_utc or utc_now()
                 target = self.repository.claim_next_queued_delivery(
@@ -148,6 +163,15 @@ class ReminderDeliveryService:
                 elif terminal.status == ReminderDeliveryStatus.FAILED:
                     failed += 1
 
+        email_result = (
+            self.email_reminder_service.run_sweep_once(
+                now_utc=now_utc,
+                batch_size=batch_size,
+                stale_after_seconds=stale_after_seconds,
+            )
+            if self.email_reminder_service is not None
+            else EmailSweepResult()
+        )
         return ReminderSweepResult(
             claimed_reminders=len(claim.claimed_reminder_ids),
             queued_deliveries=len(claim.queued_delivery_ids),
@@ -156,6 +180,15 @@ class ReminderDeliveryService:
             failed_deliveries=failed,
             stale_unknown_deliveries=stale_unknown,
             inactive_target_deliveries=inactive_targets,
+            email_stale_unknown=email_result.stale_unknown,
+            email_attempted=email_result.attempted,
+            email_accepted=email_result.accepted,
+            email_retry_wait=email_result.retry_wait,
+            email_failed=email_result.failed,
+            email_expired=email_result.expired,
+            email_suppressed=email_result.suppressed,
+            email_ambiguous=email_result.ambiguous,
+            email_status_checks=email_result.status_checks,
         )
 
 
@@ -177,10 +210,16 @@ async def run_reminder_polling_worker(
                 or result.attempted_deliveries
                 or result.stale_unknown_deliveries
                 or result.inactive_target_deliveries
+                or result.email_stale_unknown
+                or result.email_attempted
+                or result.email_status_checks
             ):
                 logger.info(
                     "Reminder sweep completed claimed=%s queued=%s "
-                    "attempted=%s sent=%s failed=%s unknown=%s inactive=%s",
+                    "attempted=%s sent=%s failed=%s unknown=%s inactive=%s "
+                    "email_attempted=%s email_accepted=%s email_retry=%s "
+                    "email_failed=%s email_expired=%s email_suppressed=%s "
+                    "email_unknown=%s email_status_checks=%s",
                     result.claimed_reminders,
                     result.queued_deliveries,
                     result.attempted_deliveries,
@@ -188,6 +227,14 @@ async def run_reminder_polling_worker(
                     result.failed_deliveries,
                     result.stale_unknown_deliveries,
                     result.inactive_target_deliveries,
+                    result.email_attempted,
+                    result.email_accepted,
+                    result.email_retry_wait,
+                    result.email_failed,
+                    result.email_expired,
+                    result.email_suppressed,
+                    result.email_ambiguous,
+                    result.email_status_checks,
                 )
         except asyncio.CancelledError:
             raise

@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from app.database import Database, REQUIRED_V5_INDEXES, SCHEMA_VERSION
+from app.database import (
+    CURRENT_SCHEMA_VERSION,
+    Database,
+    REQUIRED_V6_INDEXES,
+)
 from app.repository import Repository
 from app.schemas import InputMethod
 
@@ -31,8 +35,8 @@ def create_database(path: Path) -> Database:
     return database
 
 
-def test_fresh_database_initializes_complete_public_schema_v5(tmp_path: Path):
-    database = create_database(tmp_path / "fresh-v5.db")
+def test_fresh_database_initializes_complete_public_schema_v6(tmp_path: Path):
+    database = create_database(tmp_path / "fresh-v6.db")
     with database.connection() as connection:
         tables = {
             row["name"]
@@ -57,7 +61,7 @@ def test_fresh_database_initializes_complete_public_schema_v5(tmp_path: Path):
             row["name"] for row in connection.execute("PRAGMA table_info(item_inputs)")
         }
 
-    assert version == SCHEMA_VERSION == 5
+    assert version == CURRENT_SCHEMA_VERSION == 6
     assert {
         "users",
         "user_sessions",
@@ -69,15 +73,31 @@ def test_fresh_database_initializes_complete_public_schema_v5(tmp_path: Path):
         "capture_drafts",
         "voice_segments",
         "voice_file_deletions",
+        "email_reminder_settings",
+        "email_verification_challenges",
+        "reminder_email_deliveries",
     } <= tables
-    assert REQUIRED_V5_INDEXES <= indexes
+    assert REQUIRED_V6_INDEXES <= indexes
     assert "source_draft_id" in item_input_columns
     assert voice_counts == {
         "capture_drafts": 0,
         "voice_segments": 0,
         "voice_file_deletions": 0,
     }
-    assert not any("email" in table for table in tables)
+    with database.connection() as connection:
+        email_counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "email_reminder_settings",
+                "email_verification_challenges",
+                "reminder_email_deliveries",
+            )
+        }
+    assert email_counts == {
+        "email_reminder_settings": 0,
+        "email_verification_challenges": 0,
+        "reminder_email_deliveries": 0,
+    }
 
 
 def test_fresh_v5_database_preserves_normal_non_voice_operation(tmp_path: Path):

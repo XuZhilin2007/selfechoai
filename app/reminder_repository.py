@@ -31,6 +31,7 @@ def _optional_datetime(value: str | None) -> datetime | None:
 class ReminderClaimResult:
     claimed_reminder_ids: tuple[int, ...]
     queued_delivery_ids: tuple[int, ...]
+    queued_email_delivery_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,14 +316,17 @@ class ReminderRepository:
         self,
         user_id: int,
         *,
+        queue_push_deliveries: bool,
+        queue_email_deliveries: bool,
         as_of: datetime | None = None,
     ) -> int:
-        """Lazily transition due reminders without creating Push deliveries."""
+        """Lazily transition due reminders and persist eligible channel intents."""
 
         result = self.claim_due_reminders(
             as_of=as_of,
             user_id=user_id,
-            queue_deliveries=False,
+            queue_push_deliveries=queue_push_deliveries,
+            queue_email_deliveries=queue_email_deliveries,
         )
         return len(result.claimed_reminder_ids)
 
@@ -332,9 +336,10 @@ class ReminderRepository:
         as_of: datetime | None = None,
         batch_size: int | None = None,
         user_id: int | None = None,
-        queue_deliveries: bool = True,
+        queue_push_deliveries: bool = True,
+        queue_email_deliveries: bool = True,
     ) -> ReminderClaimResult:
-        """Atomically mark a bounded due set and optionally queue safe targets."""
+        """Atomically mark due Reminders and persist enabled channel intents."""
 
         if batch_size is not None and batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -349,6 +354,7 @@ class ReminderRepository:
 
         claimed_reminder_ids: list[int] = []
         queued_delivery_ids: list[int] = []
+        queued_email_delivery_ids: list[int] = []
         with self.database.transaction() as connection:
             candidates = connection.execute(
                 f"""
@@ -394,41 +400,70 @@ class ReminderRepository:
                 if claimed.rowcount != 1:
                     continue
                 claimed_reminder_ids.append(reminder_id)
-                if not queue_deliveries:
-                    continue
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO reminder_deliveries (
-                        user_id, reminder_id, subscription_id, status
+                if queue_push_deliveries:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO reminder_deliveries (
+                            user_id, reminder_id, subscription_id, status
+                        )
+                        SELECT subscriptions.user_id, ?, subscriptions.id, 'queued'
+                        FROM push_subscriptions AS subscriptions
+                        JOIN user_sessions AS sessions
+                          ON sessions.id = subscriptions.session_id
+                         AND sessions.user_id = subscriptions.user_id
+                        JOIN users
+                          ON users.id = subscriptions.user_id
+                        WHERE subscriptions.user_id = ?
+                          AND subscriptions.status = 'active'
+                          AND users.status = 'active'
+                          AND sessions.revoked_time IS NULL
+                          AND sessions.expires_time > ?
+                        ORDER BY subscriptions.id
+                        """,
+                        (reminder_id, reminder_user_id, due_value),
                     )
-                    SELECT subscriptions.user_id, ?, subscriptions.id, 'queued'
-                    FROM push_subscriptions AS subscriptions
-                    JOIN user_sessions AS sessions
-                      ON sessions.id = subscriptions.session_id
-                     AND sessions.user_id = subscriptions.user_id
-                    JOIN users
-                      ON users.id = subscriptions.user_id
-                    WHERE subscriptions.user_id = ?
-                      AND subscriptions.status = 'active'
-                      AND users.status = 'active'
-                      AND sessions.revoked_time IS NULL
-                      AND sessions.expires_time > ?
-                    ORDER BY subscriptions.id
-                    """,
-                    (reminder_id, reminder_user_id, due_value),
-                )
-                rows = connection.execute(
-                    """
-                    SELECT id FROM reminder_deliveries
-                    WHERE reminder_id = ? AND user_id = ? AND status = 'queued'
-                    ORDER BY id
-                    """,
-                    (reminder_id, reminder_user_id),
-                ).fetchall()
-                queued_delivery_ids.extend(int(row["id"]) for row in rows)
+                    rows = connection.execute(
+                        """
+                        SELECT id FROM reminder_deliveries
+                        WHERE reminder_id = ? AND user_id = ? AND status = 'queued'
+                        ORDER BY id
+                        """,
+                        (reminder_id, reminder_user_id),
+                    ).fetchall()
+                    queued_delivery_ids.extend(int(row["id"]) for row in rows)
+                if queue_email_deliveries:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO reminder_email_deliveries (
+                            user_id, reminder_id, destination_email, status,
+                            created_time, updated_time
+                        )
+                        SELECT settings.user_id, ?, settings.email_address,
+                               'queued', ?, ?
+                        FROM email_reminder_settings AS settings
+                        JOIN users ON users.id = settings.user_id
+                        WHERE settings.user_id = ?
+                          AND settings.enabled = 1
+                          AND settings.email_address IS NOT NULL
+                          AND settings.verification_status = 'verified'
+                          AND settings.health_status = 'healthy'
+                          AND users.status = 'active'
+                        """,
+                        (reminder_id, due_value, due_value, reminder_user_id),
+                    )
+                    email_row = connection.execute(
+                        """
+                        SELECT id FROM reminder_email_deliveries
+                        WHERE reminder_id = ? AND user_id = ? AND status = 'queued'
+                        """,
+                        (reminder_id, reminder_user_id),
+                    ).fetchone()
+                    if email_row is not None:
+                        queued_email_delivery_ids.append(int(email_row["id"]))
         return ReminderClaimResult(
             claimed_reminder_ids=tuple(claimed_reminder_ids),
             queued_delivery_ids=tuple(queued_delivery_ids),
+            queued_email_delivery_ids=tuple(queued_email_delivery_ids),
         )
 
     def list_upcoming(

@@ -1978,6 +1978,79 @@ details summary {
   width: auto;
 }
 
+.email-reminder-settings {
+  display: grid;
+  gap: 16px;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.email-reminder-heading,
+.email-enabled-row,
+.email-test-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.email-reminder-heading h2 {
+  margin-bottom: 6px;
+  font-size: 1.05rem;
+}
+
+.settings-badge {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  color: var(--muted);
+  border-radius: 999px;
+  background: #e8e9e1;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.settings-badge[data-kind="success"] {
+  color: var(--accent-deep);
+  background: var(--accent-soft);
+}
+
+.settings-badge[data-kind="error"] {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.email-address-form,
+.email-inline-form {
+  display: grid;
+  align-items: end;
+  gap: 12px;
+}
+
+.email-address-form {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.email-inline-form {
+  grid-template-columns: minmax(120px, 180px) auto;
+}
+
+.email-inline-form label {
+  grid-column: 1 / -1;
+}
+
+.email-verification-actions {
+  display: grid;
+  gap: 12px;
+}
+
+.email-verification-actions > button,
+.email-enabled-row button,
+.email-test-row button,
+.email-address-form > button,
+.email-inline-form button {
+  width: auto;
+}
+
 .notification-onboarding {
   margin-bottom: 18px;
 }
@@ -2021,6 +2094,9 @@ details summary {
   }
 
   .notification-device-settings,
+  .email-reminder-heading,
+  .email-enabled-row,
+  .email-test-row,
   .notification-onboarding,
   .notification-onboarding-actions {
     align-items: stretch;
@@ -2028,8 +2104,22 @@ details summary {
   }
 
   .notification-device-settings button,
+  .email-address-form > button,
+  .email-inline-form button,
+  .email-verification-actions > button,
+  .email-enabled-row button,
+  .email-test-row button,
   .notification-onboarding button {
     width: 100%;
+  }
+
+  .email-address-form,
+  .email-inline-form {
+    grid-template-columns: 1fr;
+  }
+
+  .email-inline-form label {
+    grid-column: auto;
   }
 }
 

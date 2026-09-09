@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.config import Settings
-from app.database import Database, DatabaseVersionError, SCHEMA_VERSION
+from app.database import CURRENT_SCHEMA_VERSION, Database, DatabaseVersionError
 
 
 def test_settings_use_selfecho_database_name_for_new_installations(
@@ -230,7 +230,7 @@ def test_https_origin_requires_secure_cookie(tmp_path: Path, monkeypatch):
         Settings.from_environment(env_file=env_file)
 
 
-def test_new_database_initializes_directly_to_v4(tmp_path: Path):
+def test_new_database_initializes_directly_to_current_v6(tmp_path: Path):
     database_path = tmp_path / "new.db"
 
     Database(database_path).initialize()
@@ -281,6 +281,9 @@ def test_new_database_initializes_directly_to_v4(tmp_path: Path):
         "reminders",
         "push_subscriptions",
         "reminder_deliveries",
+        "email_reminder_settings",
+        "email_verification_challenges",
+        "reminder_email_deliveries",
     } <= tables
     assert item_columns["user_id"] == 1
     assert "reminder_prompt_dismissed_at" in item_columns
@@ -319,7 +322,7 @@ def test_new_database_initializes_directly_to_v4(tmp_path: Path):
         "idx_reminder_deliveries_user_status",
         "uq_reminder_deliveries_pair",
     } <= indexes
-    assert version == SCHEMA_VERSION
+    assert version == CURRENT_SCHEMA_VERSION == 6
     assert foreign_key_errors == []
     assert integrity == "ok"
 

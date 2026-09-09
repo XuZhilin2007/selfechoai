@@ -111,6 +111,42 @@ class ReminderDeliveryStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class EmailVerificationStatus(str, Enum):
+    PENDING = "pending"
+    VERIFIED = "verified"
+
+
+class EmailHealthStatus(str, Enum):
+    HEALTHY = "healthy"
+    PAUSED = "paused"
+
+
+class EmailPauseReason(str, Enum):
+    BLACKLISTED = "blacklisted"
+    HARD_REJECTED = "hard_rejected"
+    COMPLAINT = "complaint"
+    PROVIDER_SUPPRESSED = "provider_suppressed"
+
+
+class EmailDeliveryStatus(str, Enum):
+    QUEUED = "queued"
+    SENDING = "sending"
+    RETRY_WAIT = "retry_wait"
+    ACCEPTED = "accepted"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    UNKNOWN = "unknown"
+    SUPPRESSED = "suppressed"
+
+
+class EmailProviderDeliveryStatus(str, Enum):
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    DROPPED = "dropped"
+    REJECTED = "rejected"
+    DEFERRED = "deferred"
+
+
 class UserStatus(str, Enum):
     ACTIVE = "active"
     DISABLED = "disabled"
@@ -479,6 +515,45 @@ class ReminderSettingsPatch(StrictModel):
     @classmethod
     def default_time_must_be_valid(cls, value: str) -> str:
         return validate_default_reminder_time(value)
+
+
+class EmailReminderSettingsPublic(StrictModel):
+    email_address: str | None
+    verification_status: EmailVerificationStatus
+    verified_at: datetime | None
+    enabled: bool
+    health_status: EmailHealthStatus
+    pause_reason: EmailPauseReason | None
+    effective_active: bool
+    provider_available: bool
+    test_email_available: bool
+
+
+class EmailAddressRequest(StrictModel):
+    email_address: str = Field(min_length=3, max_length=320)
+
+    @field_validator("email_address")
+    @classmethod
+    def email_address_must_not_contain_controls(cls, value: str) -> str:
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("email address must not contain control characters")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("email address must not be blank")
+        return normalized
+
+
+class EmailVerificationCodeRequest(StrictModel):
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class EmailReminderEnabledPatch(StrictModel):
+    enabled: bool
+
+
+class EmailOperationResponse(StrictModel):
+    message: str
+    settings: EmailReminderSettingsPublic | None = None
 
 
 class UserItemPatch(StrictModel):

@@ -27,6 +27,8 @@ from app.auth_routes import (
 )
 from app.config import Settings
 from app.database import Database
+from app.email_repository import EmailReminderRepository
+from app.email_routes import create_email_reminder_router
 from app.priority import rank_items
 from app.push_routes import create_push_router
 from app.reminder_repository import ReminderRepository
@@ -47,6 +49,7 @@ from app.schemas import (
 )
 from app.services.ai import AIService, AIServiceError, create_ai_service
 from app.services.alibaba_asr import AlibabaASRClient
+from app.services.email_reminders import EmailReminderService
 from app.services.processing import InputProcessingService
 from app.services.push_security import PushEndpointPolicy
 from app.services.push_subscriptions import PushSubscriptionService
@@ -55,6 +58,7 @@ from app.services.reminder_delivery import (
     run_reminder_polling_worker,
 )
 from app.services.reminders import ReminderService
+from app.services.tencent_ses import TencentSesEmailSender
 from app.services.web_push import WebPushService
 from app.services.voice_deletions import VoiceDeletionLedger
 from app.services.voice_media import VoiceMediaProcessor
@@ -71,6 +75,7 @@ def create_app(
     push_endpoint_policy: PushEndpointPolicy | None = None,
     voice_asr_provider: ASRProvider | None = None,
     voice_media_processor: VoiceMediaProcessor | None = None,
+    email_sender: TencentSesEmailSender | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
     database = Database(settings.database_path)
@@ -78,13 +83,22 @@ def create_app(
     voice_repository = VoiceCaptureRepository(database)
     auth_repository = AuthRepository(database)
     reminder_repository = ReminderRepository(database)
+    email_repository = EmailReminderRepository(database)
+    push_endpoint_policy = push_endpoint_policy or PushEndpointPolicy()
+    web_push_service = WebPushService(settings, push_endpoint_policy)
+    email_sender = email_sender or TencentSesEmailSender(settings)
+    email_reminder_service = EmailReminderService(
+        email_repository,
+        email_sender,
+        settings,
+    )
     reminder_service = ReminderService(
         reminder_repository,
         repository,
         auth_repository,
+        push_delivery_enabled=settings.web_push_enabled,
+        email_delivery_enabled=email_sender.available,
     )
-    push_endpoint_policy = push_endpoint_policy or PushEndpointPolicy()
-    web_push_service = WebPushService(settings, push_endpoint_policy)
     push_subscription_service = PushSubscriptionService(
         reminder_repository,
         settings,
@@ -94,7 +108,9 @@ def create_app(
     reminder_delivery_service = ReminderDeliveryService(
         reminder_repository,
         web_push_service,
+        email_reminder_service,
         delivery_enabled=settings.web_push_enabled,
+        email_delivery_enabled=email_sender.available,
     )
     auth_service = AuthenticationService(
         auth_repository,
@@ -206,6 +222,9 @@ def create_app(
     app.state.auth_service = auth_service
     app.state.reminder_repository = reminder_repository
     app.state.reminder_service = reminder_service
+    app.state.email_repository = email_repository
+    app.state.email_sender = email_sender
+    app.state.email_reminder_service = email_reminder_service
     app.state.push_endpoint_policy = push_endpoint_policy
     app.state.web_push_service = web_push_service
     app.state.push_subscription_service = push_subscription_service
@@ -225,6 +244,13 @@ def create_app(
     app.include_router(
         create_reminder_router(
             reminder_service,
+            require_current_user,
+            require_csrf_current_user,
+        )
+    )
+    app.include_router(
+        create_email_reminder_router(
+            email_reminder_service,
             require_current_user,
             require_csrf_current_user,
         )

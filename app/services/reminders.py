@@ -22,10 +22,15 @@ class ReminderService:
         reminder_repository: ReminderRepository,
         item_repository: Repository,
         auth_repository: AuthRepository,
+        *,
+        push_delivery_enabled: bool,
+        email_delivery_enabled: bool,
     ) -> None:
         self.reminders = reminder_repository
         self.items = item_repository
         self.auth = auth_repository
+        self.push_delivery_enabled = push_delivery_enabled
+        self.email_delivery_enabled = email_delivery_enabled
 
     @staticmethod
     def _public(record: ReminderRecord) -> ReminderPublic:
@@ -82,7 +87,12 @@ class ReminderService:
         *,
         as_of: datetime | None = None,
     ) -> int:
-        return self.reminders.mark_due_reminders(user_id, as_of=as_of)
+        return self.reminders.mark_due_reminders(
+            user_id,
+            as_of=as_of,
+            queue_push_deliveries=self.push_delivery_enabled,
+            queue_email_deliveries=self.email_delivery_enabled,
+        )
 
     def get_item_state(self, item_id: int, user_id: int) -> ItemReminderResponse:
         reminder = self.reminders.get_relevant_reminder_for_item(item_id, user_id)

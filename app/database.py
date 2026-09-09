@@ -8,7 +8,11 @@ from typing import Iterator
 
 SCHEMA_V3_VERSION = 3
 SCHEMA_V4_VERSION = 4
-SCHEMA_VERSION = 5
+SCHEMA_V5_VERSION = 5
+# Kept as the v5 compatibility name because the immutable v005 migration
+# imports it. New application code uses CURRENT_SCHEMA_VERSION explicitly.
+SCHEMA_VERSION = SCHEMA_V5_VERSION
+CURRENT_SCHEMA_VERSION = 6
 
 USERS_V3_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -450,7 +454,161 @@ SCHEMA_V5 = "\n".join(
         VOICE_SEGMENTS_TABLE_SQL,
         VOICE_FILE_DELETIONS_TABLE_SQL,
         V5_INDEXES_SQL,
-        f"PRAGMA user_version = {SCHEMA_VERSION};",
+        f"PRAGMA user_version = {SCHEMA_V5_VERSION};",
+    )
+)
+
+EMAIL_REMINDER_SETTINGS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS email_reminder_settings (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    email_address TEXT CHECK (
+        email_address IS NULL OR (
+            length(trim(email_address)) BETWEEN 3 AND 320
+            AND instr(email_address, char(10)) = 0
+            AND instr(email_address, char(13)) = 0
+        )
+    ),
+    verification_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        verification_status IN ('pending', 'verified')
+    ),
+    verified_at TEXT,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    health_status TEXT NOT NULL DEFAULT 'healthy' CHECK (
+        health_status IN ('healthy', 'paused')
+    ),
+    pause_reason TEXT CHECK (
+        pause_reason IS NULL OR pause_reason IN (
+            'blacklisted', 'hard_rejected', 'complaint', 'provider_suppressed'
+        )
+    ),
+    last_test_sent_at TEXT,
+    test_send_window_started_at TEXT,
+    test_send_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        test_send_count BETWEEN 0 AND 5
+    ),
+    created_time TEXT NOT NULL,
+    updated_time TEXT NOT NULL,
+    CHECK (
+        (verification_status = 'pending' AND verified_at IS NULL)
+        OR (verification_status = 'verified'
+            AND email_address IS NOT NULL
+            AND verified_at IS NOT NULL)
+    ),
+    CHECK (
+        (health_status = 'healthy' AND pause_reason IS NULL)
+        OR (health_status = 'paused' AND pause_reason IS NOT NULL)
+    ),
+    CHECK (
+        (test_send_window_started_at IS NULL AND test_send_count = 0)
+        OR test_send_window_started_at IS NOT NULL
+    )
+);
+"""
+
+EMAIL_VERIFICATION_CHALLENGES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS email_verification_challenges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email_address TEXT NOT NULL CHECK (
+        length(trim(email_address)) BETWEEN 3 AND 320
+    ),
+    code_hmac TEXT NOT NULL CHECK (length(code_hmac) = 64),
+    send_status TEXT NOT NULL CHECK (
+        send_status IN ('pending', 'accepted', 'failed', 'unknown')
+    ),
+    provider_message_id TEXT,
+    provider_request_id TEXT,
+    provider_request_date TEXT,
+    expires_at TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        attempt_count BETWEEN 0 AND 5
+    ),
+    consumed_at TEXT,
+    invalidated_at TEXT,
+    created_time TEXT NOT NULL,
+    last_sent_at TEXT NOT NULL,
+    CHECK (consumed_at IS NULL OR invalidated_at IS NULL)
+);
+"""
+
+REMINDER_EMAIL_DELIVERIES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS reminder_email_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    reminder_id INTEGER NOT NULL UNIQUE,
+    destination_email TEXT NOT NULL CHECK (
+        length(trim(destination_email)) BETWEEN 3 AND 320
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN (
+            'queued', 'sending', 'retry_wait', 'accepted', 'failed',
+            'expired', 'unknown', 'suppressed'
+        )
+    ),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        attempt_count BETWEEN 0 AND 4
+    ),
+    next_attempt_at TEXT,
+    first_attempted_at TEXT,
+    last_attempted_at TEXT,
+    accepted_at TEXT,
+    finished_at TEXT,
+    provider_message_id TEXT,
+    provider_request_id TEXT,
+    provider_request_date TEXT CHECK (
+        provider_request_date IS NULL OR length(provider_request_date) = 10
+    ),
+    provider_status TEXT,
+    last_error_class TEXT,
+    provider_delivery_status TEXT CHECK (
+        provider_delivery_status IS NULL OR provider_delivery_status IN (
+            'pending', 'delivered', 'dropped', 'rejected', 'deferred'
+        )
+    ),
+    provider_deliver_message TEXT CHECK (
+        provider_deliver_message IS NULL
+        OR length(provider_deliver_message) <= 500
+    ),
+    provider_deliver_time TEXT,
+    status_check_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        status_check_count BETWEEN 0 AND 3
+    ),
+    next_status_check_at TEXT,
+    created_time TEXT NOT NULL,
+    updated_time TEXT NOT NULL,
+    FOREIGN KEY (reminder_id, user_id)
+        REFERENCES reminders(id, user_id) ON DELETE CASCADE,
+    CHECK (
+        (status = 'queued' AND attempt_count = 0)
+        OR status != 'queued'
+    )
+);
+"""
+
+V6_INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS idx_email_challenges_user_address_created
+    ON email_verification_challenges(user_id, email_address, created_time);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_email_challenges_active
+    ON email_verification_challenges(user_id, email_address)
+    WHERE consumed_at IS NULL
+      AND invalidated_at IS NULL
+      AND send_status IN ('pending', 'accepted', 'unknown');
+CREATE INDEX IF NOT EXISTS idx_email_deliveries_send_ready
+    ON reminder_email_deliveries(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_email_deliveries_status_ready
+    ON reminder_email_deliveries(status, next_status_check_at, id);
+CREATE INDEX IF NOT EXISTS idx_email_deliveries_user_status
+    ON reminder_email_deliveries(user_id, status, id);
+"""
+
+SCHEMA_V6 = "\n".join(
+    (
+        SCHEMA_V5,
+        EMAIL_REMINDER_SETTINGS_TABLE_SQL,
+        EMAIL_VERIFICATION_CHALLENGES_TABLE_SQL,
+        REMINDER_EMAIL_DELIVERIES_TABLE_SQL,
+        V6_INDEXES_SQL,
+        f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION};",
     )
 )
 
@@ -636,6 +794,73 @@ REQUIRED_V5_INDEXES = REQUIRED_V4_INDEXES | {
     "idx_voice_file_deletions_created",
 }
 
+REQUIRED_V6_COLUMNS = {
+    **REQUIRED_V5_COLUMNS,
+    "email_reminder_settings": {
+        "user_id",
+        "email_address",
+        "verification_status",
+        "verified_at",
+        "enabled",
+        "health_status",
+        "pause_reason",
+        "last_test_sent_at",
+        "test_send_window_started_at",
+        "test_send_count",
+        "created_time",
+        "updated_time",
+    },
+    "email_verification_challenges": {
+        "id",
+        "user_id",
+        "email_address",
+        "code_hmac",
+        "send_status",
+        "provider_message_id",
+        "provider_request_id",
+        "provider_request_date",
+        "expires_at",
+        "attempt_count",
+        "consumed_at",
+        "invalidated_at",
+        "created_time",
+        "last_sent_at",
+    },
+    "reminder_email_deliveries": {
+        "id",
+        "user_id",
+        "reminder_id",
+        "destination_email",
+        "status",
+        "attempt_count",
+        "next_attempt_at",
+        "first_attempted_at",
+        "last_attempted_at",
+        "accepted_at",
+        "finished_at",
+        "provider_message_id",
+        "provider_request_id",
+        "provider_request_date",
+        "provider_status",
+        "last_error_class",
+        "provider_delivery_status",
+        "provider_deliver_message",
+        "provider_deliver_time",
+        "status_check_count",
+        "next_status_check_at",
+        "created_time",
+        "updated_time",
+    },
+}
+
+REQUIRED_V6_INDEXES = REQUIRED_V5_INDEXES | {
+    "idx_email_challenges_user_address_created",
+    "uq_email_challenges_active",
+    "idx_email_deliveries_send_ready",
+    "idx_email_deliveries_status_ready",
+    "idx_email_deliveries_user_status",
+}
+
 
 class DatabaseVersionError(RuntimeError):
     pass
@@ -659,7 +884,7 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        """Create a new v5 database or validate an existing v5 database.
+        """Create a new v6 database or validate an existing v6 database.
 
         Upgrading an existing database is intentionally not performed here.
         Existing installations must use an explicit, backup-aware migration.
@@ -678,16 +903,16 @@ class Database:
             }
 
             if version == 0 and not existing_tables:
-                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V5}\nCOMMIT;")
+                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V6}\nCOMMIT;")
                 return
 
-            if version != SCHEMA_VERSION:
+            if version != CURRENT_SCHEMA_VERSION:
                 raise DatabaseVersionError(
                     f"database schema version {version} requires an explicit "
-                    f"migration to version {SCHEMA_VERSION}"
+                    f"migration to version {CURRENT_SCHEMA_VERSION}"
                 )
 
-            self._validate_v5_schema(connection, existing_tables)
+            self._validate_v6_schema(connection, existing_tables)
 
     @staticmethod
     def _validate_v3_schema(
@@ -723,6 +948,18 @@ class Database:
             version=SCHEMA_VERSION,
             required_columns=REQUIRED_V5_COLUMNS,
             required_indexes=REQUIRED_V5_INDEXES,
+        )
+
+    @staticmethod
+    def _validate_v6_schema(
+        connection: sqlite3.Connection, existing_tables: set[str]
+    ) -> None:
+        Database._validate_schema(
+            connection,
+            existing_tables,
+            version=CURRENT_SCHEMA_VERSION,
+            required_columns=REQUIRED_V6_COLUMNS,
+            required_indexes=REQUIRED_V6_INDEXES,
         )
 
     @staticmethod
