@@ -24,7 +24,7 @@ Scattered thoughts often appear earlier than conventional tasks, and they carry 
 - Optional Web Push (disabled by default) with your own VAPID keys, browser subscription lifecycle, Service Worker delivery, and an embedded Reminder worker for scheduled multi-device delivery
 - Optional Email Reminder (disabled by default) through operator-configured Tencent SES, with address ownership verification, an independent account-level channel, and an optional Test Email
 - Optional Voice Capture (disabled by default): press-and-hold recording with upward cancel, transcription appended to the editable Capture Draft, and explicit retry/delete for failed segments
-- Capture/Voice correctness fixes for concurrent discard actions, upload revision-conflict recovery, and truthful failed-segment feedback
+- Capture/Voice correctness fixes for concurrent discard actions and truthful failed-segment feedback
 - Mobile-first Web/PWA interface
 - Login, logout, server-side sessions, and CSRF protection
 - Registration closed by default, with optional invite registration

@@ -47,9 +47,8 @@ The self-host database stores Reminder Email settings, verification/challenge me
 
 ## Fixes
 
-- Improves Capture/Voice state correctness around concurrent discard actions and Voice upload revision-conflict recovery.
+- Prevents duplicate concurrent Capture Draft discard requests and restores the discard control after either success or failure.
 - Uses truthful, bounded failed-segment messaging while preserving Original Audio and explicit retry/delete choices.
-- Improves visible Voice transcription-completion feedback without changing the rule that Final Save triggers AI Structuring.
 
 ## Self-host Notes
 

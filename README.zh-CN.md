@@ -24,7 +24,7 @@ SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Person
 - 可选 Web Push（默认关闭）：使用自托管者自己的 VAPID 密钥、浏览器订阅生命周期、Service Worker 送达，以及用于定时投递的嵌入式 Reminder worker
 - 可选 Email Reminder（默认关闭）：通过自托管者配置的 Tencent SES 发送，包含邮箱所有权验证、独立的账户级渠道与可选 Test Email
 - 可选 Voice Capture（默认关闭）：按住录音、上滑取消，转写文本追加到可编辑的 Capture Draft，失败片段可显式重试或删除
-- Capture/Voice correctness fixes：覆盖并发 discard 操作、上传 revision conflict 恢复与如实的失败片段提示
+- Capture/Voice 正确性修复：覆盖并发 discard 操作与如实的失败片段提示
 - 移动端优先的 Web/PWA 界面
 - Login、Logout、服务端 Session 与 CSRF 防护
 - 默认关闭注册和可选 Invite registration
