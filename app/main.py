@@ -35,12 +35,16 @@ from app.reminder_repository import ReminderRepository
 from app.reminder_routes import create_reminder_router
 from app.repository import InvalidOperationError, NotFoundError, Repository
 from app.schemas import (
+    BulkLifecycleAction,
+    BulkLifecycleRequest,
+    BulkLifecycleResponse,
     CaptureRequest,
     DashboardItem,
     DashboardResponse,
     ItemDetailResponse,
     ItemInputPublic,
     ItemStatus,
+    MAX_BULK_LIFECYCLE_ITEMS,
     MessageResponse,
     PersonalItemPublic,
     ProcessingStatus,
@@ -59,6 +63,10 @@ from app.services.reminder_delivery import (
 )
 from app.services.reminders import ReminderService
 from app.services.tencent_ses import TencentSesEmailSender
+from app.services.trash_retention import (
+    TrashRetentionService,
+    run_trash_retention_worker,
+)
 from app.services.web_push import WebPushService
 from app.services.voice_deletions import VoiceDeletionLedger
 from app.services.voice_media import VoiceMediaProcessor
@@ -67,6 +75,37 @@ from app.services.voice_transcription import ASRProvider, VoiceTranscriptionServ
 from app.voice_repository import VoiceCaptureRepository
 from app.voice_routes import create_voice_router, drain_voice_deletions
 from app.voice_runtime import VoiceRuntime, validate_voice_runtime
+
+
+def _dashboard_page(
+    sortable: list[DashboardItem],
+    needs_confirmation: list[DashboardItem],
+    requested_page: int,
+) -> tuple[list[DashboardItem], list[DashboardItem], int, int, int]:
+    """Return one UI page that can always be submitted as one atomic batch."""
+
+    total_items = len(sortable) + len(needs_confirmation)
+    total_pages = max(
+        1,
+        (total_items + MAX_BULK_LIFECYCLE_ITEMS - 1)
+        // MAX_BULK_LIFECYCLE_ITEMS,
+    )
+    page = min(requested_page, total_pages)
+    start = (page - 1) * MAX_BULK_LIFECYCLE_ITEMS
+    end = start + MAX_BULK_LIFECYCLE_ITEMS
+    page_sortable = sortable[start:end]
+    needs_start = max(0, start - len(sortable))
+    needs_capacity = MAX_BULK_LIFECYCLE_ITEMS - len(page_sortable)
+    page_needs_confirmation = needs_confirmation[
+        needs_start : needs_start + needs_capacity
+    ]
+    return (
+        page_sortable,
+        page_needs_confirmation,
+        page,
+        total_items,
+        total_pages,
+    )
 
 
 def create_app(
@@ -125,6 +164,7 @@ def create_app(
         auth_repository=auth_repository,
         reminder_repository=reminder_repository,
     )
+    trash_retention_service = TrashRetentionService(repository)
     recovery_tasks: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
@@ -168,6 +208,9 @@ def create_app(
             )
             application.state.voice_runtime = voice_runtime
             await voice_runtime.start()
+        trash_retention_service.voice_deletion_ledger = (
+            application.state.voice_deletion_ledger
+        )
         repository.system_recover_interrupted_inputs()
         for pending_input in repository.system_list_pending_inputs():
             task = asyncio.create_task(
@@ -187,9 +230,23 @@ def create_app(
                 )
             )
         application.state.reminder_worker_task = reminder_worker_task
+        trash_retention_worker_task = asyncio.create_task(
+            run_trash_retention_worker(
+                trash_retention_service,
+                settings,
+            )
+        )
+        application.state.trash_retention_worker_task = (
+            trash_retention_worker_task
+        )
         try:
             yield
         finally:
+            trash_retention_worker_task.cancel()
+            await asyncio.gather(
+                trash_retention_worker_task,
+                return_exceptions=True,
+            )
             if voice_runtime is not None:
                 await voice_runtime.stop()
             if reminder_worker_task is not None:
@@ -229,6 +286,8 @@ def create_app(
     app.state.web_push_service = web_push_service
     app.state.push_subscription_service = push_subscription_service
     app.state.reminder_delivery_service = reminder_delivery_service
+    app.state.trash_retention_service = trash_retention_service
+    app.state.trash_retention_worker_task = None
     app.include_router(create_auth_router(auth_service, settings))
     require_current_user = create_current_user_dependency(auth_service, settings)
     require_csrf_current_user = create_current_user_dependency(
@@ -403,18 +462,66 @@ def create_app(
     def dashboard(
         current_user: UserPublic = Depends(require_current_user),
         item_status: ItemStatus = Query(default=ItemStatus.ACTIVE, alias="status"),
+        page: int | None = Query(default=None, ge=1),
     ) -> DashboardResponse:
-        reminder_service.lazy_transition_due(current_user.id)
-        sortable, needs_confirmation = rank_items(
-            repository.list_items_by_status(item_status, current_user.id)
-        )
         show_capture_queue = item_status == ItemStatus.ACTIVE
-        return DashboardResponse(
-            sortable_items=add_reminder_state(sortable, current_user.id),
-            needs_confirmation=add_reminder_state(
+        if show_capture_queue:
+            reminder_service.lazy_transition_due(current_user.id)
+            sortable, needs_confirmation = rank_items(
+                repository.list_items_by_status(item_status, current_user.id)
+            )
+            if page is None:
+                resolved_page = 1
+                total_items = len(sortable) + len(needs_confirmation)
+                total_pages = 1
+            else:
+                (
+                    sortable,
+                    needs_confirmation,
+                    resolved_page,
+                    total_items,
+                    total_pages,
+                ) = _dashboard_page(sortable, needs_confirmation, page)
+            sortable = add_reminder_state(sortable, current_user.id)
+            needs_confirmation = add_reminder_state(
                 needs_confirmation,
                 current_user.id,
-            ),
+            )
+        else:
+            sortable = [
+                DashboardItem(
+                    id=item.id,
+                    title=item.title,
+                    importance=item.importance,
+                    urgency=item.urgency,
+                    deadline=item.deadline,
+                    estimated_time=item.estimated_time,
+                    status=item.status,
+                    completed_at=item.completed_at,
+                    trashed_at=item.trashed_at,
+                    status_before_trash=item.status_before_trash,
+                )
+                for item in repository.list_items_by_status(
+                    item_status,
+                    current_user.id,
+                )
+            ]
+            needs_confirmation = []
+            if page is None:
+                resolved_page = 1
+                total_items = len(sortable)
+                total_pages = 1
+            else:
+                (
+                    sortable,
+                    needs_confirmation,
+                    resolved_page,
+                    total_items,
+                    total_pages,
+                ) = _dashboard_page(sortable, needs_confirmation, page)
+        return DashboardResponse(
+            sortable_items=sortable,
+            needs_confirmation=needs_confirmation,
             pending_inputs=(
                 repository.list_unlinked_inputs(
                     [ProcessingStatus.PENDING, ProcessingStatus.PROCESSING],
@@ -438,6 +545,40 @@ def create_app(
                 if show_capture_queue
                 else []
             ),
+            page=resolved_page,
+            page_size=(
+                MAX_BULK_LIFECYCLE_ITEMS
+                if page is not None
+                else max(1, total_items)
+            ),
+            total_items=total_items,
+            total_pages=total_pages,
+        )
+
+    @app.post(
+        "/api/items/bulk-lifecycle",
+        response_model=BulkLifecycleResponse,
+    )
+    def bulk_item_lifecycle(
+        payload: BulkLifecycleRequest,
+        request: Request,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> BulkLifecycleResponse:
+        try:
+            affected_ids = repository.bulk_lifecycle(
+                current_user.id,
+                payload.item_ids,
+                payload.action,
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidOperationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if payload.action == BulkLifecycleAction.PERMANENTLY_DELETE:
+            drain_voice_deletions(request)
+        return BulkLifecycleResponse(
+            action=payload.action,
+            affected_ids=affected_ids,
         )
 
     @app.get("/api/items/{item_id}", response_model=ItemDetailResponse)

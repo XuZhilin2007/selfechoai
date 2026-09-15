@@ -9,10 +9,11 @@ from typing import Iterator
 SCHEMA_V3_VERSION = 3
 SCHEMA_V4_VERSION = 4
 SCHEMA_V5_VERSION = 5
+SCHEMA_V6_VERSION = 6
 # Kept as the v5 compatibility name because the immutable v005 migration
 # imports it. New application code uses CURRENT_SCHEMA_VERSION explicitly.
 SCHEMA_VERSION = SCHEMA_V5_VERSION
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 USERS_V3_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -21,25 +22,6 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL CHECK (length(trim(password_hash)) > 0),
     display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
     timezone TEXT NOT NULL CHECK (length(trim(timezone)) > 0),
-    status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
-    password_changed_time TEXT NOT NULL,
-    created_time TEXT NOT NULL,
-    updated_time TEXT NOT NULL
-);
-"""
-
-USERS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL UNIQUE CHECK (length(trim(email)) > 0),
-    password_hash TEXT NOT NULL CHECK (length(trim(password_hash)) > 0),
-    display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
-    timezone TEXT NOT NULL CHECK (length(trim(timezone)) > 0),
-    default_reminder_time TEXT NOT NULL DEFAULT '09:00' CHECK (
-        length(default_reminder_time) = 5
-        AND default_reminder_time GLOB '[0-2][0-9]:[0-5][0-9]'
-        AND substr(default_reminder_time, 1, 2) BETWEEN '00' AND '23'
-    ),
     status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
     password_changed_time TEXT NOT NULL,
     created_time TEXT NOT NULL,
@@ -63,6 +45,25 @@ CREATE TABLE IF NOT EXISTS personal_items (
     created_time TEXT NOT NULL,
     updated_time TEXT NOT NULL,
     UNIQUE (id, user_id)
+);
+"""
+
+USERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE CHECK (length(trim(email)) > 0),
+    password_hash TEXT NOT NULL CHECK (length(trim(password_hash)) > 0),
+    display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
+    timezone TEXT NOT NULL CHECK (length(trim(timezone)) > 0),
+    default_reminder_time TEXT NOT NULL DEFAULT '09:00' CHECK (
+        length(default_reminder_time) = 5
+        AND default_reminder_time GLOB '[0-2][0-9]:[0-5][0-9]'
+        AND substr(default_reminder_time, 1, 2) BETWEEN '00' AND '23'
+    ),
+    status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+    password_changed_time TEXT NOT NULL,
+    created_time TEXT NOT NULL,
+    updated_time TEXT NOT NULL
 );
 """
 
@@ -608,6 +609,30 @@ SCHEMA_V6 = "\n".join(
         EMAIL_VERIFICATION_CHALLENGES_TABLE_SQL,
         REMINDER_EMAIL_DELIVERIES_TABLE_SQL,
         V6_INDEXES_SQL,
+        f"PRAGMA user_version = {SCHEMA_V6_VERSION};",
+    )
+)
+
+V7_LIFECYCLE_COLUMNS_SQL = (
+    "ALTER TABLE personal_items ADD COLUMN completed_at TEXT",
+    "ALTER TABLE personal_items ADD COLUMN trashed_at TEXT",
+    "ALTER TABLE personal_items ADD COLUMN status_before_trash TEXT "
+    "CHECK (status_before_trash IS NULL "
+    "OR status_before_trash IN ('active', 'completed'))",
+)
+
+V7_INDEXES_SQL = """
+CREATE INDEX IF NOT EXISTS idx_personal_items_lifecycle
+    ON personal_items(status, completed_at, trashed_at, id);
+CREATE INDEX IF NOT EXISTS idx_personal_items_trash_retention
+    ON personal_items(status, trashed_at, id);
+"""
+
+SCHEMA_V7 = "\n".join(
+    (
+        SCHEMA_V6,
+        ";\n".join(V7_LIFECYCLE_COLUMNS_SQL) + ";",
+        V7_INDEXES_SQL,
         f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION};",
     )
 )
@@ -861,6 +886,17 @@ REQUIRED_V6_INDEXES = REQUIRED_V5_INDEXES | {
     "idx_email_deliveries_user_status",
 }
 
+REQUIRED_V7_COLUMNS = {
+    **REQUIRED_V6_COLUMNS,
+    "personal_items": REQUIRED_V6_COLUMNS["personal_items"]
+    | {"completed_at", "trashed_at", "status_before_trash"},
+}
+
+REQUIRED_V7_INDEXES = REQUIRED_V6_INDEXES | {
+    "idx_personal_items_lifecycle",
+    "idx_personal_items_trash_retention",
+}
+
 
 class DatabaseVersionError(RuntimeError):
     pass
@@ -884,7 +920,7 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        """Create a new v6 database or validate an existing v6 database.
+        """Create a new v7 database or validate an existing v7 database.
 
         Upgrading an existing database is intentionally not performed here.
         Existing installations must use an explicit, backup-aware migration.
@@ -903,7 +939,7 @@ class Database:
             }
 
             if version == 0 and not existing_tables:
-                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V6}\nCOMMIT;")
+                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V7}\nCOMMIT;")
                 return
 
             if version != CURRENT_SCHEMA_VERSION:
@@ -912,7 +948,7 @@ class Database:
                     f"migration to version {CURRENT_SCHEMA_VERSION}"
                 )
 
-            self._validate_v6_schema(connection, existing_tables)
+            self._validate_v7_schema(connection, existing_tables)
 
     @staticmethod
     def _validate_v3_schema(
@@ -957,9 +993,21 @@ class Database:
         Database._validate_schema(
             connection,
             existing_tables,
-            version=CURRENT_SCHEMA_VERSION,
+            version=SCHEMA_V6_VERSION,
             required_columns=REQUIRED_V6_COLUMNS,
             required_indexes=REQUIRED_V6_INDEXES,
+        )
+
+    @staticmethod
+    def _validate_v7_schema(
+        connection: sqlite3.Connection, existing_tables: set[str]
+    ) -> None:
+        Database._validate_schema(
+            connection,
+            existing_tables,
+            version=CURRENT_SCHEMA_VERSION,
+            required_columns=REQUIRED_V7_COLUMNS,
+            required_indexes=REQUIRED_V7_INDEXES,
         )
 
     @staticmethod

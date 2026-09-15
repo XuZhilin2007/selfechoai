@@ -3,17 +3,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Iterable
 
 from app.database import Database
 from app.schemas import (
     AIItemFields,
+    BulkLifecycleAction,
     FailureType,
     ImportantField,
     InputMethod,
     ItemInputPublic,
     ItemStatus,
+    MAX_BULK_LIFECYCLE_ITEMS,
     PersonalItemPublic,
     PriorityLevel,
     ProcessingStatus,
@@ -21,6 +23,7 @@ from app.schemas import (
     UserItemPatch,
 )
 from app.services.voice_deletions import VoiceDeletionLedger
+from app.time_utils import serialize_utc_datetime
 
 if TYPE_CHECKING:
     from app.reminder_repository import ReminderRepository
@@ -32,6 +35,10 @@ class NotFoundError(Exception):
 
 class InvalidOperationError(Exception):
     pass
+
+
+MAX_TRASH_RETENTION_BATCH_SIZE = 500
+TRASH_RETENTION_DAYS = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +105,110 @@ def _json_dump(value: dict[str, Any] | None) -> str | None:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _parse_optional_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _lifecycle_transition_values(
+    row: sqlite3.Row,
+    action: BulkLifecycleAction,
+    timestamp: str,
+) -> dict[str, str | None]:
+    """Return the complete lifecycle metadata update for one valid action."""
+
+    current = str(row["status"])
+    if action == BulkLifecycleAction.COMPLETE:
+        if current != ItemStatus.ACTIVE.value:
+            raise InvalidOperationError("complete requires every item to be active")
+        return {
+            "status": ItemStatus.COMPLETED.value,
+            "completed_at": timestamp,
+            "trashed_at": None,
+            "status_before_trash": None,
+        }
+    if action == BulkLifecycleAction.RESTORE_TO_CURRENT:
+        if current != ItemStatus.COMPLETED.value:
+            raise InvalidOperationError(
+                "restore_to_current requires every item to be completed"
+            )
+        return {
+            "status": ItemStatus.ACTIVE.value,
+            "completed_at": None,
+            "trashed_at": None,
+            "status_before_trash": None,
+        }
+    if action == BulkLifecycleAction.MOVE_TO_TRASH:
+        if current not in {ItemStatus.ACTIVE.value, ItemStatus.COMPLETED.value}:
+            raise InvalidOperationError(
+                "move_to_trash requires every item to be active or completed"
+            )
+        return {
+            "status": ItemStatus.TRASH.value,
+            "completed_at": (
+                row["completed_at"]
+                if current == ItemStatus.COMPLETED.value
+                else None
+            ),
+            "trashed_at": timestamp,
+            "status_before_trash": current,
+        }
+    if action == BulkLifecycleAction.RESTORE_FROM_TRASH:
+        if current != ItemStatus.TRASH.value:
+            raise InvalidOperationError(
+                "restore_from_trash requires every item to be in trash"
+            )
+        restore_completed = row["status_before_trash"] == ItemStatus.COMPLETED.value
+        return {
+            "status": (
+                ItemStatus.COMPLETED.value
+                if restore_completed
+                else ItemStatus.ACTIVE.value
+            ),
+            "completed_at": row["completed_at"] if restore_completed else None,
+            "trashed_at": None,
+            "status_before_trash": None,
+        }
+    raise InvalidOperationError("unsupported lifecycle action")
+
+
+def _status_transition_values(
+    row: sqlite3.Row,
+    target: ItemStatus,
+    timestamp: str,
+) -> dict[str, str | None]:
+    current = ItemStatus(str(row["status"]))
+    if current == target:
+        return {}
+    if target == ItemStatus.TRASH:
+        return _lifecycle_transition_values(
+            row,
+            BulkLifecycleAction.MOVE_TO_TRASH,
+            timestamp,
+        )
+    if target == ItemStatus.ACTIVE:
+        action = (
+            BulkLifecycleAction.RESTORE_FROM_TRASH
+            if current == ItemStatus.TRASH
+            else BulkLifecycleAction.RESTORE_TO_CURRENT
+        )
+        return _lifecycle_transition_values(row, action, timestamp)
+    if target == ItemStatus.COMPLETED:
+        action = (
+            BulkLifecycleAction.RESTORE_FROM_TRASH
+            if current == ItemStatus.TRASH
+            else BulkLifecycleAction.COMPLETE
+        )
+        values = _lifecycle_transition_values(row, action, timestamp)
+        if values["status"] != ItemStatus.COMPLETED.value:
+            raise InvalidOperationError(
+                "an item trashed from current cannot restore directly to history"
+            )
+        return values
+    raise InvalidOperationError("unsupported item status")
+
+
 class Repository:
     def __init__(self, database: Database):
         self.database = database
@@ -119,6 +230,9 @@ class Repository:
                 if row["extra_information"] is not None
                 else None
             ),
+            completed_at=_parse_optional_datetime(row["completed_at"]),
+            trashed_at=_parse_optional_datetime(row["trashed_at"]),
+            status_before_trash=row["status_before_trash"],
             created_time=datetime.fromisoformat(row["created_time"]),
             updated_time=datetime.fromisoformat(row["updated_time"]),
         )
@@ -401,10 +515,24 @@ class Repository:
         self, status: ItemStatus, user_id: int
     ) -> list[PersonalItemPublic]:
         with self.database.connection() as connection:
+            # completed_at is the only completion chronology. updated_time is
+            # used solely to make the unknown legacy subset deterministic.
+            order_by = {
+                ItemStatus.ACTIVE: "id ASC",
+                ItemStatus.COMPLETED: (
+                    "CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END ASC, "
+                    "completed_at DESC, updated_time DESC, id DESC"
+                ),
+                ItemStatus.TRASH: (
+                    "CASE WHEN trashed_at IS NULL THEN 1 ELSE 0 END ASC, "
+                    "trashed_at DESC, id DESC"
+                ),
+            }[status]
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM personal_items
                 WHERE status = ? AND user_id = ?
+                ORDER BY {order_by}
                 """,
                 (status.value, user_id),
             ).fetchall()
@@ -426,7 +554,7 @@ class Repository:
         if fields.title is None:
             raise InvalidOperationError("AI result for a new item requires a title")
 
-        now = utc_now().isoformat()
+        now = serialize_utc_datetime(utc_now(), field_name="now")
         importance = (
             fields.importance
             if ImportantField.IMPORTANCE in evidence_fields
@@ -457,13 +585,24 @@ class Repository:
                 raise InvalidOperationError("input is already linked to an item")
             input_user_id = int(input_row["user_id"])
 
+            initial_status = fields.status or ItemStatus.ACTIVE
+            completed_at = (
+                now if initial_status == ItemStatus.COMPLETED else None
+            )
+            trashed_at = now if initial_status == ItemStatus.TRASH else None
+            status_before_trash = (
+                ItemStatus.ACTIVE.value
+                if initial_status == ItemStatus.TRASH
+                else None
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO personal_items (
                     user_id, title, type, importance, urgency, deadline,
                     estimated_time, status, next_action, extra_information,
+                    completed_at, trashed_at, status_before_trash,
                     created_time, updated_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     input_user_id,
@@ -473,9 +612,12 @@ class Repository:
                     urgency.value,
                     _serialize_deadline(deadline),
                     fields.estimated_time,
-                    (fields.status or ItemStatus.ACTIVE).value,
+                    initial_status.value,
                     fields.next_action,
                     _json_dump(fields.extra_information),
+                    completed_at,
+                    trashed_at,
+                    status_before_trash,
                     now,
                     now,
                 ),
@@ -483,7 +625,9 @@ class Repository:
             item_id = int(cursor.lastrowid)
             if reminder is not None:
                 if reminder_repository is None:
-                    raise InvalidOperationError("reminder repository is required")
+                    raise InvalidOperationError(
+                        "reminder repository is required"
+                    )
                 reminder_repository.create_ai_reminder_if_absent(
                     connection,
                     item_id=item_id,
@@ -519,7 +663,7 @@ class Repository:
         reminder: ReminderCreationCandidate | None = None,
         reminder_repository: ReminderRepository | None = None,
     ) -> PersonalItemPublic:
-        now = utc_now().isoformat()
+        now = serialize_utc_datetime(utc_now(), field_name="now")
         with self.database.transaction() as connection:
             item_row = connection.execute(
                 "SELECT * FROM personal_items WHERE id = ? AND user_id = ?",
@@ -541,13 +685,18 @@ class Repository:
             updates: dict[str, Any] = {}
             supplied = fields.model_fields_set
 
-            for name in ("title", "type", "estimated_time", "status", "next_action"):
+            for name in ("title", "type", "estimated_time", "next_action"):
                 if name not in supplied:
                     continue
                 value = getattr(fields, name)
-                if name in {"title", "type", "status"} and value is None:
+                if name in {"title", "type"} and value is None:
                     continue
-                updates[name] = value.value if isinstance(value, ItemStatus) else value
+                updates[name] = value
+
+            if "status" in supplied and fields.status is not None:
+                updates.update(
+                    _status_transition_values(item_row, fields.status, now)
+                )
 
             for name, important_field in (
                 ("importance", ImportantField.IMPORTANCE),
@@ -601,7 +750,9 @@ class Repository:
 
             if reminder is not None:
                 if reminder_repository is None:
-                    raise InvalidOperationError("reminder repository is required")
+                    raise InvalidOperationError(
+                        "reminder repository is required"
+                    )
                 reminder_repository.create_ai_reminder_if_absent(
                     connection,
                     item_id=item_id,
@@ -718,6 +869,8 @@ class Repository:
 
         values: dict[str, Any] = {}
         for name in supplied:
+            if name == "status":
+                continue
             value = getattr(patch, name)
             if isinstance(value, (PriorityLevel, ItemStatus)):
                 value = value.value
@@ -726,15 +879,20 @@ class Repository:
             elif name == "extra_information":
                 value = _json_dump(value)
             values[name] = value
-        values["updated_time"] = utc_now().isoformat()
+        timestamp = serialize_utc_datetime(utc_now(), field_name="now")
 
         with self.database.transaction() as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM personal_items WHERE id = ? AND user_id = ?",
+            row = connection.execute(
+                "SELECT * FROM personal_items WHERE id = ? AND user_id = ?",
                 (item_id, user_id),
             ).fetchone()
-            if exists is None:
+            if row is None:
                 raise NotFoundError("item not found")
+            if "status" in supplied and patch.status is not None:
+                values.update(
+                    _status_transition_values(row, patch.status, timestamp)
+                )
+            values["updated_time"] = timestamp
             assignments = ", ".join(f"{name} = ?" for name in values)
             connection.execute(
                 f"""
@@ -758,42 +916,190 @@ class Repository:
             ).fetchone()
         return self._item_from_row(row)
 
-    def permanently_delete_item(self, item_id: int, user_id: int) -> None:
-        with self.database.transaction() as connection:
-            row = connection.execute(
-                """
-                SELECT status FROM personal_items
-                WHERE id = ? AND user_id = ?
+    @staticmethod
+    def _permanently_delete_rows(
+        connection: sqlite3.Connection,
+        rows: list[sqlite3.Row],
+        *,
+        deleted_time: str,
+    ) -> None:
+        if not rows:
+            return
+        if any(row["status"] != ItemStatus.TRASH.value for row in rows):
+            raise InvalidOperationError(
+                "an item must be in trash before permanent deletion"
+            )
+        item_ids = [int(row["id"]) for row in rows]
+        placeholders = ", ".join("?" for _ in item_ids)
+        storage_keys = [
+            str(segment["storage_key"])
+            for segment in connection.execute(
+                f"""
+                SELECT voice_segments.storage_key
+                FROM voice_segments
+                JOIN item_inputs
+                  ON item_inputs.id = voice_segments.item_input_id
+                 AND item_inputs.user_id = voice_segments.user_id
+                WHERE item_inputs.item_id IN ({placeholders})
                 """,
-                (item_id, user_id),
-            ).fetchone()
-            if row is None:
-                raise NotFoundError("item not found")
-            if row["status"] != ItemStatus.TRASH.value:
-                raise InvalidOperationError(
-                    "an item must be in trash before permanent deletion"
+                item_ids,
+            )
+        ]
+        # The durable ledger is written before cascading deletes remove the
+        # only relational path to external Voice storage keys.
+        VoiceDeletionLedger.record(
+            connection,
+            storage_keys,
+            "item_permanent_delete",
+            created_time=deleted_time,
+        )
+        deleted = connection.execute(
+            f"DELETE FROM personal_items WHERE id IN ({placeholders})",
+            item_ids,
+        )
+        if deleted.rowcount != len(item_ids):
+            raise InvalidOperationError("not every item could be permanently deleted")
+
+    @staticmethod
+    def _normalize_bulk_ids(item_ids: Iterable[int]) -> list[int]:
+        supplied = list(item_ids)
+        if not supplied:
+            raise InvalidOperationError("item_ids must not be empty")
+        if len(supplied) > MAX_BULK_LIFECYCLE_ITEMS:
+            raise InvalidOperationError(
+                f"at most {MAX_BULK_LIFECYCLE_ITEMS} item IDs are allowed"
+            )
+        if any(
+            isinstance(item_id, bool)
+            or not isinstance(item_id, int)
+            or item_id <= 0
+            for item_id in supplied
+        ):
+            raise InvalidOperationError("item_ids must contain positive integers")
+        return list(dict.fromkeys(supplied))
+
+    def bulk_lifecycle(
+        self,
+        user_id: int,
+        item_ids: Iterable[int],
+        action: BulkLifecycleAction,
+        *,
+        now_utc: datetime | None = None,
+    ) -> list[int]:
+        """Validate an owned snapshot fully, then mutate it in one transaction."""
+
+        unique_ids = self._normalize_bulk_ids(item_ids)
+        action = BulkLifecycleAction(action)
+        timestamp = serialize_utc_datetime(
+            now_utc or utc_now(),
+            field_name="now_utc",
+        )
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.database.transaction() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM personal_items
+                WHERE user_id = ? AND id IN ({placeholders})
+                """,
+                [user_id, *unique_ids],
+            ).fetchall()
+            if len(rows) != len(unique_ids):
+                raise NotFoundError("one or more items were not found")
+            rows_by_id = {int(row["id"]): row for row in rows}
+            ordered_rows = [rows_by_id[item_id] for item_id in unique_ids]
+
+            if action == BulkLifecycleAction.PERMANENTLY_DELETE:
+                if any(
+                    row["status"] != ItemStatus.TRASH.value
+                    for row in ordered_rows
+                ):
+                    raise InvalidOperationError(
+                        "permanently_delete requires every item to be in trash"
+                    )
+                self._permanently_delete_rows(
+                    connection,
+                    ordered_rows,
+                    deleted_time=timestamp,
                 )
-            storage_keys = [
-                str(segment["storage_key"])
-                for segment in connection.execute(
-                    """
-                    SELECT voice_segments.storage_key
-                    FROM voice_segments
-                    JOIN item_inputs
-                      ON item_inputs.id = voice_segments.item_input_id
-                     AND item_inputs.user_id = voice_segments.user_id
-                    WHERE item_inputs.item_id = ?
-                      AND item_inputs.user_id = ?
-                    """,
-                    (item_id, user_id),
-                )
+                return unique_ids
+
+            # Build every transition before the first UPDATE. This makes a bad
+            # source state fail the whole command without partial mutation.
+            transitions = [
+                _lifecycle_transition_values(row, action, timestamp)
+                for row in ordered_rows
             ]
-            VoiceDeletionLedger.record(
+            for row, values in zip(ordered_rows, transitions, strict=True):
+                connection.execute(
+                    """
+                    UPDATE personal_items
+                    SET status = ?, completed_at = ?, trashed_at = ?,
+                        status_before_trash = ?, updated_time = ?
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (
+                        values["status"],
+                        values["completed_at"],
+                        values["trashed_at"],
+                        values["status_before_trash"],
+                        timestamp,
+                        int(row["id"]),
+                        user_id,
+                    ),
+                )
+                cancel_reason = _item_status_cancel_reason(values["status"])
+                if cancel_reason is not None:
+                    _cancel_active_reminders_for_item(
+                        connection,
+                        item_id=int(row["id"]),
+                        user_id=user_id,
+                        cancel_reason=cancel_reason,
+                        cancelled_time=timestamp,
+                    )
+        return unique_ids
+
+    def permanently_delete_item(self, item_id: int, user_id: int) -> None:
+        try:
+            self.bulk_lifecycle(
+                user_id,
+                [item_id],
+                BulkLifecycleAction.PERMANENTLY_DELETE,
+            )
+        except NotFoundError as exc:
+            raise NotFoundError("item not found") from exc
+
+    def purge_expired_trash(
+        self,
+        *,
+        now_utc: datetime | None = None,
+        batch_size: int = 100,
+    ) -> list[int]:
+        if not 0 < batch_size <= MAX_TRASH_RETENTION_BATCH_SIZE:
+            raise ValueError(
+                "batch_size must be between 1 and "
+                f"{MAX_TRASH_RETENTION_BATCH_SIZE}"
+            )
+        moment = now_utc or utc_now()
+        timestamp = serialize_utc_datetime(moment, field_name="now_utc")
+        cutoff = serialize_utc_datetime(
+            moment - timedelta(days=TRASH_RETENTION_DAYS),
+            field_name="trash_cutoff",
+        )
+        with self.database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM personal_items
+                WHERE status = 'trash'
+                  AND trashed_at IS NOT NULL
+                  AND trashed_at <= ?
+                ORDER BY trashed_at ASC, id ASC
+                LIMIT ?
+                """,
+                (cutoff, batch_size),
+            ).fetchall()
+            self._permanently_delete_rows(
                 connection,
-                storage_keys,
-                "item_permanent_delete",
+                list(rows),
+                deleted_time=timestamp,
             )
-            connection.execute(
-                "DELETE FROM personal_items WHERE id = ? AND user_id = ?",
-                (item_id, user_id),
-            )
+        return [int(row["id"]) for row in rows]

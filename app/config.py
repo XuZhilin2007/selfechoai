@@ -135,7 +135,7 @@ class Settings:
     ai_model: str = ""
     deepseek_api_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = ""
-    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_model: str = "deepseek-flash"
     ai_timeout_seconds: float = 30.0
     ai_debug_output: bool = False
     web_push_enabled: bool = False
@@ -148,6 +148,8 @@ class Settings:
     reminder_poll_interval_seconds: float = 30.0
     reminder_batch_size: int = 100
     reminder_sending_stale_seconds: int = 300
+    trash_retention_poll_interval_seconds: float = 3_600.0
+    trash_retention_batch_size: int = 100
     email_reminder_provider_enabled: bool = False
     tencent_ses_region: str = "ap-guangzhou"
     tencentcloud_secret_id: SecretStr = SecretStr("")
@@ -206,6 +208,14 @@ class Settings:
         if not 1 <= self.reminder_sending_stale_seconds <= 86_400:
             raise ValueError(
                 "REMINDER_SENDING_STALE_SECONDS must be between 1 and 86400"
+            )
+        if self.trash_retention_poll_interval_seconds <= 0:
+            raise ValueError(
+                "TRASH_RETENTION_POLL_INTERVAL_SECONDS must be positive"
+            )
+        if not 0 < self.trash_retention_batch_size <= 500:
+            raise ValueError(
+                "TRASH_RETENTION_BATCH_SIZE must be between 1 and 500"
             )
         if self.email_reminder_provider_enabled:
             if not _TENCENT_REGION_PATTERN.fullmatch(self.tencent_ses_region):
@@ -412,7 +422,7 @@ class Settings:
             ).strip(),
             deepseek_api_key=read("DEEPSEEK_API_KEY").strip(),
             deepseek_model=read(
-                "DEEPSEEK_MODEL", "deepseek-v4-flash"
+                "DEEPSEEK_MODEL", "deepseek-flash"
             ).strip(),
             ai_timeout_seconds=float(read("AI_TIMEOUT_SECONDS", "30")),
             ai_debug_output=read_bool("AI_DEBUG_OUTPUT", "false"),
@@ -439,6 +449,12 @@ class Settings:
             reminder_batch_size=int(read("REMINDER_BATCH_SIZE", "100")),
             reminder_sending_stale_seconds=int(
                 read("REMINDER_SENDING_STALE_SECONDS", "300")
+            ),
+            trash_retention_poll_interval_seconds=float(
+                read("TRASH_RETENTION_POLL_INTERVAL_SECONDS", "3600")
+            ),
+            trash_retention_batch_size=int(
+                read("TRASH_RETENTION_BATCH_SIZE", "100")
             ),
             email_reminder_provider_enabled=email_provider_enabled,
             tencent_ses_region=email_region,

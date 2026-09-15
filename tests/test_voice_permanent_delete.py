@@ -220,7 +220,7 @@ def test_non_owner_and_non_trash_item_cannot_register_or_delete(
 
     with pytest.raises(NotFoundError, match="item not found"):
         repository.permanently_delete_item(21, 2)
-    with pytest.raises(InvalidOperationError, match="must be in trash"):
+    with pytest.raises(InvalidOperationError, match="in trash"):
         repository.permanently_delete_item(22, 1)
 
     with database.connection() as connection:

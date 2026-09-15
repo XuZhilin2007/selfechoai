@@ -100,7 +100,7 @@ def test_settings_load_deepseek_env_with_official_defaults(tmp_path: Path, monke
 
     assert settings.ai_provider == "deepseek"
     assert settings.deepseek_api_key == "deepseek-secret"
-    assert settings.deepseek_model == "deepseek-v4-flash"
+    assert settings.deepseek_model == "deepseek-flash"
     assert settings.deepseek_api_url == "https://api.deepseek.com"
     assert settings.ai_debug_output is False
 
@@ -214,6 +214,58 @@ def test_reminder_worker_settings_are_positive_finite_and_bounded(
         Settings(database_path=tmp_path / "invalid-worker.db", **{field: value})
 
 
+def test_trash_retention_loads_bounded_runtime_configuration(
+    tmp_path: Path,
+    monkeypatch,
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "TRASH_RETENTION_POLL_INTERVAL_SECONDS=1800\n"
+        "TRASH_RETENTION_BATCH_SIZE=40\n",
+        encoding="utf-8",
+    )
+    for name in (
+        "TRASH_RETENTION_POLL_INTERVAL_SECONDS",
+        "TRASH_RETENTION_BATCH_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings.from_environment(env_file=env_file)
+
+    assert settings.trash_retention_poll_interval_seconds == 1800
+    assert settings.trash_retention_batch_size == 40
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        (
+            "TRASH_RETENTION_POLL_INTERVAL_SECONDS",
+            "0",
+            "TRASH_RETENTION_POLL_INTERVAL_SECONDS must be positive",
+        ),
+        (
+            "TRASH_RETENTION_BATCH_SIZE",
+            "501",
+            "TRASH_RETENTION_BATCH_SIZE must be between 1 and 500",
+        ),
+    ],
+)
+def test_trash_retention_rejects_unbounded_configuration(
+    tmp_path: Path,
+    monkeypatch,
+    name: str,
+    value: str,
+    message: str,
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"{name}={value}", encoding="utf-8")
+    monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ValueError, match=message):
+        Settings.from_environment(env_file=env_file)
+
+
 def test_https_origin_requires_secure_cookie(tmp_path: Path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -230,7 +282,7 @@ def test_https_origin_requires_secure_cookie(tmp_path: Path, monkeypatch):
         Settings.from_environment(env_file=env_file)
 
 
-def test_new_database_initializes_directly_to_current_v6(tmp_path: Path):
+def test_new_database_initializes_directly_to_current_v7(tmp_path: Path):
     database_path = tmp_path / "new.db"
 
     Database(database_path).initialize()
@@ -322,7 +374,10 @@ def test_new_database_initializes_directly_to_current_v6(tmp_path: Path):
         "idx_reminder_deliveries_user_status",
         "uq_reminder_deliveries_pair",
     } <= indexes
-    assert version == CURRENT_SCHEMA_VERSION == 6
+    assert version == CURRENT_SCHEMA_VERSION == 7
+    assert {"completed_at", "trashed_at", "status_before_trash"} <= set(
+        item_columns
+    )
     assert foreign_key_errors == []
     assert integrity == "ok"
 

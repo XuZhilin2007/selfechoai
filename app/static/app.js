@@ -2,10 +2,27 @@ const appElement = document.querySelector("#app");
 const primaryNavigation = document.querySelector("#primary-navigation");
 let pollTimer = null;
 let authRedirectTimer = null;
+let authenticationInitializationPromise = null;
 let pushOperationPromise = null;
 let pushStateGeneration = 0;
 let notificationOnboardingHasReminder = false;
 let activeCaptureController = null;
+let suppressedDashboardClickItemId = null;
+// Tracks the touch/pen press currently held on a selectable item so the
+// native long-press link menu can be suppressed across dashboard re-renders.
+let activeSelectableTouchPress = null;
+// Short-lived record of the selectable item whose touch/pen press just ended,
+// covering user agents that dispatch contextmenu after the pointer stream.
+let recentSelectableTouchPress = null;
+
+const dashboardSelection = {
+  active: false,
+  status: null,
+  page: null,
+  ids: new Set(),
+  visibleIds: [],
+  generation: 0,
+};
 
 const AUTH_STATES = Object.freeze({
   LOADING: "loading",
@@ -21,6 +38,13 @@ const VOICE_CANCEL_DISTANCE_PX = 72;
 const VOICE_MAX_RECORDING_MS = 60_000;
 const VOICE_COMPLETION_HIGHLIGHT_MS = 700;
 const VOICE_COMPLETION_VIBRATION_MS = 25;
+const ITEM_LONG_PRESS_DELAY_MS = 520;
+const ITEM_LONG_PRESS_MOVE_THRESHOLD_PX = 12;
+// Native link contextmenu may be dispatched after pointerup/pointercancel;
+// this grace keeps suppression alive briefly after a stationary touch/pen
+// selectable press ends. Scroll-cancelled gestures never arm it.
+const SELECTABLE_TOUCH_MENU_GRACE_MS = 500;
+const MAX_BULK_LIFECYCLE_ITEMS = 100;
 const CAPTURE_BROWSER_STATES = Object.freeze({
   BOOTSTRAPPING: "BOOTSTRAPPING",
   OPEN: "OPEN",
@@ -34,6 +58,7 @@ const CAPTURE_BROWSER_STATES = Object.freeze({
   SAVING: "SAVING",
   REVISION_CONFLICT: "REVISION_CONFLICT",
 });
+const STARTUP_AUTH_RETRY_DELAYS_MS = Object.freeze([300, 700]);
 const NOTIFICATION_DISMISSAL_KEY = "selfecho.notification-onboarding-dismissed";
 const NOTIFICATION_DISABLED_KEY = "selfecho.device-notifications-disabled";
 const PUSH_CLEANUP_TIMEOUT_MS = 2500;
@@ -76,12 +101,42 @@ const labels = {
   processing: "正在整理",
   succeeded: "已整理",
   failed: "整理失败",
-  configuration: "配置缺失",
-  network: "网络错误",
-  api: "API 错误",
-  invalid_output: "输出无效",
-  internal: "内部错误",
+  needs_confirmation: "待设置时间",
+  scheduled: "已设置",
+  due: "已到时间",
+  cancelled: "已关闭",
 };
+
+const CAPTURE_FAILURE_DISPLAYS = Object.freeze({
+  configuration: {
+    title: "当前暂时不可用",
+    message: "这条记录暂时没有处理完成，可以稍后重试。",
+  },
+  network: {
+    title: "网络连接失败",
+    message: "当前无法完成处理，请检查网络后重试。",
+  },
+  api: {
+    title: "服务暂时出错",
+    message: "这条记录暂时没有处理完成，可以稍后重试。",
+  },
+  invalid_output: {
+    title: "没有整理成功",
+    message: "这条记录没有整理完成，可以重新尝试。",
+  },
+  internal: {
+    title: "暂时无法整理",
+    message: "这条记录处理失败，可以重新尝试；如果问题持续出现，请稍后再试。",
+  },
+});
+const CAPTURE_FAILURE_FALLBACK = Object.freeze({
+  title: "暂时没有整理成功",
+  message: "这条记录暂时没有处理完成，可以稍后重试。",
+});
+
+function captureFailureDisplay(input) {
+  return CAPTURE_FAILURE_DISPLAYS[input?.failure_type] || CAPTURE_FAILURE_FALLBACK;
+}
 
 const lifecycleViews = {
   active: {
@@ -90,7 +145,7 @@ const lifecycleViews = {
     empty: "还没有需要关注的事项。",
   },
   completed: {
-    label: "已完成",
+    label: "历史",
     heading: "已经完成的事",
     empty: "还没有已完成事项。",
   },
@@ -193,7 +248,6 @@ async function rawApi(path, options = {}) {
     const csrfToken = readCookie(CSRF_COOKIE_NAME);
     if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
   }
-
   let response;
   try {
     response = await fetch(path, {
@@ -230,6 +284,22 @@ function readCookie(name) {
     .map((part) => part.trim())
     .find((part) => part.startsWith(prefix));
   return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : null;
+}
+
+function setAuthentication(status, user = authentication.user) {
+  if (status === AUTH_STATES.AUTHENTICATED && authRedirectTimer) {
+    window.clearTimeout(authRedirectTimer);
+    authRedirectTimer = null;
+  }
+  authentication.status = status;
+  authentication.user = user;
+  primaryNavigation.hidden = status !== AUTH_STATES.AUTHENTICATED;
+  if (status === AUTH_STATES.AUTHENTICATED && user) {
+    if (pushDeviceState.userId !== user.id) resetPushDeviceState(user.id);
+    void initializePushForAuthenticatedUser();
+  } else if (status === AUTH_STATES.UNAUTHENTICATED) {
+    resetPushDeviceState(null);
+  }
 }
 
 function resetPushDeviceState(userId) {
@@ -732,6 +802,7 @@ function dismissNotificationOnboarding() {
   renderNotificationOnboarding();
 }
 
+
 function renderNotificationOnboarding() {
   const existing = document.querySelector("#notification-onboarding");
   if (existing && typeof existing.remove === "function") existing.remove();
@@ -850,22 +921,6 @@ async function performLogout() {
   }
 }
 
-function setAuthentication(status, user = authentication.user) {
-  if (status === AUTH_STATES.AUTHENTICATED && authRedirectTimer) {
-    window.clearTimeout(authRedirectTimer);
-    authRedirectTimer = null;
-  }
-  authentication.status = status;
-  authentication.user = user;
-  primaryNavigation.hidden = status !== AUTH_STATES.AUTHENTICATED;
-  if (status === AUTH_STATES.AUTHENTICATED && user) {
-    if (pushDeviceState.userId !== user.id) resetPushDeviceState(user.id);
-    void initializePushForAuthenticatedUser();
-  } else if (status === AUTH_STATES.UNAUTHENTICATED) {
-    resetPushDeviceState(null);
-  }
-}
-
 function setActiveNavigation() {
   const path = window.location.pathname;
   document.querySelectorAll(".topbar nav a").forEach((link) => {
@@ -902,8 +957,8 @@ function detailRefreshBlocked() {
     '#update-form[data-dirty="true"], #edit-form[data-dirty="true"], #reminder-form[data-dirty="true"]',
   );
   const modalOpen = document.querySelector(
-    "#trash-confirm-dialog[open], #edit-dialog[open]",
-  ) || document.querySelector("#reminder-dialog[open]");
+    "#edit-dialog[open], #reminder-dialog[open]",
+  );
   return editorHasFocus || Boolean(dirtyForm) || Boolean(modalOpen);
 }
 
@@ -920,10 +975,62 @@ function scheduleDetailPoll(itemId, delay = 2500) {
 }
 
 document.addEventListener("click", (event) => {
+  const selectableItem = event.target.closest("[data-selectable-item]");
+  if (selectableItem) {
+    const itemId = Number(selectableItem.dataset.itemId);
+    if (suppressedDashboardClickItemId === itemId) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressedDashboardClickItemId = null;
+      return;
+    }
+    if (dashboardSelection.active) {
+      event.preventDefault();
+      const focusIntent = createDashboardFocusIntent("item", itemId);
+      toggleDashboardSelection(itemId);
+      void renderDashboard({ silent: true, focusIntent });
+      return;
+    }
+  }
   const link = event.target.closest("a[data-link]");
   if (!link || link.origin !== window.location.origin) return;
   event.preventDefault();
   void navigate(`${link.pathname}${link.search}`);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (!dashboardSelection.active || event.key !== " ") return;
+  const selectableItem = event.target.closest("[data-selectable-item]");
+  if (!selectableItem) return;
+  event.preventDefault();
+  const itemId = Number(selectableItem.dataset.itemId);
+  const focusIntent = createDashboardFocusIntent("item", itemId);
+  toggleDashboardSelection(itemId);
+  void renderDashboard({ silent: true, focusIntent });
+});
+
+function endSelectableTouchPress(pointerId) {
+  if (activeSelectableTouchPress?.pointerId !== pointerId) return;
+  const itemId = activeSelectableTouchPress.itemId;
+  activeSelectableTouchPress = null;
+  if (recentSelectableTouchPress !== null) {
+    window.clearTimeout(recentSelectableTouchPress.timer);
+  }
+  const record = { itemId };
+  record.timer = window.setTimeout(() => {
+    if (recentSelectableTouchPress === record) {
+      recentSelectableTouchPress = null;
+    }
+  }, SELECTABLE_TOUCH_MENU_GRACE_MS);
+  recentSelectableTouchPress = record;
+}
+
+document.addEventListener("pointerup", (event) => {
+  endSelectableTouchPress(event.pointerId);
+});
+
+document.addEventListener("pointercancel", (event) => {
+  endSelectableTouchPress(event.pointerId);
 });
 
 window.addEventListener("popstate", () => {
@@ -1011,6 +1118,27 @@ function reminderExactTime(remindAt) {
   return `${Number(parts.month)} 月 ${Number(parts.day)} 日 ${parts.hour}:${parts.minute}`;
 }
 
+function upcomingReminderItems(items, nowMilliseconds = Date.now()) {
+  return items
+    .filter((item) => {
+      const timestamp = Date.parse(item.reminder?.remind_at || "");
+      return item.reminder?.status === "scheduled" &&
+        Number.isFinite(timestamp) && timestamp > nowMilliseconds;
+    })
+    .sort(
+      (left, right) => Date.parse(left.reminder.remind_at) - Date.parse(right.reminder.remind_at),
+    )
+    .slice(0, 3);
+}
+
+function upcomingReminderList(items, nowMilliseconds = Date.now()) {
+  return upcomingReminderItems(items, nowMilliseconds).map((item) => `
+    <a class="upcoming-reminder-row" href="/items/${item.id}" data-link>
+      <time datetime="${escapeHtml(item.reminder.remind_at)}">${escapeHtml(reminderExactTime(item.reminder.remind_at))}</time>
+      <span>${escapeHtml(item.title)}</span>
+    </a>`).join("");
+}
+
 function reminderNaturalText(reminder) {
   if (!reminder?.remind_at) return "还需要选择一个具体时间";
   const target = new Date(reminder.remind_at);
@@ -1039,11 +1167,11 @@ function reminderNaturalText(reminder) {
 
 function reminderCardText(reminder) {
   if (!reminder || reminder.status === "cancelled") return null;
-  if (reminder.status === "needs_confirmation") return "🔔 待设置时间";
+  if (reminder.status === "needs_confirmation") return "提醒时间待设置";
   if (reminder.status === "due") {
-    return reminder.surfaced_time ? null : "🔔 已到提醒时间";
+    return reminder.surfaced_time ? null : "已到提醒时间";
   }
-  return `🔔 ${reminderNaturalText(reminder).replace("会微提醒你", "")}`;
+  return `提醒 · ${reminderNaturalText(reminder).replace("会微提醒你", "")}`;
 }
 
 function tag(label, value) {
@@ -1076,20 +1204,119 @@ function selectedDashboardStatus() {
   return Object.hasOwn(lifecycleViews, status) ? status : "active";
 }
 
-function dashboardPath(status) {
-  return status === "active" ? "/dashboard" : `/dashboard?status=${status}`;
+function selectedDashboardPage() {
+  const page = Number(new URLSearchParams(window.location.search).get("page") || "1");
+  return Number.isSafeInteger(page) && page > 0 ? page : 1;
+}
+
+function dashboardPath(status, page = 1) {
+  const parameters = new URLSearchParams();
+  if (status !== "active") parameters.set("status", status);
+  if (page > 1) parameters.set("page", String(page));
+  const query = parameters.toString();
+  return query ? `/dashboard?${query}` : "/dashboard";
 }
 
 function lifecycleNavigation(selectedStatus) {
+  if (selectedStatus === "trash") return "";
   return `
-    <nav class="lifecycle-navigation" aria-label="事项状态">
+    <nav class="lifecycle-navigation" aria-label="主要事项视图">
       ${Object.entries(lifecycleViews)
+        .filter(([status]) => status !== "trash")
         .map(([status, view]) => `
           <a href="${dashboardPath(status)}" data-link ${status === selectedStatus ? 'aria-current="page"' : ""}>
             ${escapeHtml(view.label)}
           </a>`)
         .join("")}
     </nav>`;
+}
+
+function resetDashboardSelection() {
+  dashboardSelection.generation += 1;
+  dashboardSelection.active = false;
+  dashboardSelection.status = null;
+  dashboardSelection.page = null;
+  dashboardSelection.ids.clear();
+  dashboardSelection.visibleIds = [];
+  suppressedDashboardClickItemId = null;
+}
+
+function toggleDashboardSelection(itemId) {
+  if (dashboardSelection.ids.has(itemId)) dashboardSelection.ids.delete(itemId);
+  else dashboardSelection.ids.add(itemId);
+}
+
+function reconcileDashboardSelectionView(selectedStatus, selectedPage) {
+  if (
+    dashboardSelection.status !== null && (
+      dashboardSelection.status !== selectedStatus ||
+      dashboardSelection.page !== selectedPage
+    )
+  ) {
+    resetDashboardSelection();
+  }
+}
+
+function selectAllVisibleDashboardItems() {
+  if (dashboardSelection.visibleIds.length > MAX_BULK_LIFECYCLE_ITEMS) {
+    throw new Error("当前页面超过批量操作上限，请刷新后重试。");
+  }
+  dashboardSelection.ids = new Set(dashboardSelection.visibleIds);
+}
+
+function createDashboardFocusIntent(kind, itemId = null) {
+  return {
+    kind,
+    itemId,
+    status: selectedDashboardStatus(),
+    generation: dashboardSelection.generation,
+  };
+}
+
+function restoreDashboardFocus(intent) {
+  if (
+    !intent ||
+    intent.generation !== dashboardSelection.generation ||
+    intent.status !== selectedDashboardStatus() ||
+    window.location.pathname !== "/dashboard"
+  ) return;
+
+  let target = null;
+  if (intent.kind === "item" && Number.isSafeInteger(intent.itemId)) {
+    target = document.querySelector(
+      `[data-selectable-item][data-item-id="${intent.itemId}"]`,
+    );
+  } else if (intent.kind === "first_item") {
+    target = document.querySelector("[data-selectable-item]");
+  } else if (intent.kind === "select_all") {
+    target = document.querySelector("[data-select-all]");
+  } else if (intent.kind === "selection_entry") {
+    const selectionEntry = document.querySelector("#selection-entry");
+    if (selectionEntry && !selectionEntry.disabled) target = selectionEntry;
+  }
+
+  if (!target && dashboardSelection.active) {
+    target = document.querySelector("[data-selection-focus-fallback]");
+  }
+  if (!target) {
+    const selectionEntry = document.querySelector("#selection-entry");
+    if (selectionEntry && !selectionEntry.disabled) target = selectionEntry;
+  }
+  if (!target) target = document.querySelector("[data-dashboard-focus-fallback]");
+  target?.focus({ preventScroll: true });
+}
+
+function selectableItemAttributes(itemId) {
+  if (!dashboardSelection.active) {
+    return `data-selectable-item data-item-id="${itemId}"`;
+  }
+  return `data-selectable-item data-item-id="${itemId}" role="option" aria-selected="${dashboardSelection.ids.has(itemId)}"`;
+}
+
+function selectionIndicator(itemId) {
+  if (!dashboardSelection.active) return "";
+  const selected = dashboardSelection.ids.has(itemId);
+  return `<span class="selection-indicator" aria-hidden="true">${selected ? "✓" : ""}</span>`;
 }
 
 function itemCard(item) {
@@ -1112,59 +1339,294 @@ function itemCard(item) {
   const reminderText = reminderCardText(item.reminder);
   if (reminderText) metadata.push(reminderText);
   return `
-    <a class="item-card" href="/items/${item.id}" data-link>
+    <a class="item-card selectable-item ${dashboardSelection.ids.has(item.id) ? "selected" : ""}" href="/items/${item.id}" data-link ${selectableItemAttributes(item.id)}>
+      ${selectionIndicator(item.id)}
       <h3>${escapeHtml(item.title)}</h3>
       ${signals.length ? `<div class="card-signals">${signals.join("")}</div>` : ""}
       ${metadata.length ? `<div class="card-meta">${metadata.map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
     </a>`;
 }
 
-function quickPriorityButtons(item, field) {
-  const fieldLabel = field === "importance" ? "重要性" : "紧急性";
-  return `
-    <div class="quick-priority-row">
-      <span>${fieldLabel}</span>
-      <div class="quick-priority-buttons" role="group" aria-label="${escapeHtml(item.title)}的${fieldLabel}">
-        ${["low", "medium", "high"].map((value) => `
-          <button
-            class="priority-choice-button"
-            type="button"
-            data-item-id="${item.id}"
-            data-field="${field}"
-            data-value="${value}"
-          >${labels[value]}</button>`).join("")}
-      </div>
-    </div>`;
+function historyCompletionText(completedAt) {
+  if (!completedAt) return "完成时间未知";
+  const parts = zonedParts(completedAt);
+  return `${Number(parts.month)} 月 ${Number(parts.day)} 日完成`;
 }
 
-function quickConfirmationCard(item) {
-  const reminderChoice = item.reminder?.status === "needs_confirmation"
-    ? `
-        <div class="quick-reminder-choice reminder-needs-confirmation">
-          <span>你想之后被提醒，但还没有确定时间。</span>
-          ${item.reminder.source_expression ? `<small>原话里的时间：${escapeHtml(item.reminder.source_expression)}</small>` : ""}
-          <div>
-            <button class="secondary-button reminder-decline-button" type="button" data-item-id="${item.id}">暂时不用提醒</button>
-            <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置时间</button>
-          </div>
-        </div>`
-    : item.show_reminder_prompt
-      ? `
-        <div class="quick-reminder-choice">
-          <span>需要提醒吗？</span>
-          <div>
-            <button class="secondary-button reminder-dismiss-button" type="button" data-item-id="${item.id}">不用</button>
-            <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置提醒</button>
-          </div>
-        </div>`
-      : "";
+function trashRemainingText(trashedAt, nowMilliseconds = Date.now()) {
+  if (!trashedAt) return "删除时间尚不可用";
+  const trashedMilliseconds = Date.parse(trashedAt);
+  if (!Number.isFinite(trashedMilliseconds)) return "删除时间尚不可用";
+  const remainingMilliseconds =
+    trashedMilliseconds + (30 * 86_400_000) - nowMilliseconds;
+  if (remainingMilliseconds <= 0) return "即将永久删除";
+  return `${Math.ceil(remainingMilliseconds / 86_400_000)} 天后永久删除`;
+}
+
+function lifecycleListRow(item, status) {
+  const secondary = status === "completed"
+    ? historyCompletionText(item.completed_at)
+    : trashRemainingText(item.trashed_at);
   return `
-    <article class="quick-confirmation-card">
-      <h3>${escapeHtml(item.title)}</h3>
-      ${item.importance === "unknown" ? quickPriorityButtons(item, "importance") : ""}
-      ${item.urgency === "unknown" ? quickPriorityButtons(item, "urgency") : ""}
-      ${reminderChoice}
-    </article>`;
+    <a class="lifecycle-list-row selectable-item ${dashboardSelection.ids.has(item.id) ? "selected" : ""}" href="/items/${item.id}" data-link ${selectableItemAttributes(item.id)}>
+      ${selectionIndicator(item.id)}
+      <span class="lifecycle-row-copy">
+        <strong>${escapeHtml(item.title)}</strong>
+        <span>${escapeHtml(secondary)}</span>
+      </span>
+    </a>`;
+}
+
+function selectionActions(status) {
+  return {
+    active: [
+      ["complete", "标记为已完成", "primary-button"],
+      ["move_to_trash", "移入回收站", "secondary-button"],
+    ],
+    completed: [
+      ["restore_to_current", "恢复为当前", "primary-button"],
+      ["move_to_trash", "移入回收站", "secondary-button"],
+    ],
+    trash: [
+      ["restore_from_trash", "恢复", "primary-button"],
+      ["permanently_delete", "永久删除", "text-button danger-button"],
+    ],
+  }[status];
+}
+
+function dashboardSelectionBar(status) {
+  if (!dashboardSelection.active) return "";
+  const count = dashboardSelection.ids.size;
+  return `
+    <section class="selection-bar" aria-label="批量操作">
+      <p aria-live="polite"><strong>${count}</strong> 项已选择</p>
+      <div class="selection-actions">
+        ${status === "trash" ? '<button class="text-button" type="button" data-select-all>全选本页</button>' : ""}
+        ${selectionActions(status).map(([action, label, className]) => `
+          <button class="${className}" type="button" data-bulk-action="${action}" ${count ? "" : "disabled"}>${label}</button>`).join("")}
+        <button class="text-button" type="button" data-cancel-selection data-selection-focus-fallback>取消</button>
+      </div>
+      <p id="selection-status" class="status-message" role="status"></p>
+    </section>`;
+}
+
+function dashboardPagination(status, page, totalPages, totalItems, visibleCount) {
+  if (totalPages <= 1) return "";
+  const previous = page > 1
+    ? `<a class="text-button" href="${dashboardPath(status, page - 1)}" data-link>上一页</a>`
+    : '<span class="text-button disabled" aria-disabled="true">上一页</span>';
+  const next = page < totalPages
+    ? `<a class="text-button" href="${dashboardPath(status, page + 1)}" data-link>下一页</a>`
+    : '<span class="text-button disabled" aria-disabled="true">下一页</span>';
+  return `
+    <nav class="dashboard-pagination" aria-label="事项分页">
+      ${previous}
+      <span>第 ${page} / ${totalPages} 页，本页 ${visibleCount} 项，共 ${totalItems} 项</span>
+      ${next}
+    </nav>`;
+}
+
+function bindDashboardLongPressRows(selectedStatus) {
+  const selectedPage = selectedDashboardPage();
+  document.querySelectorAll("[data-selectable-item]").forEach((row) => {
+    let pointerId = null;
+    let startX = 0;
+    let startY = 0;
+    let timer = null;
+    let longPressed = false;
+    let selectionGeneration = dashboardSelection.generation;
+
+    const cancelTimer = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+    };
+    const finishPointer = (event) => {
+      if (pointerId !== event.pointerId) return;
+      cancelTimer();
+      if (row.hasPointerCapture?.(pointerId)) {
+        row.releasePointerCapture(pointerId);
+      }
+      pointerId = null;
+    };
+
+    row.addEventListener("pointerdown", (event) => {
+      if (event.pointerType === "touch" || event.pointerType === "pen") {
+        activeSelectableTouchPress = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          itemId: Number(row.dataset.itemId),
+        };
+      }
+      if (
+        dashboardSelection.active ||
+        pointerId !== null ||
+        event.isPrimary === false ||
+        (event.button !== undefined && event.button !== 0)
+      ) return;
+      pointerId = event.pointerId;
+      startX = event.clientX;
+      startY = event.clientY;
+      longPressed = false;
+      selectionGeneration = dashboardSelection.generation;
+      row.setPointerCapture?.(pointerId);
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (
+          selectionGeneration !== dashboardSelection.generation ||
+          window.location.pathname !== "/dashboard" ||
+          selectedDashboardStatus() !== selectedStatus ||
+          selectedDashboardPage() !== selectedPage
+        ) return;
+        longPressed = true;
+        const itemId = Number(row.dataset.itemId);
+        suppressedDashboardClickItemId = itemId;
+        window.setTimeout(() => {
+          if (suppressedDashboardClickItemId === itemId) {
+            suppressedDashboardClickItemId = null;
+          }
+        }, 1_000);
+        dashboardSelection.active = true;
+        dashboardSelection.status = selectedStatus;
+        dashboardSelection.page = selectedDashboardPage();
+        dashboardSelection.ids.add(itemId);
+        void renderDashboard({
+          silent: true,
+          focusIntent: createDashboardFocusIntent("item", itemId),
+        });
+      }, ITEM_LONG_PRESS_DELAY_MS);
+    });
+    row.addEventListener("pointermove", (event) => {
+      if (
+        activeSelectableTouchPress?.pointerId === event.pointerId &&
+        Math.hypot(
+          event.clientX - activeSelectableTouchPress.startX,
+          event.clientY - activeSelectableTouchPress.startY,
+        ) > ITEM_LONG_PRESS_MOVE_THRESHOLD_PX
+      ) {
+        activeSelectableTouchPress = null;
+      }
+      if (pointerId !== event.pointerId || timer === null) return;
+      if (
+        Math.hypot(event.clientX - startX, event.clientY - startY) >
+        ITEM_LONG_PRESS_MOVE_THRESHOLD_PX
+      ) {
+        cancelTimer();
+      }
+    });
+    row.addEventListener("pointerup", finishPointer);
+    row.addEventListener("pointercancel", finishPointer);
+    row.addEventListener("lostpointercapture", (event) => {
+      if (pointerId === event.pointerId) {
+        cancelTimer();
+        pointerId = null;
+      }
+    });
+    row.addEventListener("contextmenu", (event) => {
+      const touchLikeLongPressMenu =
+        (event.pointerType === "touch" || event.pointerType === "pen") &&
+        event.button !== 2;
+      const recentTouchPressOnRow =
+        event.pointerType !== "mouse" &&
+        recentSelectableTouchPress?.itemId === Number(row.dataset.itemId);
+      if (
+        longPressed ||
+        activeSelectableTouchPress !== null ||
+        touchLikeLongPressMenu ||
+        recentTouchPressOnRow
+      ) {
+        event.preventDefault();
+      }
+    });
+  });
+}
+
+async function submitBulkLifecycle(action, itemIds) {
+  return api("/api/items/bulk-lifecycle", {
+    method: "POST",
+    body: JSON.stringify({ action, item_ids: [...itemIds] }),
+  });
+}
+
+function bindDashboardSelectionControls(selectedStatus) {
+  const selectionEntry = document.querySelector("#selection-entry");
+  selectionEntry?.addEventListener("click", () => {
+    dashboardSelection.active = true;
+    dashboardSelection.status = selectedStatus;
+    dashboardSelection.page = selectedDashboardPage();
+    dashboardSelection.ids.clear();
+    void renderDashboard({
+      silent: true,
+      focusIntent: createDashboardFocusIntent("first_item"),
+    });
+  });
+  document.querySelector("[data-cancel-selection]")?.addEventListener("click", () => {
+    resetDashboardSelection();
+    void renderDashboard({
+      silent: true,
+      focusIntent: createDashboardFocusIntent("selection_entry"),
+    });
+  });
+  document.querySelector("[data-select-all]")?.addEventListener("click", () => {
+    selectAllVisibleDashboardItems();
+    void renderDashboard({
+      silent: true,
+      focusIntent: createDashboardFocusIntent("select_all"),
+    });
+  });
+  document.querySelectorAll("[data-bulk-action]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const itemIds = [...dashboardSelection.ids];
+      if (!itemIds.length) return;
+      const destructive = button.dataset.bulkAction === "permanently_delete";
+      if (
+        destructive &&
+        !window.confirm(`确认永久删除已选择的 ${itemIds.length} 个事项吗？此操作无法撤销。`)
+      ) return;
+      button.disabled = true;
+      const status = document.querySelector("#selection-status");
+      if (status) status.textContent = "正在应用批量操作…";
+      try {
+        await submitBulkLifecycle(button.dataset.bulkAction, itemIds);
+        resetDashboardSelection();
+        await renderDashboard({
+          silent: true,
+          focusIntent: createDashboardFocusIntent("selection_entry"),
+        });
+      } catch (error) {
+        if (status) {
+          status.dataset.kind = "error";
+          status.textContent = error.message;
+        }
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelector("#clear-trash-button")?.addEventListener("click", async (event) => {
+    const snapshotIds = [...dashboardSelection.visibleIds];
+    if (!snapshotIds.length) return;
+    const button = event.currentTarget;
+    const confirmation = button.dataset.clearTrashScope === "all"
+      ? `确认清空回收站中的 ${snapshotIds.length} 个事项吗？此操作无法撤销。`
+      : `回收站共有 ${button.dataset.totalItems} 个事项。确认永久删除本页显示的 ${snapshotIds.length} 个事项吗？此操作无法撤销。`;
+    if (!window.confirm(confirmation)) return;
+    button.disabled = true;
+    try {
+      await submitBulkLifecycle("permanently_delete", snapshotIds);
+      resetDashboardSelection();
+      await renderDashboard({
+        silent: true,
+        focusIntent: createDashboardFocusIntent("selection_entry"),
+      });
+    } catch (error) {
+      const status = document.querySelector("#dashboard-action-status");
+      if (status) {
+        status.dataset.kind = "error";
+        status.textContent = error.message;
+      }
+      button.disabled = false;
+    }
+  });
 }
 
 function selectedReminderText(localDate, localTime) {
@@ -1189,7 +1651,7 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
   const existingParts = reminder?.remind_at ? zonedParts(reminder.remind_at) : null;
   let selectedDate = existingParts
     ? `${existingParts.year}-${existingParts.month}-${existingParts.day}`
-    : addProfileDays(1);
+    : addProfileDays(0);
   let selectedTime = existingParts
     ? `${existingParts.hour}:${existingParts.minute}`
     : authentication.user.default_reminder_time;
@@ -1199,14 +1661,17 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
     <dialog id="reminder-dialog" class="reminder-dialog" aria-labelledby="reminder-dialog-title">
       <form id="reminder-form" class="reminder-surface">
         <header class="reminder-dialog-header">
-          <div><p class="eyebrow">微提醒</p><h2 id="reminder-dialog-title">${isActiveReminder ? "修改提醒时间" : "什么时候再想起它？"}</h2></div>
+          <div>
+            <p class="eyebrow">微提醒</p>
+            <h2 id="reminder-dialog-title">${isActiveReminder ? "修改提醒时间" : "什么时候再想起它？"}</h2>
+          </div>
           <button class="reminder-close-button" type="button" aria-label="关闭提醒设置">×</button>
         </header>
         <p class="reminder-item-title">${escapeHtml(item.title)}</p>
         <div class="reminder-date-options" role="group" aria-label="快速选择日期">
+          <button type="button" data-days="0">今天</button>
           <button type="button" data-days="1">明天</button>
           <button type="button" data-days="2">后天</button>
-          <button type="button" data-days="3">大后天</button>
           <button type="button" id="reminder-custom-date-button">选日期</button>
         </div>
         <div id="reminder-date-field" class="reminder-date-field" hidden>
@@ -1239,8 +1704,12 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
   const timeField = document.querySelector("#reminder-time-field");
   const status = document.querySelector("#reminder-form-status");
   const submit = form.querySelector("button[type='submit']");
+
   const renderSelection = () => {
-    document.querySelector("#reminder-selection-summary").textContent = selectedReminderText(selectedDate, selectedTime);
+    document.querySelector("#reminder-selection-summary").textContent = selectedReminderText(
+      selectedDate,
+      selectedTime,
+    );
     form.querySelectorAll("[data-days]").forEach((button) => {
       button.dataset.selected = String(addProfileDays(Number(button.dataset.days)) === selectedDate);
     });
@@ -1249,6 +1718,7 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
     if (typeof dialog.close === "function") dialog.close();
     else dialog.remove();
   };
+
   form.querySelectorAll("[data-days]").forEach((button) => {
     button.addEventListener("click", () => {
       selectedDate = addProfileDays(Number(button.dataset.days));
@@ -1281,6 +1751,7 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
   [document.querySelector(".reminder-close-button"), document.querySelector(".reminder-cancel-button")]
     .forEach((button) => button.addEventListener("click", close));
   dialog.addEventListener("close", () => dialog.remove(), { once: true });
+
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     submit.disabled = true;
@@ -1298,20 +1769,66 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
       );
       close();
       await onSaved(saved);
-      if (reminderIsNotificationEligible(saved)) {
-        notificationOnboardingHasReminder = true;
-        renderNotificationOnboarding();
-      }
+      notificationOnboardingHasReminder = true;
+      renderNotificationOnboarding();
     } catch (error) {
       status.dataset.kind = "error";
       status.textContent = `提醒未保存：${error.message}`;
       submit.disabled = false;
     }
   });
+
   renderSelection();
   form.dataset.dirty = "false";
   if (typeof dialog.showModal === "function") dialog.showModal();
   else dialog.setAttribute("open", "");
+}
+
+function quickPriorityButtons(item, field) {
+  const fieldLabel = field === "importance" ? "重要性" : "紧急性";
+  return `
+    <div class="quick-priority-row">
+      <span>${fieldLabel}</span>
+      <div class="quick-priority-buttons" role="group" aria-label="${escapeHtml(item.title)}的${fieldLabel}">
+        ${["low", "medium", "high"].map((value) => `
+          <button
+            class="priority-choice-button"
+            type="button"
+            data-item-id="${item.id}"
+            data-field="${field}"
+            data-value="${value}"
+          >${labels[value]}</button>`).join("")}
+      </div>
+    </div>`;
+}
+
+function quickConfirmationCard(item) {
+  const reminderChoice = item.reminder?.status === "needs_confirmation"
+    ? `
+        <div class="quick-reminder-choice reminder-needs-confirmation">
+          <span>你想之后被提醒，但还没有确定时间。</span>
+          <div>
+            <button class="secondary-button reminder-decline-button" type="button" data-item-id="${item.id}">暂时不用提醒</button>
+            <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置时间</button>
+          </div>
+        </div>`
+    : item.show_reminder_prompt
+      ? `
+        <div class="quick-reminder-choice">
+          <span>需要提醒吗？</span>
+          <div>
+            <button class="secondary-button reminder-dismiss-button" type="button" data-item-id="${item.id}">不用</button>
+            <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置提醒</button>
+          </div>
+        </div>`
+      : "";
+  return `
+    <article class="quick-confirmation-card">
+      <h3>${escapeHtml(item.title)}</h3>
+      ${item.importance === "unknown" ? quickPriorityButtons(item, "importance") : ""}
+      ${item.urgency === "unknown" ? quickPriorityButtons(item, "urgency") : ""}
+      ${reminderChoice}
+    </article>`;
 }
 
 function renderLoading() {
@@ -1344,13 +1861,22 @@ function renderNotFound() {
     </section>`;
 }
 
+function publicAuthIdentityMarkup() {
+  return `
+        <div class="login-branding">
+          <p class="login-product-brand">SelfEcho AI</p>
+          <p class="login-formal-name">个人智能记录工具</p>
+        </div>`;
+}
+
 function renderLogin() {
   appElement.innerHTML = `
     <section class="auth-layout">
       <div class="auth-heading">
-        <p class="eyebrow">Welcome back</p>
-        <h1>继续整理你的想法。</h1>
-        <p class="subtitle">登录后只会看到属于你的记录和事项。</p>
+        ${publicAuthIdentityMarkup()}
+        <p class="eyebrow">登录</p>
+        <h1>继续记录。</h1>
+        <p class="subtitle">回到只属于你的记录和事项。</p>
       </div>
       <div class="panel auth-panel">
         <form id="login-form" class="auth-form">
@@ -1417,9 +1943,10 @@ function renderRegister() {
   appElement.innerHTML = `
     <section class="auth-layout">
       <div class="auth-heading">
-        <p class="eyebrow">Invite only</p>
-        <h1>创建你的 SelfEcho。</h1>
-        <p class="subtitle">当前仅对受邀测试用户开放，每个账号拥有独立的数据空间。</p>
+        ${publicAuthIdentityMarkup()}
+        <p class="eyebrow">受邀注册</p>
+        <h1>创建账号。</h1>
+        <p class="subtitle">每个账号都有独立的数据空间。</p>
       </div>
       <div class="panel auth-panel">
         <form id="register-form" class="auth-form">
@@ -1499,19 +2026,23 @@ function registrationErrorMessage(error) {
 function renderAccount() {
   const user = authentication.user;
   appElement.innerHTML = `
-    <section class="page-heading">
-      <p class="eyebrow">Account</p>
-      <h1>${escapeHtml(user.display_name)}</h1>
-      <p class="subtitle">当前登录账号与本地显示设置。</p>
+    <section class="page-heading account-heading">
+      <p class="eyebrow">账户</p>
+      <h1>账户设置</h1>
+      <p class="subtitle">${escapeHtml(user.display_name)}，在这里管理提醒和当前账号。</p>
     </section>
-    <section class="panel account-panel">
+    <div class="account-panel">
+      <section class="settings-section profile-settings" aria-labelledby="profile-settings-heading">
+        <h2 id="profile-settings-heading">个人资料</h2>
       <dl class="account-details">
         <div><dt>邮箱</dt><dd>${escapeHtml(user.email)}</dd></div>
         <div><dt>显示名称</dt><dd>${escapeHtml(user.display_name)}</dd></div>
         <div><dt>时区</dt><dd>${escapeHtml(user.timezone)}</dd></div>
       </dl>
-      <form id="reminder-settings-form" class="reminder-settings-form">
+      </section>
+      <form id="reminder-settings-form" class="settings-section reminder-settings-form" aria-labelledby="reminder-preferences-heading">
         <div>
+          <h2 id="reminder-preferences-heading">提醒偏好</h2>
           <label for="default-reminder-time">无具体时间时默认提醒</label>
           <p class="form-hint">按 ${escapeHtml(user.timezone)} 的本地时间解释。</p>
         </div>
@@ -1519,19 +2050,19 @@ function renderAccount() {
         <button class="secondary-button" type="submit">保存默认时间</button>
         <p id="reminder-settings-status" class="status-message" role="status"></p>
       </form>
-      <section class="notification-device-settings" aria-labelledby="notification-device-heading">
+      <section class="settings-section notification-device-settings" aria-labelledby="notification-device-heading">
         <div>
           <h2 id="notification-device-heading">此设备通知</h2>
-          <p class="form-hint">通知只用于你创建的 Reminder，不用于广告或活动推广。</p>
+          <p class="form-hint">通知只用于你创建的提醒，不用于广告或活动推广。</p>
           <p id="notification-device-status" class="status-message" role="status"></p>
         </div>
         <button id="notification-device-action" class="secondary-button" type="button" hidden></button>
       </section>
-      <section id="email-reminder-settings" class="email-reminder-settings" aria-labelledby="email-reminder-heading">
+      <section id="email-reminder-settings" class="settings-section email-reminder-settings" aria-labelledby="email-reminder-heading">
         <div class="email-reminder-heading">
           <div>
-            <h2 id="email-reminder-heading">Email Reminder</h2>
-            <p class="form-hint">账户级可选邮件提醒，与此设备的 Web Push 独立。</p>
+            <h2 id="email-reminder-heading">邮件提醒</h2>
+            <p class="form-hint">邮件提醒与当前设备的系统通知彼此独立。</p>
           </div>
           <span id="email-reminder-badge" class="settings-badge">读取中</span>
         </div>
@@ -1539,11 +2070,11 @@ function renderAccount() {
           <p class="status-message" role="status">正在读取邮件提醒设置…</p>
         </div>
       </section>
-      <div class="account-actions">
+      <div class="account-actions settings-section">
         <p id="logout-status" class="status-message" role="alert"></p>
         <button id="logout-button" class="secondary-button" type="button">退出登录</button>
       </div>
-    </section>`;
+    </div>`;
 
   const button = document.querySelector("#logout-button");
   const status = document.querySelector("#logout-status");
@@ -1627,18 +2158,18 @@ function renderEmailReminderSettings(settings, message = "", kind = "") {
       : !isVerified
         ? "待验证"
         : settings.enabled
-          ? settings.effective_active ? "已生效" : "意愿已开启"
+          ? "已开启"
           : "已关闭";
   badge.textContent = stateLabel;
   badge.dataset.kind = isPaused ? "error" : settings.effective_active ? "success" : "";
   const addressValue = address || authentication.user?.email || "";
   const addressHelp = isPaused
-    ? "该地址已被邮件服务暂停；请更换并验证其他邮箱，不能用同一地址自行解除。"
+    ? "该地址已暂停接收提醒。需要更换并验证其他邮箱，不能用同一地址自行解除。"
     : address && !isVerified
       ? settings.enabled
-        ? "待验证；开启意愿已保留，验证成功且服务可用后恢复生效。"
+        ? "待验证；你之前的开启意愿已保留，验证成功后会自动恢复。"
         : "待验证；验证成功后仍由你决定是否开启邮件提醒。"
-      : "修改地址后会暂停实际发送，直到新地址验证成功。";
+      : "修改地址后，邮件提醒会暂停，直到新地址验证成功。";
   const verificationControls = address && !isVerified && !isPaused
     ? `
       <div class="email-verification-actions">
@@ -1654,19 +2185,19 @@ function renderEmailReminderSettings(settings, message = "", kind = "") {
     ? `
       <div class="email-enabled-row">
         <div>
-          <strong>Email Reminder 意愿 ${settings.enabled ? "ON" : "OFF"}</strong>
-          <p class="form-hint">实际发送仍要求地址已验证、健康且邮件服务可用；设置只影响首次到期的 Reminder。</p>
+          <strong>邮件提醒${settings.enabled ? "已开启" : "已关闭"}</strong>
+          <p class="form-hint">事项到期时，会按当前设置发送提醒邮件。</p>
         </div>
         <button id="email-enabled-toggle" class="${settings.enabled ? "secondary-button" : "primary-button"}" type="button">${settings.enabled ? "关闭邮件提醒" : "开启邮件提醒"}</button>
       </div>
       <div class="email-test-row">
         <button id="email-test-button" class="secondary-button" type="button" ${settings.test_email_available ? "" : "disabled"}>发送测试邮件</button>
-        <p class="form-hint">${settings.test_email_available ? "测试邮件只会提交到当前已验证邮箱。" : "专用测试模板未配置，当前不能发送测试邮件。"}</p>
+        <p class="form-hint">${settings.test_email_available ? "测试邮件只会发送到当前已验证邮箱。" : "当前未提供测试邮件，因此暂时不能发送。"}</p>
       </div>`
     : "";
   const providerNotice = settings.provider_available
     ? ""
-    : '<p class="status-message" data-kind="error">自托管者尚未配置邮件服务，暂时不能发送验证码或提醒。</p>';
+    : '<p class="status-message" data-kind="error">邮件提醒服务尚未配置，暂时不能发送验证码或提醒。</p>';
   controls.innerHTML = `
     <form id="email-address-form" class="email-address-form">
       <div class="field-group">
@@ -1680,7 +2211,6 @@ function renderEmailReminderSettings(settings, message = "", kind = "") {
     ${isPaused ? '<p class="status-message" data-kind="error">邮件提醒当前不可用，请更换并验证其他邮箱。</p>' : ""}
     ${verificationControls}
     ${enabledControls}
-    <p class="field-hint">正常 Reminder 邮件只包含通用提示与 Dashboard 链接，不包含 Personal Item 标题、正文或 ID。</p>
     <p id="email-reminder-status" class="status-message" data-kind="${escapeHtml(kind)}" role="status">${escapeHtml(message)}</p>`;
 
   const addressForm = document.querySelector("#email-address-form");
@@ -1727,7 +2257,7 @@ function renderEmailReminderSettings(settings, message = "", kind = "") {
         method: "PUT",
         body: JSON.stringify({ enabled: !settings.enabled }),
       }),
-      settings.enabled ? "邮件提醒已关闭。" : "邮件提醒开启意愿已保存。",
+      settings.enabled ? "邮件提醒已关闭。" : "邮件提醒已开启。",
     );
   });
   document.querySelector("#email-test-button")?.addEventListener("click", async (event) => {
@@ -1906,8 +2436,9 @@ function captureHasFailedSegment(draft) {
   ));
 }
 
-// Generic transcription failures must not expose arbitrary backend/provider
-// details. Only backend codes with already-safe, actionable copy may retain it.
+// Transcription failures cannot be classified as no-speech versus generic
+// provider failure, so they share one truthful copy; only codes whose backend
+// message is already safe and specific keep the backend wording.
 const VOICE_TRANSCRIPTION_FAILURE_COPY = "这段录音没有得到可用文字。原始录音已保留。";
 const VOICE_DETAILED_FAILURE_CODES = new Set([
   "media_probe",
@@ -1938,6 +2469,22 @@ function captureDiscardControl({
     hidden: Boolean(savePending || (!draft && !hasText && !hasPendingUpload)),
     disabled: Boolean(discardPending),
   };
+}
+
+function capturePrefersWholeDraftDiscard({
+  draft,
+  currentText,
+  hasPendingUpload,
+  hasRevisionConflict,
+  savePending = false,
+}) {
+  const segments = draft?.voice_segments || [];
+  return !String(currentText || "").trim() &&
+    segments.length === 1 &&
+    segments[0].transcription_status === "failed" &&
+    !hasPendingUpload &&
+    !hasRevisionConflict &&
+    !savePending;
 }
 
 async function runWithCaptureDiscardPending({
@@ -2037,8 +2584,8 @@ async function recoverVoiceUploadRevisionConflict({
   return "requires_choice";
 }
 
-function voiceAudioMarkup(segmentId, label = "播放原始录音") {
-  return `<audio class="voice-audio" controls preload="metadata" aria-label="${escapeHtml(label)}" src="/api/voice-segments/${segmentId}/audio"></audio>`;
+function voiceAudioMarkup(segmentId, label = "播放原始录音", { preload = "none" } = {}) {
+  return `<audio class="voice-audio" controls preload="${preload}" aria-label="${escapeHtml(label)}" src="/api/voice-segments/${segmentId}/audio"></audio>`;
 }
 
 function renderCapture() {
@@ -2048,7 +2595,7 @@ function renderCapture() {
         <h1>先记下来</h1>
       </section>
       <div id="capture-micro-reminders"></div>
-      <section class="panel capture-panel">
+      <section class="capture-panel" aria-label="记录内容">
         <form id="capture-form">
           <label class="visually-hidden" for="capture-text">记录内容</label>
           <textarea id="capture-text" name="original_text" maxlength="10000" autofocus placeholder="想到什么，就写下来……"></textarea>
@@ -2069,11 +2616,17 @@ function renderCapture() {
           <div class="form-footer">
             <p id="capture-status" class="status-message" role="status">原文会先保存。</p>
             <div class="capture-actions">
-              <button id="capture-discard" class="text-button" type="button" hidden>丢弃草稿</button>
               <button class="primary-button capture-submit" type="submit">保存</button>
+              <button id="capture-discard" class="text-button" type="button" hidden>丢弃草稿</button>
             </div>
           </div>
         </form>
+      </section>
+      <section id="upcoming-reminder-section" class="section capture-upcoming" aria-labelledby="upcoming-reminder-heading" hidden>
+        <div class="capture-upcoming-heading">
+          <h2 id="upcoming-reminder-heading">接下来会提醒</h2>
+        </div>
+        <div id="upcoming-reminder-list" class="upcoming-reminder-list"></div>
       </section>
       <section id="quick-confirmation-section" class="section" hidden>
         <div class="section-heading">
@@ -2097,6 +2650,8 @@ function renderCapture() {
   const pendingUploadActions = document.querySelector("#pending-upload-actions");
   const revisionConflictPanel = document.querySelector("#capture-revision-conflict");
   const quickSection = document.querySelector("#quick-confirmation-section");
+  const upcomingSection = document.querySelector("#upcoming-reminder-section");
+  const upcomingList = document.querySelector("#upcoming-reminder-list");
   const captureReminders = document.querySelector("#capture-micro-reminders");
   const quickList = document.querySelector("#quick-confirmation-list");
   const quickCount = document.querySelector("#quick-confirmation-count");
@@ -2140,6 +2695,13 @@ function renderCapture() {
 
   function renderVoiceSegments() {
     const segments = state.draft?.voice_segments || [];
+    const prefersWholeDraftDiscard = capturePrefersWholeDraftDiscard({
+      draft: state.draft,
+      currentText: textarea.value,
+      hasPendingUpload: Boolean(state.pendingUpload),
+      hasRevisionConflict: Boolean(state.revisionConflict),
+      savePending: state.savePending,
+    });
     segmentList.innerHTML = segments.map((segment, index) => {
       const statusText = {
         pending: "等待转写",
@@ -2147,11 +2709,14 @@ function renderCapture() {
         succeeded: "已加入可编辑文字",
         failed: "转写未完成",
       }[segment.transcription_status] || segment.transcription_status;
+      const deleteAction = prefersWholeDraftDiscard
+        ? ""
+        : `<button class="text-button voice-segment-delete" type="button" data-segment-id="${segment.id}">删除录音</button>`;
       const failure = segment.transcription_status === "failed"
         ? `<p class="voice-segment-error">${escapeHtml(voiceSegmentFailureCopy(segment))}</p>
            <div class="voice-segment-actions">
-             <button class="secondary-button voice-segment-retry" type="button" data-segment-id="${segment.id}">重试</button>
-             <button class="text-button voice-segment-delete" type="button" data-segment-id="${segment.id}">删除录音</button>
+             <button class="primary-button voice-segment-retry" type="button" data-segment-id="${segment.id}">重试</button>
+             ${deleteAction}
            </div>`
         : "";
       return `<article class="voice-segment" data-status="${escapeHtml(segment.transcription_status)}">
@@ -2159,7 +2724,7 @@ function renderCapture() {
           <strong>录音 ${index + 1}</strong>
           <span>${escapeHtml(statusText)}</span>
         </div>
-        ${voiceAudioMarkup(segment.id, `播放第 ${index + 1} 段原始录音`)}
+        ${voiceAudioMarkup(segment.id, `播放第 ${index + 1} 段原始录音`, { preload: "metadata" })}
         ${failure}
       </article>`;
     }).join("");
@@ -2174,17 +2739,17 @@ function renderCapture() {
     const serverDraft = state.revisionConflict.serverDraft;
     revisionConflictPanel.hidden = false;
     revisionConflictPanel.innerHTML = `
-      <strong>Draft 在其他页面发生了变化</strong>
+      <strong>草稿在其他页面发生了变化</strong>
       <p>${state.pendingUpload
         ? "尚未上传的录音仍保留在本页。请选择文字版本后，将继续上传同一段录音。"
         : "请选择要保留的文字版本；系统不会自动覆盖任一版本。"}</p>
       <div class="revision-conflict-comparison">
         <div><span>本页文字</span><pre>${escapeHtml(textarea.value)}</pre></div>
-        <div><span>服务器文字</span><pre>${escapeHtml(serverDraft?.current_text ?? "（服务器 Draft 已不存在）")}</pre></div>
+        <div><span>另一页面保存的文字</span><pre>${escapeHtml(serverDraft?.current_text ?? "（另一页面的草稿已不存在）")}</pre></div>
       </div>
       <div class="revision-conflict-actions">
         <button class="secondary-button conflict-keep-local" type="button">保留本页文字并继续</button>
-        ${serverDraft ? '<button class="secondary-button conflict-use-server" type="button">使用服务器文字并继续</button>' : ""}
+        ${serverDraft ? '<button class="secondary-button conflict-use-server" type="button">使用另一页面文字并继续</button>' : ""}
       </div>`;
   }
 
@@ -2287,7 +2852,7 @@ function renderCapture() {
       return state.draft;
     } catch (error) {
       if (!state.disposed) {
-        setCaptureStatus(`暂时无法刷新 Draft：${error.message}`, "error");
+        setCaptureStatus(`暂时无法刷新草稿：${error.message}`, "error");
         scheduleDraftPoll();
       }
       return null;
@@ -2307,7 +2872,7 @@ function renderCapture() {
     if (state.disposed) return state.draft;
     if (state.revisionConflict) {
       if (!quiet) {
-        setCaptureStatus("请先明确选择本页或服务器 Draft 文字。", "error");
+        setCaptureStatus("请先明确选择本页或另一页面保存的文字。", "error");
       }
       return state.draft;
     }
@@ -2316,7 +2881,7 @@ function renderCapture() {
       if (!state.dirty) return state.draft;
     }
     if (state.savePending) {
-      if (!quiet) setCaptureStatus("上次最终保存结果待确认，请再次点“保存”。", "error");
+      if (!quiet) setCaptureStatus("上次保存结果待确认，请再次点“保存”。", "error");
       return state.draft;
     }
     const snapshot = textarea.value;
@@ -2324,7 +2889,7 @@ function renderCapture() {
     if (!ensureDraft && !state.draft && !snapshot && !state.dirty) return null;
     const expectedRevision = state.draft?.revision || 0;
     writeSafetyBuffer();
-    if (!quiet) setCaptureStatus("正在持久保存 Draft…");
+    if (!quiet) setCaptureStatus("正在安全保存草稿…");
     state.flushPromise = (async () => {
       try {
         const response = await api("/api/capture-draft", {
@@ -2345,7 +2910,7 @@ function renderCapture() {
         if (!(state.gesture && state.phase === CAPTURE_BROWSER_STATES.REQUESTING_MIC)) {
           state.phase = CAPTURE_BROWSER_STATES.OPEN;
         }
-        if (!quiet) setCaptureStatus("Draft 已持久保存。", "success");
+        if (!quiet) setCaptureStatus("草稿已保存。", "success");
         return state.draft;
       } catch (error) {
         state.dirty = true;
@@ -2355,8 +2920,8 @@ function renderCapture() {
           : CAPTURE_BROWSER_STATES.DIRTY;
         setCaptureStatus(
           error instanceof ApiError && error.status === 409
-            ? "Draft 已在其他页面更新；本地未确认文字仍保留，请刷新后手动取舍。"
-            : `Draft 尚未同步；本地安全缓冲仍保留：${error.message}`,
+            ? "草稿已在其他页面更新；本页未确认文字仍保留，请刷新后手动取舍。"
+            : `草稿尚未同步；本页文字仍保留：${error.message}`,
           "error",
         );
         throw error;
@@ -2385,7 +2950,7 @@ function renderCapture() {
           textarea.value = localBuffer.text;
           state.dirty = false;
           state.savePending = true;
-          setCaptureStatus("上次最终保存结果待确认；请再次点“保存”安全确认。", "error");
+          setCaptureStatus("上次保存结果待确认；请再次点“保存”安全确认。", "error");
         } else if (!state.userTypedDuringBootstrap && (!localBuffer.dirty || localMatchesServer)) {
           textarea.value = serverDraft.current_text;
           state.dirty = false;
@@ -2393,7 +2958,7 @@ function renderCapture() {
           clearCaptureDraft();
         } else {
           state.dirty = true;
-          setCaptureStatus("已恢复本地未确认文字；服务器 Draft 未被自动覆盖。", "error");
+          setCaptureStatus("已恢复本页未确认文字；另一页面保存的草稿未被自动覆盖。", "error");
         }
       } else if (localBuffer.savePending && localBuffer.draftId) {
         state.draft = {
@@ -2403,7 +2968,7 @@ function renderCapture() {
           voice_segments: [],
         };
         state.savePending = true;
-        setCaptureStatus("上次最终保存结果待确认；请再次点“保存”安全确认。", "error");
+        setCaptureStatus("上次保存结果待确认；请再次点“保存”安全确认。", "error");
       } else {
         state.draft = null;
         state.dirty = localBuffer.dirty || state.userTypedDuringBootstrap;
@@ -2419,7 +2984,7 @@ function renderCapture() {
       scheduleDraftPoll();
     } catch (error) {
       state.phase = state.dirty ? CAPTURE_BROWSER_STATES.DIRTY : CAPTURE_BROWSER_STATES.OPEN;
-      setCaptureStatus(`服务器 Draft 暂时不可用；本地未确认文字仍保留：${error.message}`, "error");
+      setCaptureStatus(`暂时无法读取已保存草稿；本页文字仍保留：${error.message}`, "error");
       updateCaptureControls();
     }
   }
@@ -2466,7 +3031,7 @@ function renderCapture() {
     setCaptureStatus("正在安全保存原始录音…");
     try {
       await flushDraft({ ensureDraft: true });
-      if (!state.draft) throw new Error("Draft 尚未就绪");
+      if (!state.draft) throw new Error("草稿尚未就绪");
       const uploadedSegment = await rawApi(
         `/api/capture-draft/voice-segments/${encodeURIComponent(clientSegmentId)}?revision=${state.draft.revision}`,
         {
@@ -2515,7 +3080,7 @@ function renderCapture() {
               state.phase = CAPTURE_BROWSER_STATES.REVISION_CONFLICT;
               writeSafetyBuffer();
               setCaptureStatus(
-                "服务器 Draft 与本页文字不同；录音仍保留，请明确选择文字版本。",
+                "另一页面保存的草稿与本页文字不同；录音仍保留，请明确选择文字版本。",
                 "error",
               );
               updateCaptureControls();
@@ -2532,7 +3097,7 @@ function renderCapture() {
         }
       }
       state.phase = CAPTURE_BROWSER_STATES.OPEN;
-      setCaptureStatus(`录音尚未得到服务器确认，已保留在本页：${error.message}`, "error");
+      setCaptureStatus(`录音尚未保存成功，已保留在本页：${error.message}`, "error");
       updateCaptureControls();
     }
   }
@@ -2589,7 +3154,7 @@ function renderCapture() {
       state.gesture = null;
       state.phase = CAPTURE_BROWSER_STATES.OPEN;
       if (!state.disposed) {
-        setCaptureStatus(gesture.released ? "已取消录音。" : "Draft 未保存，未开始录音。", gesture.released ? "" : "error");
+        setCaptureStatus(gesture.released ? "已取消录音。" : "草稿未保存，未开始录音。", gesture.released ? "" : "error");
         updateCaptureControls();
       }
       return;
@@ -2601,7 +3166,7 @@ function renderCapture() {
     } catch (_) {
       abandonVoiceGesture(
         gesture,
-        "浏览器无法使用默认录音格式；原文 Draft 已保留。",
+        "浏览器无法使用默认录音格式；草稿原文已保留。",
       );
       return;
     }
@@ -2650,7 +3215,7 @@ function renderCapture() {
     } catch (_) {
       abandonVoiceGesture(
         gesture,
-        "浏览器无法启动录音；原文 Draft 已保留。",
+        "浏览器无法启动录音；草稿原文已保留。",
       );
       return;
     }
@@ -2685,10 +3250,10 @@ function renderCapture() {
     } else if (state.savePending) {
       state.savePending = false;
       state.phase = CAPTURE_BROWSER_STATES.REVISION_CONFLICT;
-      setCaptureStatus("最终保存结果尚未确认；新文字只保留在本地，请先刷新确认。", "error");
+      setCaptureStatus("上次保存结果尚未确认；新文字只保留在本页，请先刷新确认。", "error");
     } else {
       state.phase = CAPTURE_BROWSER_STATES.DIRTY;
-      setCaptureStatus("正在等待持久保存…");
+      setCaptureStatus("正在保存草稿…");
       scheduleAutosave();
     }
     writeSafetyBuffer();
@@ -2739,7 +3304,7 @@ function renderCapture() {
         setCaptureStatus("正在重试转写…");
       } else {
         await api(`/api/voice-segments/${segmentId}`, { method: "DELETE" });
-        setCaptureStatus("失败录音已删除，可以重新录制。", "success");
+        setCaptureStatus("未完成的录音已删除，可以重新录制。", "success");
       }
       await refreshDraft({ polling: Boolean(retry) });
     } catch (error) {
@@ -2762,7 +3327,7 @@ function renderCapture() {
     state.pendingUpload = null;
     setCaptureStatus(
       state.revisionConflict
-        ? "未上传录音已删除；仍需选择要保留的 Draft 文字。"
+        ? "未上传录音已删除；仍需选择要保留的草稿文字。"
         : "未上传录音已删除。",
       state.revisionConflict ? "error" : "success",
     );
@@ -2796,13 +3361,13 @@ function renderCapture() {
     } else if (keepLocal) {
       void flushDraft();
     } else {
-      setCaptureStatus("已采用服务器 Draft。", "success");
+      setCaptureStatus("已采用另一页面保存的草稿。", "success");
     }
   });
 
   discardButton.addEventListener("click", async () => {
     if (state.discardPending) return;
-    if (!window.confirm("永久丢弃当前 Draft、未保存文字和其中的原始录音吗？")) return;
+    if (!window.confirm("永久丢弃当前草稿、未保存文字和其中的原始录音吗？")) return;
     if (state.pendingUpload) {
       state.pendingUpload = null;
     }
@@ -2823,11 +3388,16 @@ function renderCapture() {
           state.savePending = false;
           textarea.value = "";
           clearCaptureDraft();
-          setCaptureStatus("Draft 已丢弃。", "success");
+          setCaptureStatus("草稿已丢弃。", "success");
         } catch (error) {
-          setCaptureStatus(`Draft 未丢弃，本地文字仍保留：${error.message}`, "error");
+          setCaptureStatus(
+            isDraftRevisionConflict(error)
+              ? "草稿已在其他页面变化，本页文字仍保留。请刷新后再取舍。"
+              : `草稿未丢弃，本页文字仍保留：${error.message}`,
+            "error",
+          );
         }
-      }
+      },
     });
   });
 
@@ -2863,7 +3433,7 @@ function renderCapture() {
         setCaptureStatus(
           state.pendingUpload
             ? "录音尚未安全上传；请先重试上传或明确删除。"
-            : "Draft 文字冲突尚未解决；请先明确选择文字版本。",
+            : "草稿文字冲突尚未解决；请先明确选择文字版本。",
           "error",
         );
         return false;
@@ -2899,6 +3469,12 @@ function renderCapture() {
     quickList.innerHTML = items.map(quickConfirmationCard).join("");
   }
 
+  function renderUpcomingReminders() {
+    const markup = upcomingReminderList(quickItems);
+    upcomingList.innerHTML = markup;
+    upcomingSection.hidden = !markup;
+  }
+
   async function loadQuickConfirmation() {
     if (pollTimer) window.clearTimeout(pollTimer);
     pollTimer = null;
@@ -2908,7 +3484,12 @@ function renderCapture() {
       captureReminders.innerHTML = inAppReminderList(data.due_reminders);
       markRenderedRemindersSurfaced(data.due_reminders);
       quickItems = [...data.sortable_items, ...data.needs_confirmation];
+      notificationOnboardingHasReminder = quickItems.some((item) =>
+        reminderIsNotificationEligible(item.reminder)
+      ) || data.due_reminders.length > 0;
+      renderUpcomingReminders();
       renderQuickConfirmation();
+      renderNotificationOnboarding();
       if (data.pending_inputs.length) {
         pollTimer = window.setTimeout(loadQuickConfirmation, 2500);
       }
@@ -2935,28 +3516,40 @@ function renderCapture() {
             item.show_reminder_prompt = false;
             quickStatus.dataset.kind = "success";
             quickStatus.textContent = "微提醒已设置。";
+            renderUpcomingReminders();
             renderQuickConfirmation();
           },
         });
+        return;
+      }
+      if (reminderChoice.classList.contains("reminder-decline-button")) {
+        reminderChoice.disabled = true;
+        quickStatus.dataset.kind = "";
+        quickStatus.textContent = "正在保存选择…";
+        try {
+          item.reminder = await api(`/api/reminders/${item.reminder.id}`, {
+            method: "DELETE",
+          });
+          quickStatus.dataset.kind = "success";
+          quickStatus.textContent = "已记住：暂时不用提醒。";
+          renderQuickConfirmation();
+        } catch (error) {
+          quickStatus.dataset.kind = "error";
+          quickStatus.textContent = `选择未保存：${error.message}`;
+          reminderChoice.disabled = false;
+        }
         return;
       }
       reminderChoice.disabled = true;
       quickStatus.dataset.kind = "";
       quickStatus.textContent = "正在保存选择…";
       try {
-        if (reminderChoice.classList.contains("reminder-decline-button")) {
-          item.reminder = await api(`/api/reminders/${item.reminder.id}`, {
-            method: "DELETE",
-          });
-          quickStatus.textContent = "已记住：暂时不用提醒。";
-        } else {
-          await api(`/api/items/${item.id}/reminder-prompt/dismiss`, {
-            method: "POST",
-          });
-          item.show_reminder_prompt = false;
-          quickStatus.textContent = "已记住：这次不用提醒。";
-        }
+        await api(`/api/items/${item.id}/reminder-prompt/dismiss`, {
+          method: "POST",
+        });
+        item.show_reminder_prompt = false;
         quickStatus.dataset.kind = "success";
+        quickStatus.textContent = "已记住：这次不用提醒。";
         renderQuickConfirmation();
       } catch (error) {
         quickStatus.dataset.kind = "error";
@@ -3015,13 +3608,13 @@ function renderCapture() {
     button.disabled = true;
     button.setAttribute("aria-busy", "true");
     button.textContent = "保存中…";
-    setCaptureStatus("正在最终保存…");
+    setCaptureStatus("正在保存…");
     try {
       if (!state.savePending) {
         await flushDraft({ ensureDraft: true });
       }
       if (!state.draft) {
-        throw new Error("Draft 尚未建立；本地文字仍保留。");
+        throw new Error("草稿尚未建立；本页文字仍保留。");
       }
       state.phase = CAPTURE_BROWSER_STATES.SAVING;
       state.savePending = true;
@@ -3042,7 +3635,7 @@ function renderCapture() {
       textarea.value = "";
       clearCaptureDraft();
       status.dataset.kind = "success";
-      status.innerHTML = '<span class="save-feedback"><strong>✓ 已保存</strong><span>AI 正在后台整理</span></span>';
+      status.innerHTML = '<span class="save-feedback"><strong>已保存</strong><span>正在整理</span></span>';
       textarea.focus();
       void loadQuickConfirmation();
       window.setTimeout(() => {
@@ -3062,7 +3655,7 @@ function renderCapture() {
       } else if (state.savePending) {
         writeSafetyBuffer({ savePending: true });
       }
-      setCaptureStatus(`最终保存尚未确认，输入仍保留：${error.message}`, "error");
+      setCaptureStatus(`保存结果尚未确认，输入仍保留：${error.message}`, "error");
     } finally {
       button.removeAttribute("aria-busy");
       button.textContent = "保存";
@@ -3074,15 +3667,12 @@ function renderCapture() {
 }
 
 function inputStatusCard(input, failed = false) {
-  const failureLabel = input.failure_type
-    ? `<span class="tag unknown">${escapeHtml(labels[input.failure_type] || input.failure_type)}</span>`
-    : "";
-  const failureMessage = input.failure_message || "未记录具体原因；请重新整理以获取诊断。";
+  const failureDisplay = captureFailureDisplay(input);
   const originalAudio = failed && input.voice_segment_ids?.length
     ? `<div class="saved-capture-audio">
         <strong>原始录音</strong>
         ${input.voice_segment_ids.map((segmentId, index) =>
-          voiceAudioMarkup(segmentId, `播放失败 Capture 的第 ${index + 1} 段原始录音`)
+          voiceAudioMarkup(segmentId, `播放未整理记录的第 ${index + 1} 段原始录音`)
         ).join("")}
       </div>`
     : "";
@@ -3090,13 +3680,30 @@ function inputStatusCard(input, failed = false) {
     <article class="status-card ${failed ? "failed" : "pending"}">
       <p class="original-preview">${escapeHtml(input.original_text)}</p>
       <p class="muted">${failed ? "整理失败，原文已安全保存。" : "原文已保存，正在整理。"}</p>
-      ${failed ? `<div class="failure-reason">${failureLabel}<span>${escapeHtml(failureMessage)}</span></div>` : ""}
+      ${failed ? `<div class="failure-reason"><span class="failure-kind">${escapeHtml(failureDisplay.title)}</span><span>${escapeHtml(failureDisplay.message)}</span></div>` : ""}
       ${originalAudio}
       ${failed ? `<div class="failed-capture-actions">
         <button class="secondary-button retry-button" data-input-id="${input.id}">重新整理</button>
-        <button class="text-button delete-input-button" data-input-id="${input.id}">删除 Capture</button>
+        <button class="text-button danger-button delete-input-button" data-input-id="${input.id}">永久删除这条记录</button>
       </div>` : ""}
     </article>`;
+}
+
+function inputHistoryItem(input) {
+  const failed = input.processing_status === "failed";
+  const failureDisplay = captureFailureDisplay(input);
+  return `
+    <li>
+      ${escapeHtml(input.original_text)}
+      <span class="history-meta">${formatTime(input.created_time)} · ${labels[input.processing_status]}</span>
+      ${input.voice_segment_ids?.length ? `<div class="history-audio-list">
+        ${input.voice_segment_ids.map((segmentId, index) =>
+          voiceAudioMarkup(segmentId, `播放第 ${index + 1} 段原始录音`)
+        ).join("")}
+      </div>` : ""}
+      ${failed ? `<span class="history-error">${escapeHtml(failureDisplay.title)}：${escapeHtml(failureDisplay.message)}</span>` : ""}
+      ${failed ? `<button class="secondary-button detail-retry-button" data-input-id="${input.id}">重新整理这条记录</button>` : ""}
+    </li>`;
 }
 
 function inAppReminderList(reminders) {
@@ -3124,28 +3731,88 @@ function markRenderedRemindersSurfaced(reminders) {
   );
 }
 
-async function renderDashboard({ silent = false } = {}) {
+async function renderDashboard({ silent = false, focusIntent = null } = {}) {
   if (!silent) {
     appElement.innerHTML = '<p class="loading">正在读取事项…</p>';
   }
   try {
     const selectedStatus = selectedDashboardStatus();
+    const requestedPage = selectedDashboardPage();
+    reconcileDashboardSelectionView(selectedStatus, requestedPage);
+    const selectionGeneration = dashboardSelection.generation;
     const view = lifecycleViews[selectedStatus];
-    const data = await api(`/api/items?status=${encodeURIComponent(selectedStatus)}`);
+    const data = await api(
+      `/api/items?status=${encodeURIComponent(selectedStatus)}&page=${requestedPage}`,
+    );
+    if (
+      selectionGeneration !== dashboardSelection.generation ||
+      window.location.pathname !== "/dashboard" ||
+      selectedDashboardStatus() !== selectedStatus ||
+      selectedDashboardPage() !== requestedPage
+    ) return;
+    const page = Number.isSafeInteger(data.page) ? data.page : requestedPage;
+    const pageSize = Number.isSafeInteger(data.page_size)
+      ? data.page_size
+      : MAX_BULK_LIFECYCLE_ITEMS;
+    const totalPages = Number.isSafeInteger(data.total_pages) ? data.total_pages : 1;
     const activeCount = data.sortable_items.length + data.needs_confirmation.length;
     const inactiveItems = [...data.sortable_items, ...data.needs_confirmation];
     const visibleCount = selectedStatus === "active" ? activeCount : inactiveItems.length;
+    const totalItems = Number.isSafeInteger(data.total_items)
+      ? data.total_items
+      : visibleCount;
+    if (visibleCount > pageSize || pageSize > MAX_BULK_LIFECYCLE_ITEMS) {
+      throw new Error("事项页面容量与批量操作上限不一致。");
+    }
+    if (page !== requestedPage) {
+      history.replaceState({}, "", dashboardPath(selectedStatus, page));
+    }
+    const visibleItems = selectedStatus === "active"
+      ? [...data.sortable_items, ...data.needs_confirmation]
+      : inactiveItems;
+    dashboardSelection.visibleIds = visibleItems.map((item) => item.id);
+    if (dashboardSelection.active) dashboardSelection.page = page;
+    dashboardSelection.ids = new Set(
+      [...dashboardSelection.ids].filter((itemId) =>
+        dashboardSelection.visibleIds.includes(itemId)
+      ),
+    );
+    const selectionListAttributes = dashboardSelection.active
+      ? 'role="listbox" aria-multiselectable="true"'
+      : "";
     appElement.innerHTML = `
       <section class="page-heading dashboard-heading ${escapeHtml(selectedStatus)}">
         <div class="dashboard-title-row">
-          <h1>${escapeHtml(view.heading)}</h1>
-          <span class="dashboard-total" aria-label="${visibleCount} 个事项">${visibleCount}</span>
+          <h1>${selectedStatus === "trash" ? "回收站" : "事项"}</h1>
+          ${selectedStatus === "trash"
+            ? '<a class="trash-entry" href="/dashboard" data-link>返回事项</a>'
+            : '<a class="trash-entry" href="/dashboard?status=trash" data-link><span aria-hidden="true">🗑</span>回收站</a>'}
         </div>
       </section>
 
-      ${selectedStatus === "active" ? inAppReminderList(data.due_reminders) : ""}
-
       ${lifecycleNavigation(selectedStatus)}
+
+      <section class="lifecycle-view-heading">
+        <div>
+          <h2 id="dashboard-view-heading" tabindex="-1" data-dashboard-focus-fallback>${escapeHtml(view.heading)}</h2>
+          <span class="dashboard-total" aria-label="${totalItems} 个事项">${totalItems}</span>
+        </div>
+        <div class="lifecycle-view-actions">
+          <button id="selection-entry" class="text-button" type="button" ${visibleCount ? "" : "disabled"}>选择</button>
+          ${selectedStatus === "trash" && visibleCount
+            ? `<button id="clear-trash-button" class="text-button danger-button" type="button" data-clear-trash-scope="${totalPages === 1 && totalItems === visibleCount ? "all" : "page"}" data-total-items="${totalItems}">${totalPages === 1 && totalItems === visibleCount ? "清空回收站" : "永久删除本页事项"}</button>`
+            : ""}
+        </div>
+      </section>
+
+      ${selectedStatus === "trash"
+        ? '<p class="trash-retention-note">事项将在移入回收站 30 天后永久删除。</p>'
+        : ""}
+
+      ${dashboardSelectionBar(selectedStatus)}
+      <p id="dashboard-action-status" class="status-message" role="status"></p>
+
+      ${selectedStatus === "active" ? inAppReminderList(data.due_reminders) : ""}
 
       ${selectedStatus === "active" && data.pending_inputs.length ? `
         <section class="section">
@@ -3161,18 +3828,38 @@ async function renderDashboard({ silent = false } = {}) {
 
       ${selectedStatus === "active" ? `
         ${data.sortable_items.length ? `<section class="section dashboard-primary-section">
-          <div class="item-list">${data.sortable_items.map(itemCard).join("")}</div>
+          <div class="item-list" ${selectionListAttributes}>${data.sortable_items.map(itemCard).join("")}</div>
         </section>` : ""}
         ${data.needs_confirmation.length ? `<section class="section dashboard-secondary-section">
           <div class="section-heading"><h2>信息待确认</h2><span class="count">${data.needs_confirmation.length}</span></div>
-          <div class="item-list">${data.needs_confirmation.map(itemCard).join("")}</div>
+          <div class="item-list" ${selectionListAttributes}>${data.needs_confirmation.map(itemCard).join("")}</div>
         </section>` : ""}
       ` : `
         <section class="section dashboard-primary-section">
-          ${inactiveItems.length ? `<div class="item-list">${inactiveItems.map(itemCard).join("")}</div>` : `<div class="empty-state compact-empty-state">${escapeHtml(view.empty)}</div>`}
+          ${inactiveItems.length ? `<div class="lifecycle-list" ${selectionListAttributes}>${inactiveItems.map((item) => lifecycleListRow(item, selectedStatus)).join("")}</div>` : `<div class="empty-state compact-empty-state">${escapeHtml(view.empty)}</div>`}
         </section>`}
 
       ${selectedStatus === "active" && activeCount === 0 && data.pending_inputs.length === 0 && data.failed_inputs.length === 0 ? `<div class="empty-state compact-empty-state section">${escapeHtml(view.empty)} <a href="/capture" data-link>去记录一条想法</a></div>` : ""}`;
+
+    appElement.insertAdjacentHTML(
+      "beforeend",
+      dashboardPagination(
+        selectedStatus,
+        page,
+        totalPages,
+        totalItems,
+        visibleCount,
+      ),
+    );
+
+    notificationOnboardingHasReminder = selectedStatus === "active" && (
+      [...data.sortable_items, ...data.needs_confirmation].some((item) =>
+        reminderIsNotificationEligible(item.reminder)
+      ) || data.due_reminders.length > 0
+    );
+    renderNotificationOnboarding();
+    bindDashboardSelectionControls(selectedStatus);
+    bindDashboardLongPressRows(selectedStatus);
 
     if (selectedStatus === "active") {
       markRenderedRemindersSurfaced(data.due_reminders);
@@ -3193,7 +3880,7 @@ async function renderDashboard({ silent = false } = {}) {
 
     document.querySelectorAll(".delete-input-button").forEach((button) => {
       button.addEventListener("click", async () => {
-        if (!window.confirm("永久删除这条失败 Capture、原文和原始录音吗？此操作不可恢复。")) return;
+        if (!window.confirm("永久删除这条未整理记录、原文和原始录音吗？此操作无法撤销。")) return;
         button.disabled = true;
         try {
           await api(`/api/inputs/${button.dataset.inputId}`, { method: "DELETE" });
@@ -3205,7 +3892,13 @@ async function renderDashboard({ silent = false } = {}) {
       });
     });
 
-    if (selectedStatus === "active" && data.pending_inputs.length) {
+    restoreDashboardFocus(focusIntent);
+
+    if (
+      selectedStatus === "active" &&
+      data.pending_inputs.length &&
+      !dashboardSelection.active
+    ) {
       pollTimer = window.setTimeout(() => renderDashboard({ silent: true }), 2500);
     }
   } catch (error) {
@@ -3272,7 +3965,6 @@ function buildEditForm(item) {
     <form id="edit-form" class="edit-form">
       <div class="full"><label for="edit-title">标题</label><input id="edit-title" value="${escapeHtml(item.title)}" maxlength="200" required /></div>
       <div><label for="edit-type">类型</label><input id="edit-type" value="${escapeHtml(item.type)}" maxlength="50" required /></div>
-      <div><label for="edit-status">状态</label><select id="edit-status">${["active", "completed", "trash"].map((value) => `<option value="${value}" ${item.status === value ? "selected" : ""}>${labels[value]}</option>`).join("")}</select></div>
       <div><label for="edit-importance">重要性</label><select id="edit-importance">${["unknown", "low", "medium", "high"].map((value) => `<option value="${value}" ${item.importance === value ? "selected" : ""}>${labels[value]}</option>`).join("")}</select></div>
       <div><label for="edit-urgency">紧急性</label><select id="edit-urgency">${["unknown", "low", "medium", "high"].map((value) => `<option value="${value}" ${item.urgency === value ? "selected" : ""}>${labels[value]}</option>`).join("")}</select></div>
       <div><label for="edit-deadline">截止日期</label><input id="edit-deadline" type="date" value="${escapeHtml(item.deadline ? item.deadline.slice(0, 10) : "")}" /></div>
@@ -3300,7 +3992,6 @@ function changedPatch(item) {
   const candidate = {
     title: document.querySelector("#edit-title").value.trim(),
     type: document.querySelector("#edit-type").value.trim(),
-    status: document.querySelector("#edit-status").value,
     importance: document.querySelector("#edit-importance").value,
     urgency: document.querySelector("#edit-urgency").value,
     deadline: document.querySelector("#edit-deadline").value || null,
@@ -3339,27 +4030,12 @@ function lifecycleActions(item) {
   }
   if (item.status === "active") {
     return `
-      <button class="primary-button lifecycle-primary lifecycle-status-button" data-status="completed">标记完成</button>
-      <button class="text-button danger-button lifecycle-status-button" data-status="trash">移入回收站</button>`;
+      <button class="primary-button lifecycle-primary lifecycle-status-button" data-status="completed">标记为已完成</button>
+      <button class="text-button lifecycle-status-button" data-status="trash">移入回收站</button>`;
   }
   return `
-    <button class="primary-button lifecycle-primary lifecycle-status-button" data-status="active">恢复为进行中</button>
-    <button class="text-button danger-button lifecycle-status-button" data-status="trash">移入回收站</button>`;
-}
-
-function confirmTrashMove() {
-  const message = "确定将这个事项移入回收站吗？之后仍可以从回收站恢复。";
-  const dialog = document.querySelector("#trash-confirm-dialog");
-  if (!dialog || typeof dialog.showModal !== "function") {
-    return Promise.resolve(window.confirm(message));
-  }
-  dialog.returnValue = "cancel";
-  return new Promise((resolve) => {
-    dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), {
-      once: true,
-    });
-    dialog.showModal();
-  });
+    <button class="primary-button lifecycle-primary lifecycle-status-button" data-status="active">恢复为当前</button>
+    <button class="text-button lifecycle-status-button" data-status="trash">移入回收站</button>`;
 }
 
 function reminderDetailSection(item, reminder) {
@@ -3439,71 +4115,67 @@ async function renderDetail(
           <h1>${escapeHtml(item.title)}</h1>
         </section>
 
-        <section class="detail-block continue-block">
-          <h2>又想到什么？</h2>
-          <form id="update-form">
-            <label class="visually-hidden" for="update-text">新增情况或修正</label>
-            <textarea id="update-text" maxlength="10000" required placeholder="补充新情况、进展，或修正之前的理解…"></textarea>
-            <div class="form-footer">
-              <p id="update-status" class="status-message" role="status">补充原文会先保存。</p>
-              <button class="primary-button update-submit" type="submit">保存补充</button>
+        <div class="detail-content">
+          <section class="detail-block understanding-block">
+            <div class="understanding-heading">
+              <h2>当前理解</h2>
+              <button class="edit-entry-button" id="edit-item-button" type="button" aria-haspopup="dialog" aria-controls="edit-dialog">修正字段</button>
             </div>
-          </form>
-        </section>
+            <dl class="detail-grid">
+              ${detailField("下一步", item.next_action || "未填写", true, "detail-next-action")}
+              ${detailField("截止日期", item.deadline ? formatDate(item.deadline) : "未填写")}
+              ${detailField("预计耗时", item.estimated_time ? `${item.estimated_time} 分钟` : "未填写")}
+              ${detailField("重要性", labels[item.importance])}
+              ${detailField("紧急性", labels[item.urgency])}
+            </dl>
+            ${item.extra_information && Object.keys(item.extra_information).length ? `
+              <div class="supplemental-section">
+                <h3>补充信息</h3>
+                ${renderExtraInformation(item.extra_information)}
+              </div>` : ""}
+          </section>
 
-        <section class="detail-block understanding-block">
-          <div class="understanding-heading">
-            <h2>当前理解</h2>
-            <button class="edit-entry-button" id="edit-item-button" type="button" aria-haspopup="dialog" aria-controls="edit-dialog">修正字段</button>
-          </div>
-          <dl class="detail-grid">
-            ${detailField("下一步", item.next_action || "未填写", true, "detail-next-action")}
-            ${detailField("截止日期", item.deadline ? formatDate(item.deadline) : "未填写")}
-            ${detailField("预计耗时", item.estimated_time ? `${item.estimated_time} 分钟` : "未填写")}
-            ${detailField("重要性", labels[item.importance])}
-            ${detailField("紧急性", labels[item.urgency])}
-          </dl>
-          ${item.extra_information && Object.keys(item.extra_information).length ? `
-            <div class="supplemental-section">
-              <h3>补充信息</h3>
-              ${renderExtraInformation(item.extra_information)}
-            </div>` : ""}
-        </section>
+          ${reminderDetailSection(item, data.reminder)}
 
-        ${reminderDetailSection(item, data.reminder)}
+          <section class="detail-block continue-block">
+            <h2>继续记录</h2>
+            <form id="update-form">
+              <label class="visually-hidden" for="update-text">新增情况或修正</label>
+              <textarea id="update-text" maxlength="10000" required placeholder="补充新情况、进展，或修正之前的理解…"></textarea>
+              <div class="form-footer">
+                <p id="update-status" class="status-message" role="status">补充原文会先保存。</p>
+                <button class="primary-button update-submit" type="submit">保存补充</button>
+              </div>
+            </form>
+          </section>
 
-        <section class="detail-block lifecycle-block">
-          <h2>事项状态</h2>
-          <div class="detail-actions lifecycle-actions">
-            ${lifecycleActions(item)}
-          </div>
-          <p id="item-action-status" class="status-message" role="status"></p>
-        </section>
+          <details class="detail-block advanced-block">
+            <summary>原始记录（${data.inputs.length}）</summary>
+            <ol class="history-list">${data.inputs.map(inputHistoryItem).join("")}</ol>
+          </details>
 
-        <details class="detail-block advanced-block">
-          <summary>查看原始记录（${data.inputs.length}）</summary>
-          <ol class="history-list">${data.inputs.map((input) => `
-            <li>
-              ${escapeHtml(input.original_text)}
-              <span class="history-meta">${formatTime(input.created_time)} · ${labels[input.processing_status]}</span>
-              ${input.processing_status === "failed" ? `<span class="history-error">${escapeHtml(input.failure_message || "未记录具体原因；重新整理后可获得诊断。")}</span>` : ""}
-              ${input.processing_status === "failed" ? `<button class="secondary-button detail-retry-button" data-input-id="${input.id}">重新整理这条记录</button>` : ""}
-            </li>`).join("")}</ol>
-        </details>
+          <details class="detail-block advanced-block more-actions-block">
+            <summary>更多信息与操作</summary>
+            <dl class="detail-metadata">
+              ${detailField("状态", labels[item.status])}
+              ${detailField("类型", itemTypeLabel(item.type))}
+              ${detailField("更新时间", formatTime(item.updated_time), true)}
+            </dl>
+            <div class="reprocess-section">
+              <p class="muted">需要时，可用全部原始记录重新整理当前理解。</p>
+              <button class="secondary-button quiet-button" id="reprocess-item-button">重新整理</button>
+              <p id="reprocess-status" class="status-message" role="status"></p>
+            </div>
+          </details>
 
-        <details class="detail-block advanced-block more-actions-block">
-          <summary>更多信息与操作</summary>
-          <dl class="detail-metadata">
-            ${detailField("状态", labels[item.status])}
-            ${detailField("类型", itemTypeLabel(item.type))}
-            ${detailField("更新时间", formatTime(item.updated_time), true)}
-          </dl>
-          <div class="reprocess-section">
-            <p class="muted">需要时，可用全部原始记录重新整理当前理解。</p>
-            <button class="secondary-button quiet-button" id="reprocess-item-button">重新整理</button>
-            <p id="reprocess-status" class="status-message" role="status"></p>
-          </div>
-        </details>
+          <section class="detail-block lifecycle-block">
+            <h2>事项状态</h2>
+            <div class="detail-actions lifecycle-actions">
+              ${lifecycleActions(item)}
+            </div>
+            <p id="item-action-status" class="status-message" role="status"></p>
+          </section>
+        </div>
 
         <dialog id="edit-dialog" class="edit-dialog" aria-labelledby="edit-dialog-title">
           <section class="edit-surface">
@@ -3520,17 +4192,12 @@ async function renderDetail(
           </section>
         </dialog>
 
-        <dialog id="trash-confirm-dialog" class="confirmation-dialog" aria-labelledby="trash-confirm-title">
-          <form method="dialog" class="confirmation-dialog-card">
-            <h2 id="trash-confirm-title">移入回收站？</h2>
-            <p>确定将这个事项移入回收站吗？之后仍可以从回收站恢复。</p>
-            <div class="confirmation-dialog-actions">
-              <button type="submit" value="cancel" class="secondary-button">取消</button>
-              <button type="submit" value="confirm" class="primary-button">移入回收站</button>
-            </div>
-          </form>
-        </dialog>
       </div>`;
+
+    notificationOnboardingHasReminder = reminderIsNotificationEligible(
+      data.reminder,
+    );
+    renderNotificationOnboarding();
 
     const updateForm = document.querySelector("#update-form");
     const updateButton = updateForm.querySelector("button");
@@ -3714,7 +4381,7 @@ async function renderDetail(
     }
     if (data.reminder?.status === "due" && !data.reminder.surfaced_time) {
       const reminderWasRendered = document.querySelector(
-        '.reminder-detail-block[data-reminder-status="due"]',
+        `.reminder-detail-block[data-reminder-status="due"]`,
       );
       if (reminderWasRendered) {
         void api(`/api/reminders/${data.reminder.id}/surface`, { method: "POST" }).catch(
@@ -3748,7 +4415,6 @@ async function renderDetail(
     document.querySelectorAll(".lifecycle-status-button").forEach((button) => {
       button.addEventListener("click", async () => {
         const nextStatus = button.dataset.status;
-        if (nextStatus === "trash" && !(await confirmTrashMove())) return;
         button.disabled = true;
         actionStatus.textContent = "正在更新状态…";
         try {
@@ -3778,7 +4444,7 @@ async function renderDetail(
         deleteButton.disabled = true;
         try {
           await api(`/api/items/${itemId}`, { method: "DELETE" });
-          navigate("/dashboard");
+          navigate(dashboardPath("trash"));
         } catch (error) {
           actionStatus.dataset.kind = "error";
           actionStatus.textContent = error.message;
@@ -3800,6 +4466,7 @@ async function renderDetail(
 }
 
 function renderRoute() {
+  resetDashboardSelection();
   if (activeCaptureController) {
     const previousCaptureController = activeCaptureController;
     activeCaptureController = null;
@@ -3855,11 +4522,29 @@ function renderRoute() {
   }
 }
 
-async function initializeAuthentication() {
+function waitForStartupAuthenticationRetry(delay) {
+  return new Promise((resolve) => window.setTimeout(resolve, delay));
+}
+
+async function fetchCurrentUserWithStartupRetry() {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await api("/api/auth/me");
+    } catch (error) {
+      const retryDelay = STARTUP_AUTH_RETRY_DELAYS_MS[attempt];
+      if (!(error instanceof NetworkError) || retryDelay === undefined) {
+        throw error;
+      }
+      await waitForStartupAuthenticationRetry(retryDelay);
+    }
+  }
+}
+
+async function runAuthenticationInitialization() {
   setAuthentication(AUTH_STATES.LOADING);
   renderRoute();
   try {
-    const user = await api("/api/auth/me");
+    const user = await fetchCurrentUserWithStartupRetry();
     setAuthentication(AUTH_STATES.AUTHENTICATED, user);
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
@@ -3872,12 +4557,27 @@ async function initializeAuthentication() {
   renderRoute();
 }
 
+async function initializeAuthentication() {
+  if (authenticationInitializationPromise) {
+    return authenticationInitializationPromise;
+  }
+  authenticationInitializationPromise = runAuthenticationInitialization();
+  try {
+    await authenticationInitializationPromise;
+  } finally {
+    authenticationInitializationPromise = null;
+  }
+}
+
 void initializeAuthentication();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/service-worker.js", { scope: "/" }).catch(() => {
-      // Installability is an enhancement; API workflows remain available.
-    });
+    navigator.serviceWorker
+      .register("/service-worker.js", { scope: "/" })
+      .then((registration) => registration.update())
+      .catch(() => {
+        // Installability is an enhancement; API workflows remain available.
+      });
   });
 }

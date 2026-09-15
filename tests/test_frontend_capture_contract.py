@@ -78,7 +78,7 @@ def test_capture_buffer_is_user_namespaced_exact_text_only_and_conflict_safe(
     assert "serverDraft.current_text === localText" in frontend
     assert "conflict-keep-local" in capture
     assert "conflict-use-server" in capture
-    assert "服务器 Draft 未被自动覆盖" in capture
+    assert "草稿未被自动覆盖" in capture
     assert "textarea.disabled = state.savePending || hasActive || transient" in capture
 
 
@@ -176,7 +176,7 @@ def test_final_save_navigation_session_and_mobile_accessibility_contract(
         submit.index('await api("/api/capture-draft/save"')
         < submit.index('textarea.value = ""')
     )
-    assert "最终保存尚未确认，输入仍保留" in submit
+    assert "保存结果尚未确认，输入仍保留" in submit
     assert "activeCaptureController.prepareNavigation()" in frontend
     assert "activeCaptureController?.deferSessionExpiredRedirect()" in frontend
     assert "previousCaptureController.dispose()" in frontend

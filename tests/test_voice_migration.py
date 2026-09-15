@@ -195,7 +195,7 @@ def test_public_v4_migrates_to_v5_and_preserves_all_community_data(
     }
     assert foreign_key_errors == []
     assert integrity == "ok"
-    with pytest.raises(DatabaseVersionError, match="migration to version 6"):
+    with pytest.raises(DatabaseVersionError, match="migration to version 7"):
         Database(database_path).initialize()
 
 
@@ -320,7 +320,7 @@ def test_application_startup_rejects_unmigrated_v4_database(tmp_path: Path):
     create_v4_database(database_path)
     before = logical_snapshot(database_path)
 
-    with pytest.raises(DatabaseVersionError, match="explicit migration to version 6"):
+    with pytest.raises(DatabaseVersionError, match="explicit migration to version 7"):
         Database(database_path).initialize()
 
     assert logical_snapshot(database_path) == before

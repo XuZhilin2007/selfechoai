@@ -5,17 +5,17 @@ import sqlite3
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.database import (
-    EMAIL_REMINDER_SETTINGS_TABLE_SQL,
-    EMAIL_VERIFICATION_CHALLENGES_TABLE_SQL,
-    REMINDER_EMAIL_DELIVERIES_TABLE_SQL,
-    SCHEMA_V5_VERSION,
+    CURRENT_SCHEMA_VERSION,
     SCHEMA_V6_VERSION,
-    V6_INDEXES_SQL,
+    V7_INDEXES_SQL,
+    V7_LIFECYCLE_COLUMNS_SQL,
     Database,
 )
+from app.time_utils import serialize_utc_datetime
 
 
 EXISTING_TABLES = (
@@ -29,18 +29,14 @@ EXISTING_TABLES = (
     "capture_drafts",
     "voice_segments",
     "voice_file_deletions",
-)
-NEW_TABLES = (
     "email_reminder_settings",
     "email_verification_challenges",
     "reminder_email_deliveries",
 )
+NEW_COLUMNS = ("completed_at", "trashed_at", "status_before_trash")
 NEW_INDEXES = (
-    "idx_email_challenges_user_address_created",
-    "uq_email_challenges_active",
-    "idx_email_deliveries_send_ready",
-    "idx_email_deliveries_status_ready",
-    "idx_email_deliveries_user_status",
+    "idx_personal_items_lifecycle",
+    "idx_personal_items_trash_retention",
 )
 
 
@@ -53,15 +49,18 @@ class MigrationPreflight:
     database_path: Path
     schema_version: int
     row_counts: dict[str, int]
+    lifecycle_counts: dict[str, int]
 
 
 @dataclass(frozen=True, slots=True)
 class MigrationResult:
     row_counts: dict[str, int]
+    lifecycle_counts: dict[str, int]
+    migration_time: str
 
 
-def inspect_v5_database(database_path: Path) -> MigrationPreflight:
-    """Validate a v5 database using a strictly read-only connection."""
+def inspect_v6_database(database_path: Path) -> MigrationPreflight:
+    """Validate a v6 database through a strictly read-only connection."""
 
     resolved = database_path.expanduser().resolve()
     if not resolved.is_file():
@@ -78,11 +77,7 @@ def inspect_v5_database(database_path: Path) -> MigrationPreflight:
     connection.execute("PRAGMA busy_timeout = 10000")
     try:
         _validate_source_database(connection)
-        return MigrationPreflight(
-            database_path=resolved,
-            schema_version=SCHEMA_V5_VERSION,
-            row_counts={name: _row_count(connection, name) for name in EXISTING_TABLES},
-        )
+        return _preflight(connection, resolved)
     except MigrationError:
         raise
     except sqlite3.DatabaseError as exc:
@@ -91,12 +86,20 @@ def inspect_v5_database(database_path: Path) -> MigrationPreflight:
         connection.close()
 
 
-def migrate_v5_to_v6(database_path: Path) -> MigrationResult:
-    """Explicitly migrate a stopped, backed-up v5 database to schema v6."""
+def migrate_v6_to_v7(
+    database_path: Path,
+    *,
+    migration_time: datetime | None = None,
+) -> MigrationResult:
+    """Explicitly migrate a stopped, backed-up v6 database to schema v7."""
 
     resolved = database_path.expanduser().resolve()
     if not resolved.is_file():
         raise MigrationError(f"database file does not exist: {resolved}")
+    migration_timestamp = serialize_utc_datetime(
+        migration_time or datetime.now(timezone.utc),
+        field_name="migration_time",
+    )
     try:
         connection = sqlite3.connect(resolved, timeout=10)
     except sqlite3.DatabaseError as exc:
@@ -106,20 +109,25 @@ def migrate_v5_to_v6(database_path: Path) -> MigrationResult:
     connection.execute("PRAGMA foreign_keys = ON")
     try:
         _validate_source_database(connection)
-        preflight = MigrationPreflight(
-            database_path=resolved,
-            schema_version=SCHEMA_V5_VERSION,
-            row_counts={name: _row_count(connection, name) for name in EXISTING_TABLES},
-        )
+        preflight = _preflight(connection, resolved)
         connection.execute("BEGIN IMMEDIATE")
         try:
-            connection.execute(EMAIL_REMINDER_SETTINGS_TABLE_SQL)
-            connection.execute(EMAIL_VERIFICATION_CHALLENGES_TABLE_SQL)
-            connection.execute(REMINDER_EMAIL_DELIVERIES_TABLE_SQL)
-            _execute_statements(connection, V6_INDEXES_SQL)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_V6_VERSION}")
-            _validate_migrated_data(connection, preflight)
-            Database._validate_v6_schema(connection, _table_names(connection))
+            _apply_schema_changes(connection)
+            connection.execute(
+                """
+                UPDATE personal_items
+                SET trashed_at = ?
+                WHERE status = 'trash'
+                """,
+                (migration_timestamp,),
+            )
+            connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            _validate_migrated_data(
+                connection,
+                preflight,
+                migration_timestamp=migration_timestamp,
+            )
+            Database._validate_v7_schema(connection, _table_names(connection))
             if connection.execute("PRAGMA foreign_key_check").fetchall():
                 raise MigrationError("foreign key validation failed after migration")
             integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
@@ -131,7 +139,11 @@ def migrate_v5_to_v6(database_path: Path) -> MigrationResult:
         except Exception:
             connection.rollback()
             raise
-        return MigrationResult(row_counts=dict(preflight.row_counts))
+        return MigrationResult(
+            row_counts=dict(preflight.row_counts),
+            lifecycle_counts=dict(preflight.lifecycle_counts),
+            migration_time=migration_timestamp,
+        )
     except MigrationError:
         raise
     except sqlite3.DatabaseError as exc:
@@ -144,27 +156,51 @@ def migrate_v5_to_v6(database_path: Path) -> MigrationResult:
         connection.close()
 
 
+def _preflight(
+    connection: sqlite3.Connection,
+    database_path: Path,
+) -> MigrationPreflight:
+    return MigrationPreflight(
+        database_path=database_path,
+        schema_version=SCHEMA_V6_VERSION,
+        row_counts={name: _row_count(connection, name) for name in EXISTING_TABLES},
+        lifecycle_counts={
+            status: int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM personal_items WHERE status = ?",
+                    (status,),
+                ).fetchone()[0]
+            )
+            for status in ("active", "completed", "trash")
+        },
+    )
+
+
 def _validate_source_database(connection: sqlite3.Connection) -> None:
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version != SCHEMA_V5_VERSION:
+    if version != SCHEMA_V6_VERSION:
         raise MigrationError(
-            f"expected database schema version {SCHEMA_V5_VERSION}, got {version}"
+            f"expected database schema version {SCHEMA_V6_VERSION}, got {version}"
         )
     tables = _table_names(connection)
     try:
-        Database._validate_v5_schema(connection, tables)
+        Database._validate_v6_schema(connection, tables)
     except RuntimeError as exc:
         raise MigrationError(str(exc)) from exc
-    unexpected = set(NEW_TABLES) & tables
-    if unexpected:
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(personal_items)")
+    }
+    unexpected_columns = set(NEW_COLUMNS) & columns
+    if unexpected_columns:
         raise MigrationError(
-            "version 5 database contains v6 tables: "
-            + ", ".join(sorted(unexpected))
+            "version 6 database contains v7 columns: "
+            + ", ".join(sorted(unexpected_columns))
         )
     unexpected_indexes = set(NEW_INDEXES) & _index_names(connection)
     if unexpected_indexes:
         raise MigrationError(
-            "version 5 database contains v6 indexes: "
+            "version 6 database contains v7 indexes: "
             + ", ".join(sorted(unexpected_indexes))
         )
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
@@ -174,16 +210,61 @@ def _validate_source_database(connection: sqlite3.Connection) -> None:
         raise MigrationError("source database foreign key validation failed")
 
 
+def _apply_schema_changes(connection: sqlite3.Connection) -> None:
+    for statement in V7_LIFECYCLE_COLUMNS_SQL:
+        connection.execute(statement)
+    _execute_statements(connection, V7_INDEXES_SQL)
+
+
 def _validate_migrated_data(
     connection: sqlite3.Connection,
     preflight: MigrationPreflight,
+    *,
+    migration_timestamp: str,
 ) -> None:
     for table_name, expected_count in preflight.row_counts.items():
         if _row_count(connection, table_name) != expected_count:
             raise MigrationError(f"{table_name} row count changed during migration")
-    for table_name in NEW_TABLES:
-        if _row_count(connection, table_name) != 0:
-            raise MigrationError(f"new table {table_name} was not empty")
+    for status, expected_count in preflight.lifecycle_counts.items():
+        actual_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM personal_items WHERE status = ?",
+                (status,),
+            ).fetchone()[0]
+        )
+        if actual_count != expected_count:
+            raise MigrationError(
+                f"{status} item count changed during migration"
+            )
+
+    active_invalid = connection.execute(
+        """
+        SELECT COUNT(*) FROM personal_items
+        WHERE status = 'active'
+          AND (completed_at IS NOT NULL OR trashed_at IS NOT NULL
+               OR status_before_trash IS NOT NULL)
+        """
+    ).fetchone()[0]
+    completed_invalid = connection.execute(
+        """
+        SELECT COUNT(*) FROM personal_items
+        WHERE status = 'completed'
+          AND (completed_at IS NOT NULL OR trashed_at IS NOT NULL
+               OR status_before_trash IS NOT NULL)
+        """
+    ).fetchone()[0]
+    trash_invalid = connection.execute(
+        """
+        SELECT COUNT(*) FROM personal_items
+        WHERE status = 'trash'
+          AND (completed_at IS NOT NULL OR trashed_at IS NULL
+               OR trashed_at != ?
+               OR status_before_trash IS NOT NULL)
+        """,
+        (migration_timestamp,),
+    ).fetchone()[0]
+    if active_invalid or completed_invalid or trash_invalid:
+        raise MigrationError("legacy lifecycle metadata policy validation failed")
 
 
 def _row_count(connection: sqlite3.Connection, table_name: str) -> int:
@@ -218,10 +299,7 @@ def _execute_statements(connection: sqlite3.Connection, sql: str) -> None:
 
 def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Explicitly migrate a stopped SelfEcho Community Edition "
-            "schema v5 database to v6."
-        )
+        description="Explicitly migrate a stopped SelfEcho schema v6 database to v7."
     )
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument(
@@ -240,7 +318,7 @@ def main(
 ) -> int:
     arguments = _build_argument_parser().parse_args(argv)
     try:
-        preflight = inspect_v5_database(arguments.database)
+        preflight = inspect_v6_database(arguments.database)
         output_fn(f"Database: {preflight.database_path}")
         output_fn(f"Schema version: {preflight.schema_version}")
         for table_name, count in preflight.row_counts.items():
@@ -248,18 +326,18 @@ def main(
         if arguments.check_only:
             output_fn("Preflight passed. No database changes were made.")
             return 0
-        output_fn("A validated, recoverable schema v5 backup is required.")
+        output_fn("A validated, recoverable schema v6 backup is required.")
         confirmation = input_fn(
-            'Type "MIGRATE PUBLIC V5 TO V6" to execute the transaction: '
+            'Type "MIGRATE V6 TO V7" to execute the transaction: '
         ).strip()
-        if confirmation != "MIGRATE PUBLIC V5 TO V6":
+        if confirmation != "MIGRATE V6 TO V7":
             output_fn("Migration cancelled. No database changes were made.")
             return 2
-        result = migrate_v5_to_v6(preflight.database_path)
+        result = migrate_v6_to_v7(preflight.database_path)
         output_fn("Migration completed successfully.")
         for table_name, count in result.row_counts.items():
             output_fn(f"{table_name} preserved: {count}")
-        output_fn(f"Schema version is now {SCHEMA_V6_VERSION}.")
+        output_fn(f"Schema version is now {CURRENT_SCHEMA_VERSION}.")
         return 0
     except (MigrationError, ValueError) as exc:
         output_fn(f"ERROR: {exc}")

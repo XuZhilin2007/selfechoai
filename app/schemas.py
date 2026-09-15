@@ -4,7 +4,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, field_validator
 
 from app.time_utils import (
     normalize_utc_datetime,
@@ -24,6 +24,19 @@ class ItemStatus(str, Enum):
     ACTIVE = "active"
     COMPLETED = "completed"
     TRASH = "trash"
+
+
+class StatusBeforeTrash(str, Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+
+
+class BulkLifecycleAction(str, Enum):
+    COMPLETE = "complete"
+    RESTORE_TO_CURRENT = "restore_to_current"
+    MOVE_TO_TRASH = "move_to_trash"
+    RESTORE_FROM_TRASH = "restore_from_trash"
+    PERMANENTLY_DELETE = "permanently_delete"
 
 
 class InputMethod(str, Enum):
@@ -386,6 +399,9 @@ class PersonalItemPublic(StrictModel):
     status: ItemStatus
     next_action: str | None
     extra_information: dict[str, Any] | None
+    completed_at: datetime | None = None
+    trashed_at: datetime | None = None
+    status_before_trash: StatusBeforeTrash | None = None
     created_time: datetime
     updated_time: datetime
 
@@ -463,9 +479,16 @@ class DashboardItem(StrictModel):
     urgency: PriorityLevel
     deadline: Deadline | None
     estimated_time: int | None
+    status: ItemStatus
+    completed_at: datetime | None
+    trashed_at: datetime | None
+    status_before_trash: StatusBeforeTrash | None
     priority_score: float | None = None
     reminder: ReminderPublic | None = None
     show_reminder_prompt: bool = False
+
+
+MAX_BULK_LIFECYCLE_ITEMS = 100
 
 
 class DashboardResponse(StrictModel):
@@ -474,6 +497,10 @@ class DashboardResponse(StrictModel):
     pending_inputs: list[ItemInputPublic]
     failed_inputs: list[ItemInputPublic]
     due_reminders: list[ReminderWithItemPublic] = Field(default_factory=list)
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=MAX_BULK_LIFECYCLE_ITEMS, ge=1)
+    total_items: int = Field(default=0, ge=0)
+    total_pages: int = Field(default=1, ge=1)
 
 
 class ItemDetailResponse(StrictModel):
@@ -481,6 +508,26 @@ class ItemDetailResponse(StrictModel):
     inputs: list[ItemInputPublic]
     reminder: ReminderPublic | None = None
     show_reminder_prompt: bool = False
+
+
+class BulkLifecycleRequest(StrictModel):
+    item_ids: list[StrictInt] = Field(
+        min_length=1,
+        max_length=MAX_BULK_LIFECYCLE_ITEMS,
+    )
+    action: BulkLifecycleAction
+
+    @field_validator("item_ids")
+    @classmethod
+    def item_ids_must_be_positive(cls, value: list[int]) -> list[int]:
+        if any(item_id <= 0 for item_id in value):
+            raise ValueError("item_ids must contain only positive integers")
+        return value
+
+
+class BulkLifecycleResponse(StrictModel):
+    action: BulkLifecycleAction
+    affected_ids: list[int]
 
 
 class ReminderScheduleRequest(StrictModel):

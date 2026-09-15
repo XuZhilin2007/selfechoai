@@ -51,6 +51,10 @@ def _dashboard_item(item: PersonalItemPublic, score: float | None) -> DashboardI
         urgency=item.urgency,
         deadline=item.deadline,
         estimated_time=item.estimated_time,
+        status=item.status,
+        completed_at=item.completed_at,
+        trashed_at=item.trashed_at,
+        status_before_trash=item.status_before_trash,
         priority_score=score,
     )
 

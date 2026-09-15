@@ -35,8 +35,8 @@ def create_database(path: Path) -> Database:
     return database
 
 
-def test_fresh_database_initializes_complete_public_schema_v6(tmp_path: Path):
-    database = create_database(tmp_path / "fresh-v6.db")
+def test_fresh_database_initializes_complete_public_schema_v7(tmp_path: Path):
+    database = create_database(tmp_path / "fresh-v7.db")
     with database.connection() as connection:
         tables = {
             row["name"]
@@ -61,7 +61,7 @@ def test_fresh_database_initializes_complete_public_schema_v6(tmp_path: Path):
             row["name"] for row in connection.execute("PRAGMA table_info(item_inputs)")
         }
 
-    assert version == CURRENT_SCHEMA_VERSION == 6
+    assert version == CURRENT_SCHEMA_VERSION == 7
     assert {
         "users",
         "user_sessions",

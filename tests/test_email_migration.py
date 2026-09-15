@@ -8,6 +8,8 @@ import pytest
 from app.database import (
     CURRENT_SCHEMA_VERSION,
     SCHEMA_V5,
+    SCHEMA_V6_VERSION,
+    SCHEMA_VERSION,
     Database,
     DatabaseVersionError,
 )
@@ -141,17 +143,21 @@ def row_counts(path: Path, tables=EXISTING_TABLES) -> dict[str, int]:
         connection.close()
 
 
-def test_fresh_database_initializes_directly_to_v6(tmp_path):
-    path = tmp_path / "fresh-v6.db"
+def test_fresh_database_initializes_directly_to_v7(tmp_path):
+    path = tmp_path / "fresh-v7.db"
     Database(path).initialize()
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         tables = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
+        }
+        lifecycle_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(personal_items)")
         }
     finally:
         connection.close()
@@ -160,6 +166,9 @@ def test_fresh_database_initializes_directly_to_v6(tmp_path):
         "email_verification_challenges",
         "reminder_email_deliveries",
     } <= tables
+    assert {"completed_at", "trashed_at", "status_before_trash"} <= (
+        lifecycle_columns
+    )
 
 
 def test_v5_to_v6_preserves_all_existing_rows_and_push_schema(tmp_path):
@@ -403,10 +412,10 @@ def test_migration_rolls_back_if_index_creation_fails(tmp_path, monkeypatch):
     assert "email_reminder_settings" not in tables
 
 
-def test_v6_application_rejects_unmigrated_v5_database(tmp_path):
+def test_v7_application_rejects_unmigrated_v5_database(tmp_path):
     path = tmp_path / "unmigrated.db"
     create_populated_v5_database(path)
-    with pytest.raises(DatabaseVersionError, match="migration to version 6"):
+    with pytest.raises(DatabaseVersionError, match="migration to version 7"):
         Database(path).initialize()
 
 
@@ -446,5 +455,7 @@ def test_cli_accepts_only_exact_public_confirmation_phrase(tmp_path):
     assert "Migration completed successfully." in output
 
 
-def test_current_schema_version_is_six_without_changing_v005_compatibility():
-    assert CURRENT_SCHEMA_VERSION == 6
+def test_current_schema_version_is_seven_without_changing_migration_compatibility():
+    assert CURRENT_SCHEMA_VERSION == 7
+    assert SCHEMA_V6_VERSION == 6
+    assert SCHEMA_VERSION == 5
