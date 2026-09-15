@@ -1,8 +1,8 @@
-const CACHE_NAME = "selfecho-ai-community-v0.6";
+const CACHE_NAME = "selfecho-ai-community-v0.7.0-ui-1";
 const SHELL = [
   "/static/index.html",
-  "/static/styles.css",
-  "/static/app.js",
+  "/static/styles.css?v=0.7.0-community-ui-1",
+  "/static/app.js?v=0.7.0-community-ui-1",
   "/static/manifest.webmanifest",
   "/static/icon.svg",
 ];
@@ -16,9 +16,7 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(
-        keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key)),
-      ))
+      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))))
   );
   self.clients.claim();
 });
@@ -71,7 +69,7 @@ function parsePushNotification(event) {
 self.addEventListener("push", (event) => {
   const notification = parsePushNotification(event);
   event.waitUntil(
-    self.registration.showNotification(notification.title, notification.options),
+    self.registration.showNotification(notification.title, notification.options)
   );
 });
 
@@ -99,13 +97,17 @@ async function openNotificationTarget(targetPath) {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil(
-    openNotificationTarget(event.notification.data?.targetPath),
+    openNotificationTarget(event.notification.data?.targetPath)
   );
 });
 
 self.addEventListener("fetch", (event) => {
   const requestUrl = new URL(event.request.url);
-  if (requestUrl.origin !== self.location.origin || requestUrl.pathname.startsWith("/api/")) {
+  if (
+    event.request.method !== "GET" ||
+    requestUrl.origin !== self.location.origin ||
+    requestUrl.pathname.startsWith("/api/")
+  ) {
     return;
   }
 

@@ -122,7 +122,7 @@ def chat_completion(content: str, finish_reason: str = "stop") -> dict:
     return {
         "id": "test-completion",
         "object": "chat.completion",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "choices": [
             {
                 "index": 0,
@@ -142,7 +142,7 @@ def test_deepseek_provider_uses_official_chat_completions_json_output():
             assert str(request.url) == "https://api.deepseek.com/chat/completions"
             assert request.headers["authorization"] == "Bearer test-secret"
             payload = json.loads(request.content)
-            assert payload["model"] == "deepseek-v4-flash"
+            assert payload["model"] == "deepseek-flash"
             assert payload["response_format"] == {"type": "json_object"}
             assert payload["max_tokens"] == 2048
             assert payload["stream"] is False
@@ -173,7 +173,7 @@ def test_deepseek_provider_uses_official_chat_completions_json_output():
             provider = DeepSeekProvider(
                 api_url="https://api.deepseek.com/",
                 api_key="test-secret",
-                model="deepseek-v4-flash",
+                model="deepseek-flash",
                 timeout_seconds=1,
                 client=client,
                 today_provider=lambda: date(2026, 8, 24),
@@ -753,7 +753,7 @@ def test_deepseek_output_still_uses_existing_unknown_evidence_rule(client_factor
     provider = DeepSeekProvider(
         api_url="https://api.deepseek.com",
         api_key="test-secret",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         timeout_seconds=1,
         client=async_client,
     )
@@ -975,7 +975,7 @@ def test_deepseek_provider_rejects_retired_aliases(retired_model):
             model=retired_model,
         )
     assert error.value.category == FailureType.CONFIGURATION
-    assert "deepseek-v4-flash" in error.value.user_message
+    assert "deepseek-flash" in error.value.user_message
 
 
 def test_service_factory_selects_deepseek_as_default(tmp_path):
@@ -985,6 +985,6 @@ def test_service_factory_selects_deepseek_as_default(tmp_path):
     )
     provider = create_ai_service(settings)
     assert isinstance(provider, DeepSeekProvider)
-    assert provider.model == "deepseek-v4-flash"
+    assert provider.model == "deepseek-flash"
     assert provider.api_url == "https://api.deepseek.com/chat/completions"
     assert provider.debug_output is False

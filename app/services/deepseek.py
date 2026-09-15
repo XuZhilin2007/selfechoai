@@ -181,7 +181,7 @@ class DeepSeekProvider(AIService):
     """DeepSeek Chat Completions adapter using the official JSON Output mode."""
 
     DEFAULT_API_URL = "https://api.deepseek.com"
-    DEFAULT_MODEL = "deepseek-v4-flash"
+    DEFAULT_MODEL = "deepseek-flash"
     RETIRED_MODEL_ALIASES = frozenset({"deepseek-chat", "deepseek-reasoner"})
     MAX_TOKENS = 2_048
 
@@ -204,7 +204,7 @@ class DeepSeekProvider(AIService):
         if model in self.RETIRED_MODEL_ALIASES:
             raise AIConfigurationError(
                 f"retired DeepSeek model alias: {model}",
-                "DeepSeek 模型名已退役：请使用 deepseek-v4-flash，"
+                "DeepSeek 模型名已退役：请使用 deepseek-flash，"
                 "不要使用 deepseek-chat 或 deepseek-reasoner。",
             )
         self.api_url = self._chat_completions_url(api_url)

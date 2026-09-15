@@ -42,6 +42,7 @@ def test_frontend_authentication_state_and_csrf_contract(client_factory) -> None
     assert "if (!isKnownPath(path))" in frontend
     assert "sessionStorage.getItem(captureDraftStorageKey())" in frontend
     assert "A transient failure must not erase an already resolved user" in frontend
+    assert ".then((registration) => registration.update())" in frontend
 
 
 def test_service_worker_never_caches_api_responses_and_manifest_is_valid(
@@ -53,7 +54,10 @@ def test_service_worker_never_caches_api_responses_and_manifest_is_valid(
     shell_entries = service_worker.split("const SHELL = [", 1)[1].split("];", 1)[0]
     api_guard_index = service_worker.index('requestUrl.pathname.startsWith("/api/")')
     response_handler_index = service_worker.index("event.respondWith")
-    assert "selfecho-ai-community-v0.6" in service_worker
+    assert "selfecho-ai-community-v0.7.0-ui-1" in service_worker
+    assert '"/static/app.js?v=0.7.0-community-ui-1"' in shell_entries
+    assert '"/static/styles.css?v=0.7.0-community-ui-1"' in shell_entries
+    assert "public-security-filing" not in service_worker
     assert "/api/" not in shell_entries
     assert api_guard_index < response_handler_index
 
@@ -66,7 +70,7 @@ def test_service_worker_never_caches_api_responses_and_manifest_is_valid(
     assert manifest["icons"]
 
 
-def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
+def test_v07_quiet_utility_structure_and_community_setup_contract(
     client_factory,
 ) -> None:
     client = client_factory(FunctionAIService(lambda text, existing: None))
@@ -82,17 +86,22 @@ def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
     assert "高重要" in frontend
     assert "优先级待确认" in frontend
 
+    detail_renderer = frontend.split("async function renderDetail", 1)[1].split(
+        "function renderRoute", 1
+    )[0]
     detail_order = [
-        frontend.index('class="page-heading detail-heading"'),
-        frontend.index('class="detail-block continue-block"'),
-        frontend.index('class="detail-block understanding-block"'),
-        frontend.index('id="edit-item-button"'),
-        frontend.index('class="detail-block lifecycle-block"'),
-        frontend.index("查看原始记录"),
-        frontend.index("更多信息与操作"),
+        detail_renderer.index('class="page-heading detail-heading"'),
+        detail_renderer.index('class="detail-content"'),
+        detail_renderer.index('class="detail-block understanding-block"'),
+        detail_renderer.index('id="edit-item-button"'),
+        detail_renderer.index("${reminderDetailSection(item, data.reminder)}"),
+        detail_renderer.index('class="detail-block continue-block"'),
+        detail_renderer.index("原始记录（"),
+        detail_renderer.index("更多信息与操作"),
+        detail_renderer.index('class="detail-block lifecycle-block"'),
     ]
     assert detail_order == sorted(detail_order)
-    assert "又想到什么？" in frontend
+    assert "继续记录" in frontend
     assert "补充原文会先保存。" in frontend
     assert "尚未保存，输入仍保留" in frontend
     assert "function renderSupplementalValue(value)" in frontend
@@ -109,19 +118,27 @@ def test_ui_phase2_scanning_continue_first_and_community_setup_contract(
     assert "editDialog.showModal()" in frontend
     assert "放弃尚未保存的字段修改吗？" in frontend
     assert 'document.querySelector("#edit-title").focus()' in frontend
+    assert 'class="capture-panel" aria-label="记录内容"' in frontend
+    assert 'class="panel capture-panel"' not in frontend
+    assert 'class="account-panel"' in frontend
+    assert 'class="panel account-panel"' not in frontend
+    assert 'class="settings-section profile-settings"' in frontend
+    assert 'class="settings-section notification-device-settings"' in frontend
 
     for selector in [
         ".dashboard-title-row",
         ".card-signal",
         ".card-meta",
         ".detail-view",
+        ".detail-content",
         ".continue-block",
         ".understanding-heading",
         ".edit-entry-button",
-        ".edit-dialog",
+        ".detail-block",
         ".edit-surface",
         ".supplemental-grid",
         ".advanced-block",
+        ".settings-section",
     ]:
         assert selector in styles
 

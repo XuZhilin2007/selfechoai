@@ -441,11 +441,10 @@ test("differing stale Draft keeps Blob and requires explicit text choice", async
 test("Current Capture Voice Segment audio player preloads media metadata, not none", () => {
   const markupBody = frontendSource.split("function voiceAudioMarkup", 2)[1]
     .split("function renderCapture", 1)[0];
-  assert.match(markupBody, /<audio class="voice-audio" controls preload="metadata"/);
-  assert.doesNotMatch(markupBody, /preload="none"/);
+  assert.doesNotMatch(markupBody, /<audio class="voice-audio" controls preload="none"/);
   const currentCaptureRendering = frontendSource.split("function renderVoiceSegments", 2)[1]
     .split("function renderRevisionConflict", 1)[0];
-  assert.match(currentCaptureRendering, /voiceAudioMarkup\(segment\.id/);
+  assert.match(currentCaptureRendering, /voiceAudioMarkup\(segment\.id[^\n]*\{ preload: "metadata" \}/);
 });
 
 test("Discard pending blocks duplicates and restores after success or exception", async () => {

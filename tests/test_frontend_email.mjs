@@ -98,14 +98,14 @@ test("no-address state prefills login identity but explains verification", () =>
   context.__renderEmailSettings(settings());
   assert.equal(badge.textContent, "未设置");
   assert.match(controls.innerHTML, /value="login@example\.com"/);
-  assert.match(controls.innerHTML, /修改地址后会暂停实际发送/);
+  assert.match(controls.innerHTML, /修改地址后，邮件提醒会暂停/);
   assert.doesNotMatch(controls.innerHTML, /email-enabled-toggle/);
 });
 
 test("disabled provider is explained without exposing configuration", () => {
   const { context, controls } = createHarness();
   context.__renderEmailSettings(settings({ provider_available: false }));
-  assert.match(controls.innerHTML, /尚未配置邮件服务/);
+  assert.match(controls.innerHTML, /邮件提醒服务尚未配置/);
   assert.doesNotMatch(controls.innerHTML, /Secret|TemplateID|ap-guangzhou/);
 });
 
@@ -129,7 +129,7 @@ test("verified ON and OFF remain distinct account-level states", () => {
     enabled: false,
   }));
   assert.equal(badge.textContent, "已关闭");
-  assert.match(controls.innerHTML, /Email Reminder 意愿 OFF/);
+  assert.match(controls.innerHTML, /邮件提醒已关闭/);
   assert.match(controls.innerHTML, /开启邮件提醒/);
 
   context.__renderEmailSettings(settings({
@@ -138,9 +138,9 @@ test("verified ON and OFF remain distinct account-level states", () => {
     enabled: true,
     effective_active: true,
   }));
-  assert.equal(badge.textContent, "已生效");
+  assert.equal(badge.textContent, "已开启");
   assert.equal(badge.dataset.kind, "success");
-  assert.match(controls.innerHTML, /Email Reminder 意愿 ON/);
+  assert.match(controls.innerHTML, /邮件提醒已开启/);
 });
 
 test("unhealthy state requires a different address and disables normal delivery", () => {
@@ -154,7 +154,7 @@ test("unhealthy state requires a different address and disables normal delivery"
   }));
   assert.equal(badge.textContent, "已暂停");
   assert.equal(badge.dataset.kind, "error");
-  assert.match(controls.innerHTML, /请更换并验证其他邮箱/);
+  assert.match(controls.innerHTML, /需要更换并验证其他邮箱/);
   assert.doesNotMatch(controls.innerHTML, /email-enabled-toggle/);
 });
 
@@ -166,7 +166,7 @@ test("missing dedicated template leaves truthful disabled test capability", () =
     enabled: true,
   }));
   assert.match(controls.innerHTML, /id="email-test-button"[^>]*disabled/);
-  assert.match(controls.innerHTML, /专用测试模板未配置/);
+  assert.match(controls.innerHTML, /当前未提供测试邮件/);
   assert.doesNotMatch(controls.innerHTML, /你已收到/);
 });
 
@@ -182,8 +182,12 @@ test("frontend uses fixed Email APIs and preserves device-scoped Push copy", () 
     assert.ok(frontendSource.includes(endpoint));
   }
   assert.ok(frontendSource.includes("此设备通知"));
-  assert.ok(frontendSource.includes("账户级可选邮件提醒，与此设备的 Web Push 独立"));
+  assert.ok(frontendSource.includes("邮件提醒与当前设备的系统通知彼此独立"));
   assert.ok(frontendSource.includes("SelfEcho 内提醒仍然可用"));
+  assert.ok(
+    !frontendSource.includes("无法作为可靠的提醒方式"),
+    "Hosted-Service push-reliability claim must stay out of Community Edition",
+  );
   assert.ok(frontendSource.includes('headers.set("X-CSRF-Token", csrfToken)'));
   assert.ok(!frontendSource.includes("magic login"));
   assert.ok(!frontendSource.includes("intent://"));

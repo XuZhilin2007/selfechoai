@@ -395,7 +395,7 @@ def create_ai_service(settings: Settings) -> AIService:
         if settings.deepseek_model in DeepSeekProvider.RETIRED_MODEL_ALIASES:
             return MisconfiguredAIService(
                 f"retired DeepSeek model alias: {settings.deepseek_model}",
-                "DeepSeek 模型名已退役：请使用 deepseek-v4-flash，"
+                "DeepSeek 模型名已退役：请使用 deepseek-flash，"
                 "不要使用 deepseek-chat 或 deepseek-reasoner。",
             )
         return DeepSeekProvider(

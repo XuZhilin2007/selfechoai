@@ -9,7 +9,7 @@ def test_account_email_ui_is_local_and_does_not_change_deep_link_security():
     service_worker = (ROOT / "app" / "static" / "service-worker.js").read_text(
         encoding="utf-8"
     )
-    assert "Email Reminder" in frontend
+    assert "邮件提醒" in frontend
     assert "此设备通知" in frontend
     assert "/api/email-reminders/settings" in frontend
     assert "safeLoginDestination" in frontend

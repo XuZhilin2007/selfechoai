@@ -122,14 +122,25 @@ async function dispatchClick(harness, targetPath) {
   return closed;
 }
 
-test("v0.6 cache revision precaches only shell assets and removes old cache", async () => {
-  const currentCache = "selfecho-ai-community-v0.6";
-  const previousCache = "selfecho-ai-reminder-v0.1-stage3b-3";
+test("v0.7 cache revision precaches only shell assets and removes old cache", async () => {
+  const currentCache = "selfecho-ai-community-v0.7.0-ui-1";
+  const previousCache = "selfecho-ai-community-v0.6";
   const harness = createHarness({ cacheKeys: [previousCache, currentCache] });
 
   await dispatchLifecycle(harness, "install");
   assert.deepEqual(harness.cacheLifecycle.opened, [currentCache]);
-  assert.equal(harness.cacheLifecycle.shells[0].includes("/static/app.js"), true);
+  assert.equal(
+    harness.cacheLifecycle.shells[0].includes("/static/app.js?v=0.7.0-community-ui-1"),
+    true,
+  );
+  assert.equal(
+    harness.cacheLifecycle.shells[0].includes("/static/styles.css?v=0.7.0-community-ui-1"),
+    true,
+  );
+  assert.equal(
+    harness.cacheLifecycle.shells[0].some((entry) => entry.includes("public-security-filing")),
+    false,
+  );
   assert.equal(harness.cacheLifecycle.shells[0].some((entry) => entry.startsWith("/api/")), false);
   assert.equal(harness.cacheLifecycle.skipWaiting, 1);
 

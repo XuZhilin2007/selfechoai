@@ -176,6 +176,48 @@ def test_existing_manual_reminder_wins_over_later_ai_candidate(client_factory):
     assert detail["reminder"]["remind_at"] == manual.json()["remind_at"]
 
 
+@pytest.mark.parametrize(
+    ("original_text", "temporal_expression", "expected"),
+    [
+        (
+            "三点钟提醒我继续看这份材料",
+            "三点钟",
+            datetime(2099, 8, 27, 7, 0, tzinfo=UTC),
+        ),
+        (
+            "明天中午12:30提醒我和同事吃饭",
+            "明天中午12:30",
+            datetime(2099, 8, 28, 4, 30, tzinfo=UTC),
+        ),
+    ],
+)
+def test_new_deterministic_clock_forms_schedule_without_losing_source_expression(
+    client_factory,
+    original_text,
+    temporal_expression,
+    expected,
+):
+    client = client_factory(
+        FunctionAIService(
+            lambda text, existing: extraction(
+                "确定时间的提醒",
+                reminder_intent=True,
+                temporal_expression=temporal_expression,
+            )
+        )
+    )
+    client.app.state.processor.now_provider = lambda: FUTURE_REFERENCE
+
+    captured, dashboard_item, detail = captured_item(client, original_text)
+
+    assert captured["original_text"] == original_text
+    assert detail["inputs"][0]["original_text"] == original_text
+    assert detail["reminder"]["status"] == "scheduled"
+    assert detail["reminder"]["source_expression"] == temporal_expression
+    assert datetime.fromisoformat(detail["reminder"]["remind_at"]) == expected
+    assert dashboard_item["show_reminder_prompt"] is False
+
+
 def test_item_and_reminder_write_roll_back_together(client_factory, monkeypatch):
     client = client_factory(
         FunctionAIService(

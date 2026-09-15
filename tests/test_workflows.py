@@ -546,6 +546,9 @@ def test_dashboard_filters_lifecycle_statuses_and_defaults_to_active(
         if status != "active":
             assert dashboard["pending_inputs"] == []
             assert dashboard["failed_inputs"] == []
+            assert dashboard["needs_confirmation"] == []
+            assert all(item["priority_score"] is None for item in returned_items)
+            assert all(item["reminder"] is None for item in returned_items)
 
     restored = client.patch(
         f"/api/items/{item_ids['回收事项']}", json={"status": "active"}
@@ -582,7 +585,10 @@ def test_pwa_routes_and_health_start(client_factory):
     assert service_worker.status_code == 200
     assert service_worker.headers["content-type"].startswith("text/javascript")
     assert service_worker.headers["cache-control"] == "no-cache"
-    assert "selfecho-ai-community-v0.6" in service_worker.text
+    assert "selfecho-ai-community-v0.7.0-ui-1" in service_worker.text
+    assert "/static/app.js?v=0.7.0-community-ui-1" in shell
+    assert "/static/styles.css?v=0.7.0-community-ui-1" in shell
+    assert "public-security-filing" not in service_worker.text
     frontend = client.get("/static/app.js").text
     assert "<h1>先记下来</h1>" in frontend
     assert 'class="visually-hidden" for="capture-text">记录内容</label>' in frontend
@@ -591,8 +597,8 @@ def test_pwa_routes_and_health_start(client_factory):
     assert "这次想到什么？" not in frontend
     assert 'button.textContent = "保存中…"' in frontend
     assert "尚未保存，输入仍保留" in frontend
-    assert "✓ 已保存" in frontend
-    assert "AI 正在后台整理" in frontend
+    assert '<strong>已保存</strong><span>正在整理</span>' in frontend
+    assert "AI 正在后台整理" not in frontend
     assert "重新整理" in frontend
     assert "永久删除" in frontend
     assert "window.confirm" in frontend
@@ -603,33 +609,26 @@ def test_pwa_routes_and_health_start(client_factory):
     assert "function detailRefreshBlocked()" in frontend
     assert "automatic && detailRefreshBlocked()" in frontend
     assert 'form.dataset.dirty = "true"' in frontend
-    assert '"#trash-confirm-dialog[open], #edit-dialog[open]"' in frontend
+    assert '"#edit-dialog[open], #reminder-dialog[open]"' in frontend
     assert "状态已更新；当前未提交输入已保留。" in frontend
     assert 'const selectedStatus = selectedDashboardStatus();' in frontend
-    assert 'api(`/api/items?status=${encodeURIComponent(selectedStatus)}`)' in frontend
-    for label in ["当前", "已完成", "回收站"]:
+    assert "&page=${requestedPage}" in frontend
+    for label in ["当前", "历史", "回收站"]:
         assert label in frontend
     assert "archived" not in frontend
     assert "已归档" not in frontend
-    assert "确定将这个事项移入回收站吗？之后仍可以从回收站恢复。" in frontend
-    assert 'value="cancel"' in frontend
-    assert 'value="confirm"' in frontend
+    assert "确定将这个事项移入回收站吗？之后仍可以从回收站恢复。" not in frontend
+    assert 'id="edit-status"' not in frontend
     lifecycle_handler = frontend.split(
         'document.querySelectorAll(".lifecycle-status-button")', 1
     )[1].split('const deleteButton = document.querySelector', 1)[0]
-    confirmation_guard = (
-        'if (nextStatus === "trash" && !(await confirmTrashMove())) return;'
-    )
-    assert confirmation_guard in lifecycle_handler
-    assert lifecycle_handler.index(confirmation_guard) < lifecycle_handler.index(
-        "button.disabled = true"
-    )
-    assert lifecycle_handler.index(confirmation_guard) < lifecycle_handler.index(
-        'api(`/api/items/${itemId}`'
-    )
+    assert "confirmTrashMove" not in lifecycle_handler
+    assert "window.confirm" not in lifecycle_handler
+    assert "确认永久删除这个事项及其原始记录吗" in frontend
     styles = client.get("/static/styles.css").text
     assert "#capture-text" in styles
-    assert "--shell-width: 920px" in styles
+    assert "--shell-width:" in styles
+    assert "--capture-width:" in styles
     assert ".capture-view" in styles
     assert ":where(a, button):focus-visible" in styles
     assert "min-height: 48px" in styles

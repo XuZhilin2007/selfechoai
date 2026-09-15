@@ -59,6 +59,57 @@ def test_relative_duration_suffixes_resolve_to_the_same_instant(duration, expect
 
 
 @pytest.mark.parametrize(
+    ("now_utc", "expected"),
+    [
+        (
+            datetime(2026, 8, 27, 6, 20, tzinfo=UTC),
+            datetime(2026, 8, 27, 7, 0, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 8, 27, 8, 0, tzinfo=UTC),
+            datetime(2026, 8, 27, 19, 0, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 8, 26, 18, 30, tzinfo=UTC),
+            datetime(2026, 8, 26, 19, 0, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 8, 27, 7, 0, tzinfo=UTC),
+            datetime(2026, 8, 27, 19, 0, tzinfo=UTC),
+        ),
+    ],
+)
+def test_time_only_without_daypart_chooses_the_nearest_strict_future_occurrence(
+    now_utc,
+    expected,
+):
+    result = parse("三点钟", now_utc=now_utc)
+
+    assert result.remind_at == expected
+    assert not result.needs_confirmation
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("3点", datetime(2026, 8, 27, 7, 0, tzinfo=UTC)),
+        ("三点", datetime(2026, 8, 27, 7, 0, tzinfo=UTC)),
+        ("三点钟", datetime(2026, 8, 27, 7, 0, tzinfo=UTC)),
+        ("三点半", datetime(2026, 8, 27, 7, 30, tzinfo=UTC)),
+        ("三点10分", datetime(2026, 8, 27, 7, 10, tzinfo=UTC)),
+        ("15:30", datetime(2026, 8, 27, 7, 30, tzinfo=UTC)),
+    ],
+)
+def test_time_only_clock_grammar_remains_deliberately_small(expression, expected):
+    result = parse(
+        expression,
+        now_utc=datetime(2026, 8, 27, 6, 20, tzinfo=UTC),
+    )
+
+    assert result.remind_at == expected
+
+
+@pytest.mark.parametrize(
     ("expression", "expected"),
     [
         ("明天", datetime(2026, 8, 28, 1, 0, tzinfo=UTC)),
@@ -75,6 +126,9 @@ def test_relative_duration_suffixes_resolve_to_the_same_instant(duration, expect
         ("8月30日下午3点", datetime(2026, 8, 30, 7, 0, tzinfo=UTC)),
         ("8月30日15点", datetime(2026, 8, 30, 7, 0, tzinfo=UTC)),
         ("8月30日晚上8点", datetime(2026, 8, 30, 12, 0, tzinfo=UTC)),
+        ("明天12:30", datetime(2026, 8, 28, 4, 30, tzinfo=UTC)),
+        ("明天中午12:30", datetime(2026, 8, 28, 4, 30, tzinfo=UTC)),
+        ("8月30日12:30", datetime(2026, 8, 30, 4, 30, tzinfo=UTC)),
     ],
 )
 def test_calendar_expressions_resolve_in_user_timezone(expression, expected):
@@ -139,6 +193,64 @@ def test_dst_gap_and_fold_are_not_guessed(expression, reason):
 
     assert result.needs_confirmation
     assert result.unresolved_reason == reason
+
+
+@pytest.mark.parametrize(
+    ("expression", "now_utc", "reason"),
+    [
+        (
+            "2点钟",
+            datetime(2026, 3, 8, 6, 0, tzinfo=UTC),
+            "nonexistent_local_time",
+        ),
+        (
+            "1点30分",
+            datetime(2026, 11, 1, 4, 0, tzinfo=UTC),
+            "ambiguous_local_time",
+        ),
+    ],
+)
+def test_time_only_dst_gap_and_fold_are_not_guessed(expression, now_utc, reason):
+    result = parse(
+        expression,
+        timezone_name="America/New_York",
+        now_utc=now_utc,
+    )
+
+    assert result.needs_confirmation
+    assert result.unresolved_reason == reason
+
+
+@pytest.mark.parametrize(
+    "now_utc",
+    [
+        datetime(2026, 11, 1, 5, 30, tzinfo=UTC),
+        datetime(2026, 11, 1, 5, 45, tzinfo=UTC),
+    ],
+)
+def test_time_only_fold_stays_ambiguous_while_any_occurrence_is_strictly_future(
+    now_utc,
+):
+    result = parse(
+        "1点30分",
+        timezone_name="America/New_York",
+        now_utc=now_utc,
+    )
+
+    assert result.needs_confirmation
+    assert result.remind_at is None
+    assert result.unresolved_reason == "ambiguous_local_time"
+
+
+def test_time_only_fold_search_continues_after_both_occurrences_are_past():
+    result = parse(
+        "1点30分",
+        timezone_name="America/New_York",
+        now_utc=datetime(2026, 11, 1, 6, 45, tzinfo=UTC),
+    )
+
+    assert result.remind_at == datetime(2026, 11, 1, 18, 30, tzinfo=UTC)
+    assert not result.needs_confirmation
 
 
 @pytest.mark.parametrize(
