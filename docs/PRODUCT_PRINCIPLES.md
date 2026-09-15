@@ -31,7 +31,7 @@
 
 ## Current Release Boundary
 
-v0.6.0 提供 Capture、AI Structuring、事项生命周期管理、多用户认证隔离、Web/PWA 使用体验，以及作为当前辅助能力的一次性 Reminder。Reminder 可以手动创建，也可以由 AI 提取意图与时间表达后经应用确定性解析生成；歧义时间可以保持 `needs_confirmation` 状态，而不必被强行确定。Personal Item 不会被强制变成传统 Todo，Reminder 只辅助用户在合适的时间回看与行动。完成或回收事项会取消其活跃 Reminder；恢复事项不会复活已取消的 Reminder。
+v0.7.0 提供 Capture、AI Structuring、Current / History / Trash 事项生命周期、30 天回收站保留、批量生命周期操作（单次最多 100 项）、Dashboard 分页、多用户认证隔离、Quiet Utility Web/PWA 使用体验，以及作为当前辅助能力的一次性 Reminder。Reminder 可以手动创建，也可以由 AI 提取意图与时间表达后经应用确定性解析生成；新建 Reminder 默认「今天」，歧义时间可以保持 `needs_confirmation` 状态，而不必被强行确定。Personal Item 不会被强制变成传统 Todo，Reminder 只辅助用户在合适的时间回看与行动。完成或回收事项会取消其活跃 Reminder；恢复事项不会复活已取消的 Reminder。History 如实表达完成时间：legacy 完成事项没有真实完成时间时保持未知，不会伪造。
 
 可选 Web Push 与 Email Reminder 是彼此独立、显式的外部渠道，不存在隐藏 fallback；渠道 eligibility 在 Reminder 第一次进入 due lifecycle 时确定，不是 AI 决策，也不是每条 Reminder 的隐式选择。Email 默认关闭，只在用户设置并验证独立 Reminder Email、自托管者配置 Tencent SES、且 Reminder worker 已启用时参与定时投递。任何外部渠道不可用都不改变应用内 due Reminder 的存在与展示。
 

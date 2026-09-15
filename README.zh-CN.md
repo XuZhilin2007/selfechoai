@@ -4,7 +4,7 @@
 
 SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Personal Items，同时保留原始输入和用户的最终决策权。AI 负责提取与组织信息，不替用户决定重要性、计划或行动。
 
-**Status:** Community Edition 0.6.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.7.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
@@ -18,24 +18,30 @@ SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Person
 
 - Capture 与原始输入先保存
 - DeepSeek/OpenAI AI Structuring
-- Personal Item Dashboard、Detail 与生命周期管理
-- 一次性 Reminder：可手动创建，也可由 AI 从自然语言提取意图与时间表达，并按用户时区确定性解析；歧义时间表达会停留在 `needs_confirmation` 状态
+- Personal Item Dashboard 提供 Current / History / Trash 生命周期视图、批量选择（单次最多 100 项）与分页，分页大小与单次原子批量操作一致
+- 30 天回收站保留与嵌入式 retention worker；回收站恢复会回到已知来源状态，来源未知的 legacy 事项回到 Current
+- 如实的完成时间：History 显示真实 `completed_at`，没有真实时间的 legacy 完成事项保持「完成时间未知」
+- Quiet Utility 界面基础：以排版与层级组织内容、每个上下文一个主动作、可逆生命周期操作不做多余确认，触屏/触控笔长按进入选择并提供键盘可达的替代入口
+- 一次性 Reminder：可手动创建，也可由 AI 从自然语言提取意图与时间表达，并按用户时区确定性解析；新建 Reminder 默认「今天」，歧义时间表达会停留在 `needs_confirmation` 状态
 - 应用内 due 回退，即使不配置任何通知，Reminder 依然可用
+- Capture 页轻量 Upcoming Reminders 列表（约最近 3 条未到期的 Reminder）
 - 可选 Web Push（默认关闭）：使用自托管者自己的 VAPID 密钥、浏览器订阅生命周期、Service Worker 送达，以及用于定时投递的嵌入式 Reminder worker
 - 可选 Email Reminder（默认关闭）：通过自托管者配置的 Tencent SES 发送，包含邮箱所有权验证、独立的账户级渠道与可选 Test Email
 - 可选 Voice Capture（默认关闭）：按住录音、上滑取消，转写文本追加到可编辑的 Capture Draft，失败片段可显式重试或删除
 - Capture/Voice 正确性修复：覆盖并发 discard 操作与如实的失败片段提示
-- 移动端优先的 Web/PWA 界面
+- 移动端优先的 Web/PWA 界面，带版本化静态资源与一致的 Service Worker cache revision
 - Login、Logout、服务端 Session 与 CSRF 防护
 - 默认关闭注册和可选 Invite registration
 - Multi-user 数据所有权隔离
-- SQLite schema v6；已有 v0.5 数据库必须显式执行 v5→v6 迁移
+- SQLite schema v7；已有 v0.6 数据库必须显式执行 v6→v7 迁移
 
 Planner、日历集成和自治 Agent 尚未实现。
 
 ## Reminder 语义
 
 - AI 只提取 Reminder 意图和时间表达；实际时间由应用按用户时区和默认提醒时间确定性解析。
+- 新建 Reminder 默认「今天」；编辑已有 Reminder 始终加载真实保存的日期与时间。
+- 确定性语法支持常见中文时间表达，例如 `三点钟`、`明天中午12:30` 与 `HH:MM` 时间（含中文数字小时）；夏令时的歧义或不存在本地时间不会被猜测。
 - 歧义的时间表达可以保持 `needs_confirmation` 状态，等用户确认或修改，AI 不替用户猜。
 - 完成或回收事项会取消其活跃 Reminder；恢复事项不会复活已取消的 Reminder。
 - Reminder 都是一次性的，不支持循环提醒。
@@ -60,7 +66,7 @@ Email Reminder 是与 Web Push 并列的可选 first-class Reminder channel。�
 
 ### Tencent SES 配置
 
-Community Edition v0.6.0 首发只正式支持 Tencent SES。自托管者自行负责 Tencent Cloud 账户、SES 开通、已验证 sender identity、凭据、模板、网络访问、费用与部署所需合规事项。需要准备：
+Community Edition 正式支持 Tencent SES 作为 Email provider。自托管者自行负责 Tencent Cloud 账户、SES 开通、已验证 sender identity、凭据、模板、网络访问、费用与部署所需合规事项。需要准备：
 
 - 已开通 SES 的 Tencent Cloud 账户；
 - 已验证的发信身份；
@@ -111,7 +117,7 @@ Verification template 精确接收：
 
 验证邮件会向 Tencent 发送 recipient Email、verification code 与技术性 Provider metadata。普通 Reminder 会发送 recipient Email、通用 Reminder subject/content、通用应用/Dashboard URL 与技术性 Provider metadata。普通邮件**不会**发送 Personal Item title/body、原始 Capture 内容、item ID、reminder ID 或事项专属直达链接。
 
-自托管数据库会保存当前 Reminder Email、验证状态与 challenge metadata、包含 destination snapshot 的 durable delivery ledger，以及 Provider message/status metadata。Raw verification code 不会持久化；数据库只保存使用 `EMAIL_VERIFICATION_CODE_PEPPER` 派生的 HMAC。账户删除遵循应用现有数据生命周期；v0.6.0 不声称已有 remove-address、自动 retention、自动 challenge cleanup 或独立 GDPR 删除子系统。
+自托管数据库会保存当前 Reminder Email、验证状态与 challenge metadata、包含 destination snapshot 的 durable delivery ledger，以及 Provider message/status metadata。Raw verification code 不会持久化；数据库只保存使用 `EMAIL_VERIFICATION_CODE_PEPPER` 派生的 HMAC。账户删除遵循应用现有数据生命周期；Community Edition 不声称已有 remove-address、自动 retention、自动 challenge cleanup 或独立 GDPR 删除子系统。
 
 ### 验证与投递语义
 
@@ -249,7 +255,7 @@ Local HTTP 使用 `selfecho_session`。HTTPS deployment 必须把 `APP_ORIGIN` �
 ```text
 AI_PROVIDER=deepseek
 DEEPSEEK_API_KEY=
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MODEL=deepseek-flash
 DEEPSEEK_API_URL=https://api.deepseek.com
 ```
 
@@ -274,34 +280,37 @@ AI_MODEL=
 - Reminder Email、验证/challenge metadata、delivery destination snapshot 与 Provider status metadata 保存在 SQLite；不保存 raw verification code
 - `.env`、`data/`、`*.db`、WAL/SHM 和日志均被 Git 忽略
 - Community Edition 不附带 Production 数据或从真实数据生成的 seed
-- 空数据库会直接初始化为 schema v6
+- 空数据库会直接初始化为 schema v7
 
 不要把数据库、备份、日志或包含个人内容的截图提交到 Git。
 
-## 从 v0.5.0 升级
+## 从 v0.6.0 升级
 
-v0.5.0 数据库使用 schema v5，v0.6.0 使用 schema v6。**v0.6.0 不会自动迁移 v0.5 数据库。** 新 runtime 遇到 schema v5 会 fail closed，并要求 operator 显式迁移。
+v0.6.0 数据库使用 schema v6，v0.7.0 使用 schema v7。**v0.7.0 不会自动迁移 v0.6 数据库。** 新 runtime 遇到 schema v6 会 fail closed，并要求 operator 显式迁移。
 
 1. 停止 application/service，确认没有进程仍在使用数据库。
 2. 为数据库文件以及实际存在的 WAL/SHM 伴生文件创建经过验证、可恢复的备份。
 3. 可选：针对实际配置的数据库路径运行只读 preflight：
 
 ```bash
-python -m app.migrations.v006_email_reminders --database data/selfecho.db --check-only
+python -m app.migrations.v007_item_lifecycle --database data/selfecho.db --check-only
 ```
 
-4. 执行显式 v5→v6 迁移：
+4. 执行显式 v6→v7 迁移：
 
 ```bash
-python -m app.migrations.v006_email_reminders --database data/selfecho.db
+python -m app.migrations.v007_item_lifecycle --database data/selfecho.db
 ```
 
-5. 按提示输入精确确认文字 `MIGRATE PUBLIC V5 TO V6`。迁移在单一 transaction 内执行，并检查旧表行数守恒、schema 结构、foreign key 与 SQLite integrity。
-6. 只有迁移报告成功后，才重启 v0.6.0 应用。
-7. 确认应用启动接受 schema v6，已有数据与 Account 页面均可正常加载。
-8. 完成上述步骤后，才按需配置并开启 Tencent SES Email Reminder。
+5. 按提示输入精确确认文字 `MIGRATE PUBLIC V6 TO V7`。迁移在单一 transaction 内执行，并检查旧表行数守恒、lifecycle 元数据策略、schema 结构、foreign key 与 SQLite integrity。legacy 回收站事项会获得全新的 30 天保留期；legacy 完成事项不会写入任何虚构的完成时间。
+6. 只有迁移报告成功后，才重启 v0.7.0 应用。
+7. 确认应用启动接受 schema v7，已有数据与 Account 页面均可正常加载。
 
-全新 v0.6.0 安装会直接创建 schema v6，不需要先创建或迁移 schema v5。更旧数据库仍须顺序迁移：schema v4 先通过 `python -m app.migrations.v005_voice_capture` 升到 v5，再按上述步骤升到 v6；schema v3 还须先通过 `python -m app.migrations.v004_reminders` 升到 v4。
+全新 v0.7.0 安装会直接创建 schema v7，不需要先创建或迁移 schema v6。更旧数据库仍须顺序迁移：schema v4 先通过 `python -m app.migrations.v005_voice_capture` 升到 v5，再通过 `python -m app.migrations.v006_email_reminders` 升到 v6，然后按上述步骤升到 v7；schema v3 还须先通过 `python -m app.migrations.v004_reminders` 升到 v4。
+
+## 从 v0.5.0 升级
+
+v0.5.0 数据库使用 schema v5，v0.6.0 使用 schema v6。请使用 `python -m app.migrations.v006_email_reminders`，按上述相同的停写、备份、`--check-only` 与精确确认文字流程迁移 v5→v6（确认文字 `MIGRATE PUBLIC V5 TO V6`），然后继续执行 v6→v7 迁移。
 
 ## Tests
 
@@ -309,7 +318,7 @@ python -m app.migrations.v006_email_reminders --database data/selfecho.db
 python -m pytest
 ```
 
-测试覆盖 Capture、原始输入持久化、DeepSeek/OpenAI 模拟响应、Authentication、Session、CSRF、Invite、Migration、Multi-user isolation、Reminder、时间表达解析、Web Push 安全与订阅、Email 设置/验证/隐私/投递合同、Voice Capture 合同（草稿生命周期、转写、存储、删除 ledger）、PWA，以及 first-user bootstrap 和 local/production Cookie 行为。JavaScript 与 Service Worker 合同测试位于 `tests/*.mjs`，使用 Node 内置 test runner 运行。
+测试覆盖 Capture、原始输入持久化、DeepSeek/OpenAI 模拟响应、Authentication、Session、CSRF、Invite、Migration、Multi-user isolation、Reminder、时间表达解析、Current/History/Trash 生命周期、批量生命周期原子性、回收站保留、Web Push 安全与订阅、Email 设置/验证/隐私/投递合同、Voice Capture 合同（草稿生命周期、转写、存储、删除 ledger）、PWA，以及 first-user bootstrap 和 local/production Cookie 行为。JavaScript 与 Service Worker 合同测试位于 `tests/*.mjs`，使用 Node 内置 test runner 运行。
 
 ## Current Limitations
 
@@ -330,7 +339,7 @@ python -m pytest
 Vanilla JavaScript PWA (含 Service Worker push 处理)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite (schema v6)
+          ├── SQLite (schema v7)
           ├── DeepSeek / OpenAI provider abstraction
           ├── 可选 Voice Capture → 外部 Voice 存储 → Alibaba ASR
           └── 可选嵌入式 Reminder worker
@@ -340,7 +349,7 @@ FastAPI + Uvicorn
 
 核心产品原则是：原始输入不能丢失；未知信息保持未知；AI 只整理信息，用户始终是最终决策者。
 
-更完整的组件、数据流、认证、多用户隔离、Reminder channel/worker、PWA Cache 和 Provider 边界说明见 [Architecture](docs/ARCHITECTURE.md)，稳定产品边界见 [Product Principles](docs/PRODUCT_PRINCIPLES.md)。Release Candidate 说明见 [Community Edition v0.6.0 Release Notes](docs/RELEASE_NOTES_v0.6.0.md)。
+更完整的组件、数据流、认证、多用户隔离、Reminder channel/worker、PWA Cache 和 Provider 边界说明见 [Architecture](docs/ARCHITECTURE.md)，稳定产品边界见 [Product Principles](docs/PRODUCT_PRINCIPLES.md)，界面基础见 [UI/UX Foundation](docs/UI_UX_FOUNDATION.md)。Release Candidate 说明见 [Community Edition v0.7.0 Release Notes](docs/RELEASE_NOTES_v0.7.0.md)。
 
 ## Security and Contributing
 

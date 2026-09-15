@@ -1,6 +1,6 @@
 # SelfEcho AI Architecture
 
-本文描述 Community Edition v0.6.0 的当前实现，不代表托管服务的基础设施设计。
+本文描述 Community Edition v0.7.0 的当前实现，不代表托管服务的基础设施设计。
 
 ## System Overview
 
@@ -16,13 +16,14 @@ FastAPI application
         ├── Voice Capture / transcription APIs（可选，默认关闭）
         ├── Background AI processing
         ├── 可选嵌入式 Reminder worker（定时 due 扫描 + Push / Email 投递）
-        ├── SQLite schema v6
+        ├── 嵌入式 Trash retention worker（30 天回收站过期清理）
+        ├── SQLite schema v7
         ├── 可选 Tencent SES Email Provider boundary
         ├── 可选外部 Voice 存储 + Alibaba ASR boundary
         └── DeepSeek or OpenAI provider boundary
 ~~~
 
-- app/main.py 组装 FastAPI、生命周期、API、静态文件、PWA 路由和可选的嵌入式 Reminder worker。
+- app/main.py 组装 FastAPI、生命周期、API、静态文件、PWA 路由、可选的嵌入式 Reminder worker 与 Trash retention worker。
 - app/repository.py 处理 Personal Item 与原始输入持久化，并在事项完成/回收时取消活跃 Reminder。
 - app/reminder_repository.py、app/reminder_routes.py 和 app/services/reminders.py 处理 Reminder 状态、生命周期与查询。
 - app/services/temporal_parser.py 负责时间表达的确定性解析；app/time_utils.py 处理 IANA 时区校验与 UTC 序列化。
@@ -184,23 +185,31 @@ Email delivery 真正出站前会两次按当前数据重新检查 destination �
 - Email 每次投递记录在 `reminder_email_deliveries`；发送前重新验证 destination 与账户/事项/Reminder 状态，只对明确 retryable 的 pre-acceptance failure 做有限重试，并对 accepted message 做有限状态对账。Ambiguous result 进入 `unknown` 而不盲目重发。
 - worker 未启用时，应用访问触发的惰性 due 转移和应用内 fallback 仍然可用；但不会执行 scheduled Push 或 Email。任何一个外部渠道不可用都不会触发另一个渠道。
 
+## Trash Retention
+
+- Trash 是可恢复的二级管理区；`TRASH_RETENTION_DAYS = 30`，过期项由嵌入式 retention worker 分批永久删除，batch 大小由 `TRASH_RETENTION_BATCH_SIZE`（默认 100，上限 500）约束。
+- purge 以数据库为先：行删除提交后，才通过现有 Voice deletion ledger 追溯清理物理音频；失败会保留在 ledger 中按既有机制重试。
+- 永久删除始终需要事项处于 Trash 状态；批量 `POST /api/items/bulk-lifecycle` 单次最多 100 项并要求 CSRF，动作覆盖 complete / restore_to_current / move_to_trash / restore_from_trash / permanently_delete。
+
 ## Database and Migration
 
 - 默认数据库是 data/selfecho.db。
 - SQLite 启用 foreign_keys、busy_timeout 和 WAL。
-- 新空数据库直接初始化为 schema v6。
+- 新空数据库直接初始化为 schema v7。
 - 应用启动只验证已有数据库版本和必需结构，不执行隐式升级；遇到不支持的旧版本会拒绝启动并提示显式迁移。
-- schema v6 在 v5 基础上新增 `email_reminder_settings`（账户 Email 设置）、`email_verification_challenges`（验证 challenge 与 HMAC）和 `reminder_email_deliveries`（包含 destination snapshot 与 Provider 状态的 durable ledger）。`CURRENT_SCHEMA_VERSION = 6`。
+- schema v7 在 v6 的 `personal_items` 上新增 `completed_at`、`trashed_at` 与 `status_before_trash`（CHECK 限定 active/completed），并新增 `idx_personal_items_lifecycle` 与 `idx_personal_items_trash_retention` 索引。`CURRENT_SCHEMA_VERSION = 7`；`SCHEMA_V6_VERSION = 6` 供 v006 迁移引用。
+- app/migrations/v007_item_lifecycle.py 提供显式 v6→v7 迁移：`--check-only` 只读预检；正式迁移要求应用已停止、存在经过验证且可恢复的 v6 备份，并输入精确文字 `MIGRATE PUBLIC V6 TO V7`。迁移在单一 transaction 中新增生命周期列与索引，为 legacy Trash 写入迁移时刻作为 `trashed_at`（全新 30 天保留期），legacy 完成事项保持 `completed_at = NULL`，并验证行数守恒、lifecycle 策略、schema、foreign key 与 integrity。
+- schema v6 在 v5 基础上新增 `email_reminder_settings`（账户 Email 设置）、`email_verification_challenges`（验证 challenge 与 HMAC）和 `reminder_email_deliveries`（包含 destination snapshot 与 Provider 状态的 durable ledger）。
 - app/migrations/v006_email_reminders.py 提供显式 v5→v6 迁移：`python -m app.migrations.v006_email_reminders --database data/selfecho.db --check-only` 做只读预检；正式迁移去掉 `--check-only`，要求应用已停止、存在经过验证且可恢复的备份，并输入精确文字 `MIGRATE PUBLIC V5 TO V6`。迁移在单一 transaction 中创建三个新表与索引，同时验证旧表行数、schema、foreign key 与 integrity。
 - app/migrations/v005_voice_capture.py 提供显式的 v4→v5 迁移：`--check-only` 只读预检；正式迁移要求停止使用且已备份的数据库、输入 `MIGRATE V4 TO V5` 确认文字、单事务执行，并通过迁移后行数守恒、schema 结构、foreign key 和 integrity 检查。
-- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。旧数据库必须顺序迁移 v3→v4→v5→v6，不存在跨版本直达路径。
+- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。旧数据库必须顺序迁移 v3→v4→v5→v6→v7，不存在跨版本直达路径。
 - app/migrations/v003_auth.py 保留通用的 v2 到 v3 显式迁移实现，属于历史兼容层。
 
 Voice Original Audio 存储在 `VOICE_STORAGE_ROOT` 指定的外部目录，不在 SQLite 内；数据库迁移不涉及也不重建历史音频文件。数据库、Voice 存储、WAL/SHM、备份和真实数据不属于公开发行物。
 
 ## PWA and Caching
 
-FastAPI 同源提供 API、静态资源和单页应用入口。Service Worker 使用 `selfecho-ai-community-v0.6` cache namespace，只缓存 App Shell：HTML、CSS、JavaScript、Manifest 和图标；以 /api/ 开头的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
+FastAPI 同源提供 API、静态资源和单页应用入口。静态资源通过 `?v=0.7.0-community-ui-1` 版本化引用；Service Worker 使用 `selfecho-ai-community-v0.7.0-ui-1` cache namespace（opaque cache revision，不是产品版本号），只缓存 App Shell：HTML、版本化 CSS 与 JavaScript、Manifest 和图标；以 /api/ 开头或非 GET 的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
 
 登录用户的 Capture 草稿临时保存在 sessionStorage，并按用户区分。认证状态和私有事项不写入 Service Worker Cache。Service Worker 文件自身以 no-cache 响应，便于更新缓存版本。
 

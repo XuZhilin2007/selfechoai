@@ -328,9 +328,9 @@ def main(
             return 0
         output_fn("A validated, recoverable schema v6 backup is required.")
         confirmation = input_fn(
-            'Type "MIGRATE V6 TO V7" to execute the transaction: '
+            'Type "MIGRATE PUBLIC V6 TO V7" to execute the transaction: '
         ).strip()
-        if confirmation != "MIGRATE V6 TO V7":
+        if confirmation != "MIGRATE PUBLIC V6 TO V7":
             output_fn("Migration cancelled. No database changes were made.")
             return 2
         result = migrate_v6_to_v7(preflight.database_path)
