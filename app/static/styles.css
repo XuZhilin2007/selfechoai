@@ -2067,16 +2067,6 @@ details summary {
   width: auto;
 }
 
-.email-mainland-note {
-  padding: 12px 14px;
-  margin: 0;
-  color: var(--muted);
-  border-radius: var(--radius-control);
-  background: rgba(232, 233, 225, 0.58);
-  font-size: 0.85rem;
-  line-height: 1.55;
-}
-
 .notification-device-settings h2,
 .notification-onboarding h2 {
   margin-bottom: 6px;
