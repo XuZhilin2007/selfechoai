@@ -1,6 +1,6 @@
 # SelfEcho AI Architecture
 
-本文描述 Community Edition v0.7.0 的当前实现，不代表托管服务的基础设施设计。
+本文描述 Community Edition v0.8.0 的当前实现，不代表托管服务的基础设施设计。
 
 ## System Overview
 
@@ -17,7 +17,7 @@ FastAPI application
         ├── Background AI processing
         ├── 可选嵌入式 Reminder worker（定时 due 扫描 + Push / Email 投递）
         ├── 嵌入式 Trash retention worker（30 天回收站过期清理）
-        ├── SQLite schema v7
+        ├── SQLite schema v8
         ├── 可选 Tencent SES Email Provider boundary
         ├── 可选外部 Voice 存储 + Alibaba ASR boundary
         └── DeepSeek or OpenAI provider boundary
@@ -58,7 +58,28 @@ background provider call
 
 原始输入在 Provider 调用前提交。AI 失败不会删除输入；失败记录可重试。启动时，应用会恢复被中断的 processing 状态，并重新调度仍 pending 的输入。
 
-AI 输出通过 Pydantic schema 验证。Provider 只负责提取和组织信息；重要性、计划与最终行动仍由用户确认。向已有事项补充输入或重新整理时，服务会使用该事项的输入历史。
+AI 输出通过 Pydantic schema 验证。Importance / Urgency 是 retired legacy 字段：AI 不推断、不写入，也不询问；用户表述的后果、约束与时间压力作为事实上下文保留在 `extra_information`。计划与最终行动仍由用户确认。AI 的相对日期按用户 profile 时区计算的 `current_local_date` 做 grounding，不使用服务器本地日期。向已有事项补充输入或重新整理时，服务会使用该事项的输入历史。
+
+## Current Dashboard Ordering
+
+Current 列表的排序是确定性应用逻辑（app/priority.py），在分页之前执行：
+
+~~~text
+Pin（用户显式置顶，仅 active 事项）优先
+        ▼
+已过期：截止日晚者在前
+        ▼
+未到期：截止日早者在前（同一天内有时刻者先于纯日期）
+        ▼
+无截止日：创建时间新者在前
+        ▼
+id 升序稳定决序
+~~~
+
+- Deadline 保持输入精度：纯日期是浮动日历日期，naive datetime 是用户本地墙钟约定，带偏移的 datetime 是绝对 instant；排序与过期判定不改变持久化值（app/time_utils.py 的 `deadline_local_value` / `deadline_is_overdue`）。
+- 过期判定使用用户 profile 时区：纯日期与用户本地今天比较，aware 值按 instant 比较（含 DST 重复小时），naive 值按本地墙钟比较；等于当前时刻不算过期。
+- `priority_score` 恒为 `null`；weighted priority 评分模型已删除。
+- History 与 Trash 不参与该排序，仍按各自 lifecycle 时间排序。
 
 ## Voice Capture Flow（可选，默认关闭）
 
@@ -195,21 +216,23 @@ Email delivery 真正出站前会两次按当前数据重新检查 destination �
 
 - 默认数据库是 data/selfecho.db。
 - SQLite 启用 foreign_keys、busy_timeout 和 WAL。
-- 新空数据库直接初始化为 schema v7。
+- 新空数据库直接初始化为 schema v8。
 - 应用启动只验证已有数据库版本和必需结构，不执行隐式升级；遇到不支持的旧版本会拒绝启动并提示显式迁移。
-- schema v7 在 v6 的 `personal_items` 上新增 `completed_at`、`trashed_at` 与 `status_before_trash`（CHECK 限定 active/completed），并新增 `idx_personal_items_lifecycle` 与 `idx_personal_items_trash_retention` 索引。`CURRENT_SCHEMA_VERSION = 7`；`SCHEMA_V6_VERSION = 6` 供 v006 迁移引用。
+- schema v8 在 v7 的 `personal_items` 上新增 `is_pinned INTEGER NOT NULL DEFAULT 0 CHECK (is_pinned IN (0, 1))`。`CURRENT_SCHEMA_VERSION = 8`；`SCHEMA_V7_VERSION = 7` 供 v007 迁移与 v008 迁移的源版本校验引用。
+- app/migrations/v008_item_pin.py 提供显式 v7→v8 迁移：`--check-only` 只读预检；正式迁移要求应用已停止、存在经过验证且可恢复的 v7 备份，并输入精确文字 `MIGRATE PUBLIC V7 TO V8`。迁移在单一 transaction 中新增 Pin 列，验证行数守恒、历史事项全部未置顶、schema 结构（含 is_pinned boolean contract）、foreign key 与 integrity；任一步骤失败整体回滚。
+- schema v7 在 v6 的 `personal_items` 上新增 `completed_at`、`trashed_at` 与 `status_before_trash`（CHECK 限定 active/completed），并新增 `idx_personal_items_lifecycle` 与 `idx_personal_items_trash_retention` 索引。
 - app/migrations/v007_item_lifecycle.py 提供显式 v6→v7 迁移：`--check-only` 只读预检；正式迁移要求应用已停止、存在经过验证且可恢复的 v6 备份，并输入精确文字 `MIGRATE PUBLIC V6 TO V7`。迁移在单一 transaction 中新增生命周期列与索引，为 legacy Trash 写入迁移时刻作为 `trashed_at`（全新 30 天保留期），legacy 完成事项保持 `completed_at = NULL`，并验证行数守恒、lifecycle 策略、schema、foreign key 与 integrity。
 - schema v6 在 v5 基础上新增 `email_reminder_settings`（账户 Email 设置）、`email_verification_challenges`（验证 challenge 与 HMAC）和 `reminder_email_deliveries`（包含 destination snapshot 与 Provider 状态的 durable ledger）。
 - app/migrations/v006_email_reminders.py 提供显式 v5→v6 迁移：`python -m app.migrations.v006_email_reminders --database data/selfecho.db --check-only` 做只读预检；正式迁移去掉 `--check-only`，要求应用已停止、存在经过验证且可恢复的备份，并输入精确文字 `MIGRATE PUBLIC V5 TO V6`。迁移在单一 transaction 中创建三个新表与索引，同时验证旧表行数、schema、foreign key 与 integrity。
 - app/migrations/v005_voice_capture.py 提供显式的 v4→v5 迁移：`--check-only` 只读预检；正式迁移要求停止使用且已备份的数据库、输入 `MIGRATE V4 TO V5` 确认文字、单事务执行，并通过迁移后行数守恒、schema 结构、foreign key 和 integrity 检查。
-- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。旧数据库必须顺序迁移 v3→v4→v5→v6→v7，不存在跨版本直达路径。
+- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。旧数据库必须顺序迁移 v3→v4→v5→v6→v7→v8，不存在跨版本直达路径。
 - app/migrations/v003_auth.py 保留通用的 v2 到 v3 显式迁移实现，属于历史兼容层。
 
 Voice Original Audio 存储在 `VOICE_STORAGE_ROOT` 指定的外部目录，不在 SQLite 内；数据库迁移不涉及也不重建历史音频文件。数据库、Voice 存储、WAL/SHM、备份和真实数据不属于公开发行物。
 
 ## PWA and Caching
 
-FastAPI 同源提供 API、静态资源和单页应用入口。静态资源通过 `?v=0.7.0-community-ui-1` 版本化引用；Service Worker 使用 `selfecho-ai-community-v0.7.0-ui-1` cache namespace（opaque cache revision，不是产品版本号），只缓存 App Shell：HTML、版本化 CSS 与 JavaScript、Manifest 和图标；以 /api/ 开头或非 GET 的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
+FastAPI 同源提供 API、静态资源和单页应用入口。静态资源通过 `?v=0.8.0-community-ui-1` 版本化引用；Service Worker 使用 `selfecho-ai-community-v0.8.0-ui-1` cache namespace（opaque cache revision，不是产品版本号），只缓存 App Shell：HTML、版本化 CSS 与 JavaScript、Manifest 和图标；以 /api/ 开头或非 GET 的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
 
 登录用户的 Capture 草稿临时保存在 sessionStorage，并按用户区分。认证状态和私有事项不写入 Service Worker Cache。Service Worker 文件自身以 no-cache 响应，便于更新缓存版本。
 

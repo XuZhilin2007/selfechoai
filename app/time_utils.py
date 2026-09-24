@@ -8,6 +8,39 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 _REMINDER_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
+def user_local_date(now: datetime, timezone_name: str) -> date:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must include timezone information")
+    return now.astimezone(ZoneInfo(validate_timezone_name(timezone_name))).date()
+
+
+def deadline_local_value(value: date | datetime, timezone_name: str) -> date | datetime:
+    """Project an instant; retain floating dates and legacy local wall datetimes.
+
+    A naive datetime is a compatibility convention, not a recovered instant.
+    In particular, do not guess a DST fold or normalize a nonexistent wall time.
+    This function never changes the persisted value.
+    """
+    zone = ZoneInfo(validate_timezone_name(timezone_name))
+    if isinstance(value, datetime) and value.utcoffset() is not None:
+        return value.astimezone(zone)
+    return value
+
+
+def deadline_is_overdue(
+    value: date | datetime, *, timezone_name: str, now: datetime,
+) -> bool:
+    today = user_local_date(now, timezone_name)
+    local = deadline_local_value(value, timezone_name)
+    if not isinstance(local, datetime):
+        return local < today
+    if local.utcoffset() is not None:
+        # Compare instants even during the repeated hour of a DST transition.
+        return local.astimezone(timezone.utc) < now.astimezone(timezone.utc)
+    local_now = now.astimezone(ZoneInfo(timezone_name)).replace(tzinfo=None)
+    return local < local_now
+
+
 def validate_timezone_name(value: str) -> str:
     timezone_name = value.strip()
     if not timezone_name:

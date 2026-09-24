@@ -4,7 +4,7 @@
 
 SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Personal Items，同时保留原始输入和用户的最终决策权。AI 负责提取与组织信息，不替用户决定重要性、计划或行动。
 
-**Status:** Community Edition 0.7.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.8.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
@@ -21,6 +21,10 @@ SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Person
 - Personal Item Dashboard 提供 Current / History / Trash 生命周期视图、批量选择（单次最多 100 项）与分页，分页大小与单次原子批量操作一致
 - 30 天回收站保留与嵌入式 retention worker；回收站恢复会回到已知来源状态，来源未知的 legacy 事项回到 Current
 - 如实的完成时间：History 显示真实 `completed_at`，没有真实时间的 legacy 完成事项保持「完成时间未知」
+- Current 仪表盘排序：显式 Pin 优先，其后按 Deadline 排序——已过期按截止日晚者在前，未到期按截止日早者在前（同日内有时刻者先于纯日期），无截止日按最近创建；Pin 在 Detail 页设置、跨生命周期转换保留，且永远不会由 AI 写入
+- Legacy Importance/Urgency 退休：AI 不再推断、写入或询问重要性与紧急性；用户表述的后果、约束与时间压力作为事实上下文保留在 `extra_information` 中
+- Deadline 精度契约：纯日期截止日保持浮动日历日期，带时刻的截止日保留输入精度；过期状态与排序使用你的 profile 时区（AI 的相对日期也按该时区 grounding），且不改写已存储的值
+- 过期 Reminder 呈现按完整 24 小时显示「已过期 N 天」；不足一天的仍使用分钟/小时表述
 - Quiet Utility 界面基础：以排版与层级组织内容、每个上下文一个主动作、可逆生命周期操作不做多余确认，触屏/触控笔长按进入选择并提供键盘可达的替代入口
 - 一次性 Reminder：可手动创建，也可由 AI 从自然语言提取意图与时间表达，并按用户时区确定性解析；新建 Reminder 默认「今天」，歧义时间表达会停留在 `needs_confirmation` 状态
 - 应用内 due 回退，即使不配置任何通知，Reminder 依然可用
@@ -33,7 +37,7 @@ SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Person
 - Login、Logout、服务端 Session 与 CSRF 防护
 - 默认关闭注册和可选 Invite registration
 - Multi-user 数据所有权隔离
-- SQLite schema v7；已有 v0.6 数据库必须显式执行 v6→v7 迁移
+- SQLite schema v8；已有 v0.7 数据库必须显式执行 v7→v8 迁移
 
 Planner、日历集成和自治 Agent 尚未实现。
 
@@ -210,7 +214,7 @@ python -m app.bootstrap
 Bootstrap 会：
 
 - 使用 `.env` 中 `APP_DATABASE_PATH` 指定的 SQLite 数据库；
-- 在数据库不存在时初始化 schema v6；
+- 在数据库不存在时初始化当前 schema（v8）；
 - 只在 user count 为 0 时创建一个普通用户；
 - 通过 `getpass` 读取并确认 password；
 - 使用与应用相同的用户约束和 Argon2id password hashing；
@@ -280,9 +284,33 @@ AI_MODEL=
 - Reminder Email、验证/challenge metadata、delivery destination snapshot 与 Provider status metadata 保存在 SQLite；不保存 raw verification code
 - `.env`、`data/`、`*.db`、WAL/SHM 和日志均被 Git 忽略
 - Community Edition 不附带 Production 数据或从真实数据生成的 seed
-- 空数据库会直接初始化为 schema v7
+- 空数据库会直接初始化为 schema v8
 
 不要把数据库、备份、日志或包含个人内容的截图提交到 Git。
+
+## 从 v0.7.0 升级
+
+v0.7.0 数据库使用 schema v7，v0.8.0 使用 schema v8。**v0.8.0 不会自动迁移 v0.7 数据库。** 新 runtime 遇到 schema v7 会 fail closed，并要求 operator 显式迁移。
+
+1. 停止 application/service，确认没有进程仍在使用数据库。
+2. 为数据库文件以及实际存在的 WAL/SHM 伴生文件创建经过验证、可恢复的备份。
+3. 可选：针对实际配置的数据库路径运行只读 preflight：
+
+```bash
+python -m app.migrations.v008_item_pin --database data/selfecho.db --check-only
+```
+
+4. 执行显式 v7→v8 迁移：
+
+```bash
+python -m app.migrations.v008_item_pin --database data/selfecho.db
+```
+
+5. 按提示输入精确确认文字 `MIGRATE PUBLIC V7 TO V8`。迁移在单一 transaction 内为 `personal_items` 新增 `is_pinned` 列（NOT NULL、默认 0、CHECK 限定 0/1），并检查旧表行数守恒、全部历史事项为未置顶、schema 结构、foreign key 与 SQLite integrity。历史事项一律以未置顶状态完成迁移。
+6. 只有迁移报告成功后，才重启 v0.8.0 应用。
+7. 确认应用启动接受 schema v8，已有数据与 Account 页面均可正常加载。
+
+全新 v0.8.0 安装会直接创建 schema v8，不需要先创建或迁移 schema v7。
 
 ## 从 v0.6.0 升级
 
@@ -304,9 +332,9 @@ python -m app.migrations.v007_item_lifecycle --database data/selfecho.db
 
 5. 按提示输入精确确认文字 `MIGRATE PUBLIC V6 TO V7`。迁移在单一 transaction 内执行，并检查旧表行数守恒、lifecycle 元数据策略、schema 结构、foreign key 与 SQLite integrity。legacy 回收站事项会获得全新的 30 天保留期；legacy 完成事项不会写入任何虚构的完成时间。
 6. 只有迁移报告成功后，才重启 v0.7.0 应用。
-7. 确认应用启动接受 schema v7，已有数据与 Account 页面均可正常加载。
+7. 确认应用启动接受 schema v7，已有数据与 Account 页面均可正常加载，然后继续执行上文 v7→v8 迁移。
 
-全新 v0.7.0 安装会直接创建 schema v7，不需要先创建或迁移 schema v6。更旧数据库仍须顺序迁移：schema v4 先通过 `python -m app.migrations.v005_voice_capture` 升到 v5，再通过 `python -m app.migrations.v006_email_reminders` 升到 v6，然后按上述步骤升到 v7；schema v3 还须先通过 `python -m app.migrations.v004_reminders` 升到 v4。
+全新 v0.7.0 安装当时会直接创建 schema v7，不需要先创建或迁移 schema v6。更旧数据库仍须顺序迁移：schema v4 先通过 `python -m app.migrations.v005_voice_capture` 升到 v5，再通过 `python -m app.migrations.v006_email_reminders` 升到 v6，然后按上述步骤升到 v7，最后升到 v8；schema v3 还须先通过 `python -m app.migrations.v004_reminders` 升到 v4。
 
 ## 从 v0.5.0 升级
 
@@ -316,9 +344,10 @@ v0.5.0 数据库使用 schema v5，v0.6.0 使用 schema v6。请使用 `python -
 
 ```bash
 python -m pytest
+node --test tests/*.mjs
 ```
 
-测试覆盖 Capture、原始输入持久化、DeepSeek/OpenAI 模拟响应、Authentication、Session、CSRF、Invite、Migration、Multi-user isolation、Reminder、时间表达解析、Current/History/Trash 生命周期、批量生命周期原子性、回收站保留、Web Push 安全与订阅、Email 设置/验证/隐私/投递合同、Voice Capture 合同（草稿生命周期、转写、存储、删除 ledger）、PWA，以及 first-user bootstrap 和 local/production Cookie 行为。JavaScript 与 Service Worker 合同测试位于 `tests/*.mjs`，使用 Node 内置 test runner 运行。
+测试覆盖 Capture、原始输入持久化、DeepSeek/OpenAI 模拟响应、Authentication、Session、CSRF、Invite、Migration、Multi-user isolation、Reminder、时间表达解析、Current/History/Trash 生命周期、批量生命周期原子性、回收站保留、Web Push 安全与订阅、Email 设置/验证/隐私/投递合同、Voice Capture 合同（草稿生命周期、转写、存储、删除 ledger）、PWA，以及 first-user bootstrap 和 local/production Cookie 行为。JavaScript 与 Service Worker 合同测试位于 `tests/*.mjs`，使用 Node 内置 test runner 运行（`node --test tests/*.mjs` 一次运行全部）。
 
 ## Current Limitations
 
@@ -339,7 +368,7 @@ python -m pytest
 Vanilla JavaScript PWA (含 Service Worker push 处理)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite (schema v7)
+          ├── SQLite (schema v8)
           ├── DeepSeek / OpenAI provider abstraction
           ├── 可选 Voice Capture → 外部 Voice 存储 → Alibaba ASR
           └── 可选嵌入式 Reminder worker
@@ -349,7 +378,7 @@ FastAPI + Uvicorn
 
 核心产品原则是：原始输入不能丢失；未知信息保持未知；AI 只整理信息，用户始终是最终决策者。
 
-更完整的组件、数据流、认证、多用户隔离、Reminder channel/worker、PWA Cache 和 Provider 边界说明见 [Architecture](docs/ARCHITECTURE.md)，稳定产品边界见 [Product Principles](docs/PRODUCT_PRINCIPLES.md)，界面基础见 [UI/UX Foundation](docs/UI_UX_FOUNDATION.md)。Release Candidate 说明见 [Community Edition v0.7.0 Release Notes](docs/RELEASE_NOTES_v0.7.0.md)。
+更完整的组件、数据流、认证、多用户隔离、Reminder channel/worker、PWA Cache 和 Provider 边界说明见 [Architecture](docs/ARCHITECTURE.md)，稳定产品边界见 [Product Principles](docs/PRODUCT_PRINCIPLES.md)，界面基础见 [UI/UX Foundation](docs/UI_UX_FOUNDATION.md)。当前版本说明见 [Community Edition v0.8.0 Release Notes](docs/RELEASE_NOTES_v0.8.0.md)；更早的 Release Notes 保留为历史记录。
 
 ## Security and Contributing
 

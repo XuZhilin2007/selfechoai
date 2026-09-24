@@ -18,7 +18,7 @@ PASSWORD = "isolation API test password"
 
 
 class IsolationAIService(AIService):
-    async def extract(self, original_text, existing_item):
+    async def extract(self, original_text, existing_item, *, current_local_date):
         if "FORCE_FAILURE" in original_text:
             raise AINetworkError("forced isolation test failure")
         if existing_item is not None:

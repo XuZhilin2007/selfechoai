@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime
 
 from app.auth_repository import AuthRepository
 from app.reminder_repository import ReminderRepository
@@ -15,6 +15,7 @@ from app.schemas import (
 )
 from app.services.ai import AIService, AIServiceError
 from app.services.temporal_parser import TemporalParser
+from app.time_utils import user_local_date
 
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,9 @@ class InputProcessingService:
                 else None
             )
             extraction = await self.ai_service.extract(
-                item_input.original_text, existing_item
+                item_input.original_text,
+                existing_item,
+                current_local_date=self._current_local_date(user_id),
             )
             reminder = self._resolve_reminder(user_id, extraction.reminder)
             if existing_item is None:
@@ -138,10 +141,20 @@ class InputProcessingService:
                 for index, item in enumerate(inputs, start=1)
             )
         )
-        extraction = await self.ai_service.extract(history_text, existing_item)
+        extraction = await self.ai_service.extract(
+            history_text,
+            existing_item,
+            current_local_date=self._current_local_date(user_id),
+        )
         return self.repository.apply_reprocessed_fields(
             item_id,
             user_id,
             extraction.fields,
             extraction.evidence_fields,
         )
+
+    def _current_local_date(self, user_id: int) -> date:
+        user = self.auth_repository.get_user_by_id(user_id)
+        if user is None:
+            raise NotFoundError("user not found")
+        return user_local_date(self.now_provider(), user.timezone)

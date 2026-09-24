@@ -50,12 +50,12 @@ def test_capture_creates_item_and_preserves_original_input(client_factory):
     assert response.status_code == 202
     assert response.json()["original_text"] == "有空复习高数"
     dashboard = client.get("/api/items").json()
-    assert dashboard["sortable_items"] == []
-    assert [item["title"] for item in dashboard["needs_confirmation"]] == [
+    assert dashboard["needs_confirmation"] == []
+    assert [item["title"] for item in dashboard["sortable_items"]] == [
         "复习高数"
     ]
 
-    item_id = dashboard["needs_confirmation"][0]["id"]
+    item_id = dashboard["sortable_items"][0]["id"]
     detail = client.get(f"/api/items/{item_id}").json()
     assert detail["inputs"][0]["original_text"] == "有空复习高数"
     assert detail["inputs"][0]["processing_status"] == "succeeded"
@@ -105,7 +105,7 @@ def test_ai_failure_keeps_saved_input_and_retry_recovers(client_factory):
     assert retry.status_code == 202
     recovered = client.get("/api/items").json()
     assert recovered["failed_inputs"] == []
-    assert recovered["needs_confirmation"][0]["title"] == "已恢复的事项"
+    assert recovered["sortable_items"][0]["title"] == "已恢复的事项"
 
 
 def test_missing_ai_configuration_is_visible_to_user(client_factory):
@@ -119,36 +119,24 @@ def test_missing_ai_configuration_is_visible_to_user(client_factory):
     assert "API_KEY" in failed["failure_message"]
 
 
-def test_priority_formula_and_unknown_group_are_separate(client_factory):
-    def handler(text, existing):
-        if text == "高高":
-            return new_item_extraction(
-                "高紧急高重要", importance="high", urgency="high"
-            )
-        if text == "高中":
-            return new_item_extraction(
-                "高紧急中重要", importance="medium", urgency="high"
-            )
-        return new_item_extraction("信息不足")
-
-    client = client_factory(FunctionAIService(handler))
-    for text in ("高中", "未知", "高高"):
+def test_priority_output_is_ignored_and_unknown_never_forms_confirmation(client_factory):
+    client = client_factory(FunctionAIService(lambda text, existing: new_item_extraction(
+        text, importance="high", urgency="high",
+    )))
+    for text in ("first", "second", "third"):
         assert client.post("/api/inputs", json={"original_text": text}).status_code == 202
-
+    with client.app.state.database.transaction() as connection:
+        for index, title in enumerate(("first", "second", "third"), start=1):
+            connection.execute("UPDATE personal_items SET created_time = ? WHERE title = ?",
+                               (f"2026-09-20T00:00:0{index}+00:00", title))
     dashboard = client.get("/api/items").json()
-    assert [item["title"] for item in dashboard["sortable_items"]] == [
-        "高紧急高重要",
-        "高紧急中重要",
-    ]
-    assert [item["priority_score"] for item in dashboard["sortable_items"]] == [
-        3.0,
-        2.65,
-    ]
-    assert dashboard["needs_confirmation"][0]["title"] == "信息不足"
-    assert dashboard["needs_confirmation"][0]["priority_score"] is None
+    assert dashboard["needs_confirmation"] == []
+    assert [item["title"] for item in dashboard["sortable_items"]] == ["third", "second", "first"]
+    assert all(item["priority_score"] is None for item in dashboard["sortable_items"])
+    assert all(item["importance"] == item["urgency"] == "unknown" for item in dashboard["sortable_items"])
 
 
-def test_quick_confirmation_contract_updates_unknown_fields_and_preserves_item(
+def test_legacy_manual_priority_patch_remains_compatible_without_confirmation_group(
     client_factory,
 ):
     extraction = AIExtraction(
@@ -174,7 +162,8 @@ def test_quick_confirmation_contract_updates_unknown_fields_and_preserves_item(
     )
     assert captured.status_code == 202
 
-    initial_queue = client.get("/api/items").json()["needs_confirmation"]
+    assert client.get("/api/items").json()["needs_confirmation"] == []
+    initial_queue = client.get("/api/items").json()["sortable_items"]
     assert len(initial_queue) == 1
     assert initial_queue[0]["importance"] == "unknown"
     assert initial_queue[0]["urgency"] == "unknown"
@@ -186,7 +175,8 @@ def test_quick_confirmation_contract_updates_unknown_fields_and_preserves_item(
         json={"importance": "medium", "confirmed_important_fields": True},
     )
     assert importance_update.status_code == 200
-    one_field_left = client.get("/api/items").json()["needs_confirmation"]
+    assert client.get("/api/items").json()["needs_confirmation"] == []
+    one_field_left = client.get("/api/items").json()["sortable_items"]
     assert len(one_field_left) == 1
     assert one_field_left[0]["importance"] == "medium"
     assert one_field_left[0]["urgency"] == "unknown"
@@ -231,6 +221,10 @@ def test_unknown_ai_update_cannot_erase_known_priority(client_factory):
     client = client_factory(FunctionAIService(handler))
     client.post("/api/inputs", json={"original_text": "这次考试很重要"})
     item_id = client.get("/api/items").json()["sortable_items"][0]["id"]
+
+    assert client.patch(f"/api/items/{item_id}", json={
+        "importance": "high", "urgency": "medium", "confirmed_important_fields": True,
+    }).status_code == 200
 
     update = client.post(
         f"/api/items/{item_id}/inputs",
@@ -284,9 +278,9 @@ def test_context_survives_updates_and_is_returned_by_detail_api(client_factory):
     captured = client.post("/api/inputs", json={"original_text": original_text})
     assert captured.status_code == 202
 
-    dashboard_item = client.get("/api/items").json()["needs_confirmation"][0]
+    dashboard_item = client.get("/api/items").json()["sortable_items"][0]
     assert dashboard_item["importance"] == "unknown"
-    assert dashboard_item["urgency"] == "low"
+    assert dashboard_item["urgency"] == "unknown"
 
     item_id = dashboard_item["id"]
     initial_detail = client.get(f"/api/items/{item_id}").json()
@@ -304,7 +298,7 @@ def test_context_survives_updates_and_is_returned_by_detail_api(client_factory):
 
     updated_item = client.get(f"/api/items/{item_id}").json()["item"]
     assert updated_item["importance"] == "unknown"
-    assert updated_item["urgency"] == "low"
+    assert updated_item["urgency"] == "unknown"
     assert updated_item["next_action"] == "比较现有候选型号的测评"
     assert updated_item["extra_information"] == {
         **original_context,
@@ -330,7 +324,7 @@ def test_failed_detail_update_can_be_retried(client_factory):
 
     client = client_factory(FunctionAIService(handler))
     client.post("/api/inputs", json={"original_text": "先创建事项"})
-    item_id = client.get("/api/items").json()["needs_confirmation"][0]["id"]
+    item_id = client.get("/api/items").json()["sortable_items"][0]["id"]
 
     failed = client.post(
         f"/api/items/{item_id}/inputs", json={"original_text": "补充失败后重试"}
@@ -392,6 +386,9 @@ def test_reprocess_updates_same_item_and_preserves_history_and_known_core_fields
     client.post("/api/inputs", json={"original_text": "比较两种学习设备"})
     original = client.get("/api/items").json()["sortable_items"][0]
     item_id = original["id"]
+    assert client.patch(f"/api/items/{item_id}", json={
+        "importance": "high", "urgency": "medium", "confirmed_important_fields": True,
+    }).status_code == 200
     history_before = client.get(f"/api/items/{item_id}").json()["inputs"]
 
     response = client.post(f"/api/items/{item_id}/reprocess")
@@ -417,7 +414,7 @@ def test_reprocess_updates_same_item_and_preserves_history_and_known_core_fields
     assert len(client.app.state.repository.list_active_items(user_id)) == 1
 
 
-def test_reprocess_can_fill_unknown_core_fields_with_supported_evidence(
+def test_reprocess_fills_deadline_but_never_fills_legacy_priority(
     client_factory,
 ):
     def handler(text, existing):
@@ -439,12 +436,12 @@ def test_reprocess_can_fill_unknown_core_fields_with_supported_evidence(
 
     client = client_factory(FunctionAIService(handler))
     client.post("/api/inputs", json={"original_text": "准备合成演示"})
-    item_id = client.get("/api/items").json()["needs_confirmation"][0]["id"]
+    item_id = client.get("/api/items").json()["sortable_items"][0]["id"]
 
     item = client.post(f"/api/items/{item_id}/reprocess").json()
 
-    assert item["importance"] == "medium"
-    assert item["urgency"] == "low"
+    assert item["importance"] == "unknown"
+    assert item["urgency"] == "unknown"
     assert item["deadline"] == "2026-11-20"
     assert item["extra_information"] == {"goal": "完成一次演示"}
 
@@ -575,7 +572,7 @@ def test_pwa_routes_and_health_start(client_factory):
     assert "SelfEcho" in shell
     openapi_info = client.get("/openapi.json").json()["info"]
     assert openapi_info["title"] == "SelfEcho AI"
-    assert openapi_info["version"] == "0.7.0"
+    assert openapi_info["version"] == "0.8.0"
     manifest_response = client.get("/static/manifest.webmanifest")
     assert manifest_response.status_code == 200
     manifest = json.loads(manifest_response.text)
@@ -585,9 +582,9 @@ def test_pwa_routes_and_health_start(client_factory):
     assert service_worker.status_code == 200
     assert service_worker.headers["content-type"].startswith("text/javascript")
     assert service_worker.headers["cache-control"] == "no-cache"
-    assert "selfecho-ai-community-v0.7.0-ui-1" in service_worker.text
-    assert "/static/app.js?v=0.7.0-community-ui-1" in shell
-    assert "/static/styles.css?v=0.7.0-community-ui-1" in shell
+    assert "selfecho-ai-community-v0.8.0-ui-1" in service_worker.text
+    assert "/static/app.js?v=0.8.0-community-ui-1" in shell
+    assert "/static/styles.css?v=0.8.0-community-ui-1" in shell
     assert "public-security-filing" not in service_worker.text
     frontend = client.get("/static/app.js").text
     assert "<h1>先记下来</h1>" in frontend
@@ -603,8 +600,9 @@ def test_pwa_routes_and_health_start(client_factory):
     assert "永久删除" in frontend
     assert "window.confirm" in frontend
     assert "待快速确认" in frontend
-    assert "priority-choice-button" in frontend
-    assert "confirmed_important_fields: true" in frontend
+    assert "priority-choice-button" not in frontend
+    assert "需要提醒吗？" not in frontend
+    assert "patch.confirmed_important_fields = deadlineChanged" in frontend
     assert 'register("/service-worker.js", { scope: "/" })' in frontend
     assert "function detailRefreshBlocked()" in frontend
     assert "automatic && detailRefreshBlocked()" in frontend
@@ -635,9 +633,5 @@ def test_pwa_routes_and_health_start(client_factory):
     assert "safe-area-inset-bottom" in styles
     assert ".lifecycle-navigation" in styles
     assert ".confirmation-dialog" in styles
-    quick_controls = frontend.split("function quickPriorityButtons", 1)[1].split(
-        "function quickConfirmationCard",
-        1,
-    )[0]
-    assert "<button" in quick_controls
-    assert "<select" not in quick_controls
+    assert "function quickPriorityButtons" not in frontend
+    assert "function quickConfirmationCard" in frontend

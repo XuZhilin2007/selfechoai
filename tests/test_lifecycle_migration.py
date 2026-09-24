@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 
 from app.database import (
-    CURRENT_SCHEMA_VERSION,
     SCHEMA_V6,
+    SCHEMA_V7,
+    SCHEMA_V7_VERSION,
     V7_LIFECYCLE_COLUMNS_SQL,
     Database,
 )
@@ -139,7 +140,7 @@ def test_v6_to_v7_preserves_rows_and_applies_exact_legacy_policy(
             )
     finally:
         connection.close()
-    assert CURRENT_SCHEMA_VERSION == 7
+    assert SCHEMA_V7_VERSION == 7
 
     restored_legacy_trash = Repository(Database(path)).update_item(
         3,
@@ -159,14 +160,18 @@ def test_fresh_and_migrated_v7_share_retention_index_definition(
     fresh_path = tmp_path / "fresh-v7.db"
     create_populated_v6_database(migrated_path)
     migrate_v6_to_v7(migrated_path, migration_time=MIGRATION_TIME)
-    Database(fresh_path).initialize()
+    with sqlite3.connect(fresh_path) as connection:
+        connection.executescript(SCHEMA_V7)
 
     for path in (migrated_path, fresh_path):
         assert index_columns(
             path,
             "idx_personal_items_trash_retention",
         ) == ["status", "trashed_at", "id"]
-        Database(path).initialize()
+        with sqlite3.connect(path) as connection:
+            connection.row_factory = sqlite3.Row
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            Database._validate_v7_schema(connection, set(EXISTING_TABLES))
 
 
 def test_migration_rolls_back_schema_and_data_after_injected_failure(

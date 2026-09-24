@@ -13,7 +13,9 @@ SCHEMA_V6_VERSION = 6
 # Kept as the v5 compatibility name because the immutable v005 migration
 # imports it. New application code uses CURRENT_SCHEMA_VERSION explicitly.
 SCHEMA_VERSION = SCHEMA_V5_VERSION
-CURRENT_SCHEMA_VERSION = 7
+SCHEMA_V7_VERSION = 7
+SCHEMA_V8_VERSION = 8
+CURRENT_SCHEMA_VERSION = SCHEMA_V8_VERSION
 
 USERS_V3_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -633,8 +635,17 @@ SCHEMA_V7 = "\n".join(
         SCHEMA_V6,
         ";\n".join(V7_LIFECYCLE_COLUMNS_SQL) + ";",
         V7_INDEXES_SQL,
-        f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION};",
+        f"PRAGMA user_version = {SCHEMA_V7_VERSION};",
     )
+)
+
+V8_PIN_COLUMN_SQL = (
+    "ALTER TABLE personal_items ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0 "
+    "CHECK (is_pinned IN (0, 1))"
+)
+
+SCHEMA_V8 = "\n".join(
+    (SCHEMA_V7, V8_PIN_COLUMN_SQL + ";", f"PRAGMA user_version = {SCHEMA_V8_VERSION};")
 )
 
 REQUIRED_V3_COLUMNS = {
@@ -897,6 +908,12 @@ REQUIRED_V7_INDEXES = REQUIRED_V6_INDEXES | {
     "idx_personal_items_trash_retention",
 }
 
+REQUIRED_V8_COLUMNS = {
+    **REQUIRED_V7_COLUMNS,
+    "personal_items": REQUIRED_V7_COLUMNS["personal_items"] | {"is_pinned"},
+}
+REQUIRED_V8_INDEXES = REQUIRED_V7_INDEXES
+
 
 class DatabaseVersionError(RuntimeError):
     pass
@@ -920,10 +937,10 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        """Create a new v7 database or validate an existing v7 database.
+        """Create a new v8 database or validate an existing v8 database.
 
         Upgrading an existing database is intentionally not performed here.
-        Existing installations must use an explicit, backup-aware migration.
+        Production upgrades must use an explicit, backup-aware migration.
         """
 
         with self._connect() as connection:
@@ -939,7 +956,7 @@ class Database:
             }
 
             if version == 0 and not existing_tables:
-                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V7}\nCOMMIT;")
+                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V8}\nCOMMIT;")
                 return
 
             if version != CURRENT_SCHEMA_VERSION:
@@ -948,7 +965,7 @@ class Database:
                     f"migration to version {CURRENT_SCHEMA_VERSION}"
                 )
 
-            self._validate_v7_schema(connection, existing_tables)
+            self._validate_v8_schema(connection, existing_tables)
 
     @staticmethod
     def _validate_v3_schema(
@@ -1005,10 +1022,30 @@ class Database:
         Database._validate_schema(
             connection,
             existing_tables,
-            version=CURRENT_SCHEMA_VERSION,
+            version=SCHEMA_V7_VERSION,
             required_columns=REQUIRED_V7_COLUMNS,
             required_indexes=REQUIRED_V7_INDEXES,
         )
+
+    @staticmethod
+    def _validate_v8_schema(
+        connection: sqlite3.Connection, existing_tables: set[str]
+    ) -> None:
+        Database._validate_schema(
+            connection, existing_tables, version=SCHEMA_V8_VERSION,
+            required_columns=REQUIRED_V8_COLUMNS,
+            required_indexes=REQUIRED_V8_INDEXES,
+        )
+        column = next(row for row in connection.execute("PRAGMA table_info(personal_items)")
+                      if row["name"] == "is_pinned")
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'personal_items'"
+        ).fetchone()[0]
+        compact_sql = "".join(table_sql.lower().split())
+        if (column["type"].upper() != "INTEGER" or column["notnull"] != 1
+                or column["dflt_value"] != "0"
+                or "check(is_pinnedin(0,1))" not in compact_sql):
+            raise DatabaseSchemaError("version 8 is_pinned boolean contract is invalid")
 
     @staticmethod
     def _validate_schema(

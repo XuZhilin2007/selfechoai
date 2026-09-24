@@ -30,7 +30,7 @@ class RecordingAIService(AIService):
         self.database = None
         self.commit_observations: list[tuple[bool, int]] = []
 
-    async def extract(self, original_text, existing_item):
+    async def extract(self, original_text, existing_item, *, current_local_date):
         self.calls.append(original_text)
         if self.database is not None:
             with self.database.connection() as connection:

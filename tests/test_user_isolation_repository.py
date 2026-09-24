@@ -24,7 +24,7 @@ from app.services.processing import InputProcessingService
 
 
 class SuccessfulAIService(AIService):
-    async def extract(self, original_text, existing_item):
+    async def extract(self, original_text, existing_item, *, current_local_date):
         return AIExtraction(
             fields=AIItemFields(
                 title=f"已整理：{original_text}",
@@ -36,7 +36,7 @@ class SuccessfulAIService(AIService):
 
 
 class FailingAIService(AIService):
-    async def extract(self, original_text, existing_item):
+    async def extract(self, original_text, existing_item, *, current_local_date):
         raise AINetworkError("test network failure")
 
 

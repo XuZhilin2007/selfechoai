@@ -7,10 +7,10 @@ def test_manual_reminder_quick_choice_and_native_date_time_controls(client_facto
     client = client_factory(FunctionAIService(lambda text, existing: None))
     frontend = client.get("/static/app.js").text
 
-    assert "需要提醒吗？" in frontend
-    assert "不用" in frontend
+    assert "需要提醒吗？" not in frontend
+    assert "reminder-dismiss-button" not in frontend
     assert "设置提醒" in frontend
-    for option in ["明天", "后天", "大后天", "选日期"]:
+    for option in ["今天", "明天", "后天", "选日期"]:
         assert option in frontend
     assert 'id="reminder-date" type="date"' in frontend
     assert 'id="reminder-time" type="time"' in frontend
@@ -19,7 +19,7 @@ def test_manual_reminder_quick_choice_and_native_date_time_controls(client_facto
     assert "authentication.user.default_reminder_time" in frontend
     assert "改时间" in frontend
     assert "openReminderEditor" in frontend
-    assert "/reminder-prompt/dismiss" in frontend
+    assert "/reminder-prompt/dismiss" not in frontend
     assert "你想之后被提醒，但还没有确定时间。" in frontend
     assert 'item.reminder?.status === "needs_confirmation"' in frontend
     assert "暂时不用提醒" in frontend
@@ -27,6 +27,14 @@ def test_manual_reminder_quick_choice_and_native_date_time_controls(client_facto
     assert 'api(`/api/reminders/${item.reminder.id}`' in frontend
     assert 'method: "DELETE"' in frontend
     assert "原话里的时间：" in frontend
+    reminder_editor = frontend.split("function openReminderEditor", 1)[1].split(
+        "function quickConfirmationCard",
+        1,
+    )[0]
+    assert 'data-days="0">今天' in reminder_editor
+    assert 'data-days="1">明天' in reminder_editor
+    assert 'data-days="2">后天' in reminder_editor
+    assert 'data-days="3"' not in reminder_editor
 
 
 def test_dashboard_detail_and_account_reminder_contract(client_factory):

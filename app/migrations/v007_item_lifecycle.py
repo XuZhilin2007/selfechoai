@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.database import (
-    CURRENT_SCHEMA_VERSION,
+    SCHEMA_V7_VERSION,
     SCHEMA_V6_VERSION,
     V7_INDEXES_SQL,
     V7_LIFECYCLE_COLUMNS_SQL,
@@ -121,7 +121,7 @@ def migrate_v6_to_v7(
                 """,
                 (migration_timestamp,),
             )
-            connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            connection.execute(f"PRAGMA user_version = {SCHEMA_V7_VERSION}")
             _validate_migrated_data(
                 connection,
                 preflight,
@@ -337,7 +337,7 @@ def main(
         output_fn("Migration completed successfully.")
         for table_name, count in result.row_counts.items():
             output_fn(f"{table_name} preserved: {count}")
-        output_fn(f"Schema version is now {CURRENT_SCHEMA_VERSION}.")
+        output_fn(f"Schema version is now {SCHEMA_V7_VERSION}.")
         return 0
     except (MigrationError, ValueError) as exc:
         output_fn(f"ERROR: {exc}")

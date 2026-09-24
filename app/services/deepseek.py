@@ -3,8 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -19,6 +18,7 @@ from app.services.ai import (
     AINetworkError,
     AIService,
     INSTRUCTIONS,
+    without_legacy_priority,
 )
 
 
@@ -55,8 +55,6 @@ Example for creating an item:
   "fields": {{
     "title": "复习高数",
     "type": "study",
-    "importance": "unknown",
-    "urgency": "unknown",
     "deadline": null,
     "estimated_time": null,
     "status": "active",
@@ -77,29 +75,26 @@ Context-preserving decision example for latest_user_text
   "fields": {{
     "title": "购买设备",
     "type": "purchase_decision",
-    "importance": "unknown",
-    "urgency": "low",
     "deadline": null,
     "estimated_time": null,
     "status": "active",
     "next_action": null,
     "extra_information": {{
       "decision_context": "不确定现在购买还是等待",
+      "timing_context": "不算特别急",
       "concerns": ["担心之后涨价"],
       "constraints": ["预算充足", "购买时间不会影响正常生活"]
     }}
   }},
-  "evidence_fields": ["urgency"]
+  "evidence_fields": []
 }}
 
-Evidence-based priority example for latest_user_text
+Consequence-preserving example for latest_user_text
 "补办校园通行证会影响已经确认的住宿安排，必须尽快处理。":
 {{
   "fields": {{
     "title": "补办校园通行证",
     "type": "administrative",
-    "importance": "high",
-    "urgency": "high",
     "deadline": null,
     "estimated_time": null,
     "status": "active",
@@ -108,24 +103,22 @@ Evidence-based priority example for latest_user_text
       "dependency": "会影响已经确认的住宿安排"
     }}
   }},
-  "evidence_fields": ["importance", "urgency"]
+  "evidence_fields": []
 }}
 
-Deadline-without-importance example for latest_user_text
+Temporal-constraint example for latest_user_text
 "旅行用品最好在出发五天前买好。":
 {{
   "fields": {{
     "title": "购买旅行用品",
     "type": "purchase_decision",
-    "importance": "unknown",
-    "urgency": "medium",
     "deadline": null,
     "estimated_time": null,
     "status": "active",
     "next_action": null,
     "extra_information": {{"timing_constraint": "出发五天前买好"}}
   }},
-  "evidence_fields": ["urgency"]
+  "evidence_fields": []
 }}
 
 Generic-category example for latest_user_text
@@ -134,8 +127,6 @@ Generic-category example for latest_user_text
   "fields": {{
     "title": "了解一门新课程",
     "type": "study",
-    "importance": "unknown",
-    "urgency": "unknown",
     "deadline": null,
     "estimated_time": null,
     "status": "active",
@@ -157,10 +148,8 @@ Example for updating only a next action:
   "evidence_fields": []
 }}
 
-Allowed evidence_fields values are "importance", "urgency", and "deadline".
-Only include one when facts in latest_user_text directly support that field,
-including a conservative inference grounded in consequences, deadlines,
-dependencies, external requirements, goals, or impact on stated plans.
+Only "deadline" belongs in evidence_fields when latest_user_text supports it.
+Do not return legacy importance or urgency fields or evidence.
 
 Valid optional values use their real JSON types:
 {{"deadline": null, "estimated_time": 30, "next_action": null}}
@@ -193,7 +182,6 @@ class DeepSeekProvider(AIService):
         timeout_seconds: float = 30.0,
         client: httpx.AsyncClient | None = None,
         debug_output: bool = False,
-        today_provider: Callable[[], date] | None = None,
     ) -> None:
         if not api_url or not api_key or not model:
             raise AIConfigurationError(
@@ -213,20 +201,20 @@ class DeepSeekProvider(AIService):
         self.timeout_seconds = timeout_seconds
         self._client = client
         self.debug_output = debug_output
-        self._today_provider = today_provider or date.today
 
     async def extract(
         self,
         original_text: str,
         existing_item: PersonalItemPublic | None,
+        *,
+        current_local_date: date,
     ) -> AIExtraction:
-        current_local_date = self._today_provider()
         context: dict[str, Any] = {
             "operation": "update" if existing_item is not None else "create",
             "current_local_date": current_local_date.isoformat(),
             "latest_user_text": original_text,
             "existing_item": (
-                existing_item.model_dump(mode="json")
+                existing_item.model_dump(mode="json", exclude={"is_pinned"})
                 if existing_item is not None
                 else None
             ),
@@ -445,7 +433,7 @@ class DeepSeekProvider(AIService):
                 "DeepSeek create output validation failed: fields.title is required",
                 output_text,
             )
-        return extraction
+        return without_legacy_priority(extraction)
 
     @staticmethod
     def _normalize_reminder_candidate(decoded_output: Any) -> None:
@@ -569,6 +557,21 @@ class DeepSeekProvider(AIService):
                         exact_date = candidate
 
         if exact_date is not None and deadline_is_claimed:
+            value = fields.get("deadline")
+            if isinstance(value, str) and ("T" in value or " " in value):
+                try:
+                    moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+                else:
+                    # Aware values are instants: replacing their date in an
+                    # arbitrary offset can move them to another user-local day.
+                    # Ground naive wall dates while retaining their clock.
+                    if moment.utcoffset() is None:
+                        fields["deadline"] = moment.replace(
+                            year=exact_date.year, month=exact_date.month, day=exact_date.day,
+                        ).isoformat()
+                    return
             fields["deadline"] = exact_date.isoformat()
             return
 

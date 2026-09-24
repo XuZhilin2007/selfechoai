@@ -1,8 +1,8 @@
-const CACHE_NAME = "selfecho-ai-community-v0.7.0-ui-1";
+const CACHE_NAME = "selfecho-ai-community-v0.8.0-ui-1";
 const SHELL = [
   "/static/index.html",
-  "/static/styles.css?v=0.7.0-community-ui-1",
-  "/static/app.js?v=0.7.0-community-ui-1",
+  "/static/styles.css?v=0.8.0-community-ui-1",
+  "/static/app.js?v=0.8.0-community-ui-1",
   "/static/manifest.webmanifest",
   "/static/icon.svg",
 ];

@@ -155,10 +155,7 @@ def test_deepseek_provider_uses_official_chat_completions_json_output():
             assert "model-generated chain-of-thought" in payload["messages"][0]["content"]
             assert "Preserve unrelated existing extra_information" in payload["messages"][0]["content"]
             assert '"decision_context": "不确定现在购买还是等待"' in payload["messages"][0]["content"]
-            assert 'importance and urgency: "high", "medium", "low", or "unknown"' in payload["messages"][0]["content"]
-            assert "explicit consequences" in payload["messages"][0]["content"]
-            assert "A deadline normally supports urgency" in payload["messages"][0]["content"]
-            assert "purchases are low importance" in payload["messages"][0]["content"]
+            assert "Importance and urgency are retired legacy fields" in payload["messages"][0]["content"]
             assert "reminder.intent is true only" in payload["messages"][0]["content"]
             assert "Never calculate remind_at" in payload["messages"][0]["content"]
             assert "不要猜" not in payload["messages"][1]["content"]
@@ -176,11 +173,10 @@ def test_deepseek_provider_uses_official_chat_completions_json_output():
                 model="deepseek-flash",
                 timeout_seconds=1,
                 client=client,
-                today_provider=lambda: date(2026, 8, 24),
             )
-            result = await provider.extract("下周复习高数", None)
+            result = await provider.extract("下周复习高数", None, current_local_date=date(2026, 8, 24))
             assert result.fields.title == "复习高数"
-            assert result.fields.importance.value == "unknown"
+            assert result.fields.importance is None
             assert result.fields.extra_information == {"chapter": "第四章"}
             assert result.reminder.intent is False
 
@@ -209,7 +205,7 @@ def test_deepseek_normalizes_and_validates_reminder_candidate():
                 api_key="test-secret",
                 client=client,
             )
-            result = await provider.extract("后天下午3点提醒我买东西", None)
+            result = await provider.extract("后天下午3点提醒我买东西", None, current_local_date=date(2026, 8, 24))
 
         assert result.reminder.intent is True
         assert result.reminder.temporal_expression == "后天下午3点"
@@ -217,7 +213,7 @@ def test_deepseek_normalizes_and_validates_reminder_candidate():
     asyncio.run(run_test())
 
 
-def test_deepseek_accepts_priority_inference_grounded_in_deadline_and_consequence():
+def test_deepseek_discards_priority_inference_but_preserves_deadline_and_context():
     original_text = (
         "提交合成测试材料关系到已确认的参赛资格，明确要求9月5日前完成，"
         "现在只剩三天，必须尽快处理。"
@@ -245,17 +241,12 @@ def test_deepseek_accepts_priority_inference_grounded_in_deadline_and_consequenc
                 api_url="https://api.deepseek.com",
                 api_key="test-secret",
                 client=client,
-                today_provider=lambda: date(2026, 9, 2),
             )
-            result = await provider.extract(original_text, None)
-            assert result.fields.importance.value == "high"
-            assert result.fields.urgency.value == "high"
+            result = await provider.extract(original_text, None, current_local_date=date(2026, 9, 2))
+            assert result.fields.importance is None
+            assert result.fields.urgency is None
             assert result.fields.deadline == date(2026, 9, 5)
-            assert result.evidence_fields == {
-                ImportantField.IMPORTANCE,
-                ImportantField.URGENCY,
-                ImportantField.DEADLINE,
-            }
+            assert result.evidence_fields == {ImportantField.DEADLINE}
 
     asyncio.run(run_test())
 
@@ -268,7 +259,7 @@ def test_deepseek_accepts_priority_inference_grounded_in_deadline_and_consequenc
         "想买一本书。",
     ],
 )
-def test_deepseek_keeps_priority_unknown_without_user_evidence(original_text):
+def test_deepseek_omits_retired_priority_without_user_evidence(original_text):
     async def run_test():
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -289,9 +280,9 @@ def test_deepseek_keeps_priority_unknown_without_user_evidence(original_text):
                 api_key="test-secret",
                 client=client,
             )
-            result = await provider.extract(original_text, None)
-            assert result.fields.importance.value == "unknown"
-            assert result.fields.urgency.value == "unknown"
+            result = await provider.extract(original_text, None, current_local_date=date(2026, 8, 24))
+            assert result.fields.importance is None
+            assert result.fields.urgency is None
             assert result.evidence_fields == set()
 
     asyncio.run(run_test())
@@ -333,12 +324,12 @@ def test_deepseek_preserves_purchase_reasoning_concerns_and_constraints():
                 api_key="test-secret",
                 client=client,
             )
-            result = await provider.extract(original_text, None)
+            result = await provider.extract(original_text, None, current_local_date=date(2026, 8, 24))
             assert result.fields.extra_information == expected_context
             assert result.fields.next_action is None
-            assert result.fields.importance.value == "unknown"
-            assert result.fields.urgency.value == "low"
-            assert result.evidence_fields == {ImportantField.URGENCY}
+            assert result.fields.importance is None
+            assert result.fields.urgency is None
+            assert result.evidence_fields == set()
 
     asyncio.run(run_test())
 
@@ -414,11 +405,11 @@ def test_deepseek_preserves_context_and_explicit_next_actions(
                 api_key="test-secret",
                 client=client,
             )
-            result = await provider.extract(original_text, None)
+            result = await provider.extract(original_text, None, current_local_date=date(2026, 8, 24))
             assert result.fields.extra_information == expected_context
             assert result.fields.next_action == next_action
-            assert result.fields.importance.value == "unknown"
-            assert result.fields.urgency.value == "unknown"
+            assert result.fields.importance is None
+            assert result.fields.urgency is None
             assert result.evidence_fields == set()
 
     asyncio.run(run_test())
@@ -453,7 +444,7 @@ def test_deepseek_normalizes_natural_language_estimated_time(
                 api_key="test-secret",
                 client=client,
             )
-            result = await provider.extract("测试预计耗时", None)
+            result = await provider.extract("测试预计耗时", None, current_local_date=date(2026, 8, 24))
             assert result.fields.estimated_time == expected_minutes
 
     asyncio.run(run_test())
@@ -498,7 +489,7 @@ def test_unknown_duration_does_not_clear_existing_estimate_on_update():
                 created_time=now,
                 updated_time=now,
             )
-            result = await provider.extract("现在无法判断耗时", existing)
+            result = await provider.extract("现在无法判断耗时", existing, current_local_date=date(2026, 8, 24))
             assert "estimated_time" not in result.fields.model_fields_set
 
     asyncio.run(run_test())
@@ -551,7 +542,7 @@ def test_deepseek_normalizes_empty_optional_values_without_erasing_updates():
                 api_key="test-secret",
                 client=client,
             )
-            created = await provider.extract("整理课程资料", None)
+            created = await provider.extract("整理课程资料", None, current_local_date=date(2026, 8, 24))
             assert created.fields.deadline is None
             assert created.fields.estimated_time is None
             assert created.fields.next_action is None
@@ -572,7 +563,7 @@ def test_deepseek_normalizes_empty_optional_values_without_erasing_updates():
                 created_time=now,
                 updated_time=now,
             )
-            updated = await provider.extract("没有新增内容", existing)
+            updated = await provider.extract("没有新增内容", existing, current_local_date=date(2026, 8, 24))
             assert updated.fields.model_fields_set == set()
 
     asyncio.run(run_test())
@@ -599,7 +590,7 @@ def test_deepseek_invalid_output_gets_exactly_one_successful_repair():
                 api_key="test-secret",
                 client=client,
             )
-            result = await provider.extract("复习课程", None)
+            result = await provider.extract("复习课程", None, current_local_date=date(2026, 8, 24))
             assert result.fields.title == "复习高数"
             assert calls == 2
 
@@ -622,7 +613,7 @@ def test_deepseek_stops_after_one_failed_repair_attempt():
                 client=client,
             )
             with pytest.raises(AIInvalidOutputError):
-                await provider.extract("复习课程", None)
+                await provider.extract("复习课程", None, current_local_date=date(2026, 8, 24))
             assert calls == 2
 
     asyncio.run(run_test())
@@ -710,9 +701,8 @@ def test_deepseek_grounds_exact_dates_against_runtime_date(
                 api_url="https://api.deepseek.com",
                 api_key="test-secret",
                 client=client,
-                today_provider=lambda: today,
             )
-            result = await provider.extract(original_text, None)
+            result = await provider.extract(original_text, None, current_local_date=today)
             assert result.fields.deadline == expected_deadline
 
     asyncio.run(run_test())
@@ -731,16 +721,15 @@ def test_deepseek_preserves_ambiguous_month_without_inventing_day():
                 api_url="https://api.deepseek.com",
                 api_key="test-secret",
                 client=client,
-                today_provider=lambda: date(2026, 8, 24),
             )
-            result = await provider.extract("明年6月完成一次合成测试", None)
+            result = await provider.extract("明年6月完成一次合成测试", None, current_local_date=date(2026, 8, 24))
             assert result.fields.deadline is None
             assert result.fields.extra_information == {"date_context": "明年6月"}
 
     asyncio.run(run_test())
 
 
-def test_deepseek_output_still_uses_existing_unknown_evidence_rule(client_factory):
+def test_deepseek_output_cannot_write_retired_priority(client_factory):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -763,7 +752,7 @@ def test_deepseek_output_still_uses_existing_unknown_evidence_rule(client_factor
         "/api/inputs", json={"original_text": "下周复习高数，没有说明优先级"}
     )
     assert response.status_code == 202
-    item = client.get("/api/items").json()["needs_confirmation"][0]
+    item = client.get("/api/items").json()["sortable_items"][0]
     assert item["importance"] == "unknown"
     assert item["urgency"] == "unknown"
 
@@ -801,7 +790,7 @@ def test_deepseek_provider_classifies_api_errors(status_code, expected_message):
                 client=client,
             )
             with pytest.raises(AIAPIError) as error:
-                await provider.extract("测试", None)
+                await provider.extract("测试", None, current_local_date=date(2026, 8, 24))
             assert error.value.category == FailureType.API
             assert expected_message in error.value.user_message
 
@@ -832,7 +821,7 @@ def test_deepseek_provider_rejects_invalid_output(response_body):
                 client=client,
             )
             with pytest.raises(AIInvalidOutputError) as error:
-                await provider.extract("测试", None)
+                await provider.extract("测试", None, current_local_date=date(2026, 8, 24))
             assert error.value.category == FailureType.INVALID_OUTPUT
 
     asyncio.run(run_test())
@@ -880,7 +869,7 @@ def test_deepseek_debug_logs_raw_output_and_precise_validation_error(
                 debug_output=True,
             )
             with pytest.raises(AIInvalidOutputError):
-                await provider.extract("测试", None)
+                await provider.extract("测试", None, current_local_date=date(2026, 8, 24))
 
     caplog.set_level(logging.ERROR, logger="app.services.deepseek")
     asyncio.run(run_test())
@@ -908,7 +897,7 @@ def test_deepseek_debug_output_is_disabled_by_default(caplog):
                 client=client,
             )
             with pytest.raises(AIInvalidOutputError):
-                await provider.extract("测试", None)
+                await provider.extract("测试", None, current_local_date=date(2026, 8, 24))
 
     caplog.set_level(logging.ERROR, logger="app.services.deepseek")
     asyncio.run(run_test())
@@ -959,7 +948,7 @@ def test_deepseek_provider_classifies_network_errors():
                 client=client,
             )
             with pytest.raises(AINetworkError) as error:
-                await provider.extract("测试", None)
+                await provider.extract("测试", None, current_local_date=date(2026, 8, 24))
             assert error.value.category == FailureType.NETWORK
             assert "DeepSeek" in error.value.user_message
 

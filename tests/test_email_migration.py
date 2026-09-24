@@ -143,12 +143,12 @@ def row_counts(path: Path, tables=EXISTING_TABLES) -> dict[str, int]:
         connection.close()
 
 
-def test_fresh_database_initializes_directly_to_v7(tmp_path):
-    path = tmp_path / "fresh-v7.db"
+def test_fresh_database_initializes_directly_to_v8(tmp_path):
+    path = tmp_path / "fresh-v8.db"
     Database(path).initialize()
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         tables = {
             row[0]
             for row in connection.execute(
@@ -412,10 +412,10 @@ def test_migration_rolls_back_if_index_creation_fails(tmp_path, monkeypatch):
     assert "email_reminder_settings" not in tables
 
 
-def test_v7_application_rejects_unmigrated_v5_database(tmp_path):
+def test_current_application_rejects_unmigrated_v5_database(tmp_path):
     path = tmp_path / "unmigrated.db"
     create_populated_v5_database(path)
-    with pytest.raises(DatabaseVersionError, match="migration to version 7"):
+    with pytest.raises(DatabaseVersionError, match="migration to version 8"):
         Database(path).initialize()
 
 
@@ -455,7 +455,7 @@ def test_cli_accepts_only_exact_public_confirmation_phrase(tmp_path):
     assert "Migration completed successfully." in output
 
 
-def test_current_schema_version_is_seven_without_changing_migration_compatibility():
-    assert CURRENT_SCHEMA_VERSION == 7
+def test_current_schema_version_is_eight_without_changing_migration_compatibility():
+    assert CURRENT_SCHEMA_VERSION == 8
     assert SCHEMA_V6_VERSION == 6
     assert SCHEMA_VERSION == 5

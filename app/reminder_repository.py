@@ -286,32 +286,6 @@ class ReminderRepository:
             ).fetchone()
         return self._reminder_from_row(row) if row is not None else None
 
-    def should_offer_reminder_prompt(self, item_id: int, user_id: int) -> bool:
-        with self.database.connection() as connection:
-            item = connection.execute(
-                """
-                SELECT status, reminder_prompt_dismissed_at
-                FROM personal_items
-                WHERE id = ? AND user_id = ?
-                """,
-                (item_id, user_id),
-            ).fetchone()
-            if item is None:
-                raise NotFoundError("item not found")
-            has_reminder = connection.execute(
-                """
-                SELECT 1 FROM reminders
-                WHERE item_id = ? AND user_id = ?
-                LIMIT 1
-                """,
-                (item_id, user_id),
-            ).fetchone()
-        return (
-            item["status"] == "active"
-            and item["reminder_prompt_dismissed_at"] is None
-            and has_reminder is None
-        )
-
     def mark_due_reminders(
         self,
         user_id: int,

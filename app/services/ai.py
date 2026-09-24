@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from datetime import date
 from typing import Any
 
@@ -10,7 +9,13 @@ import httpx
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.schemas import AIExtraction, FailureType, PersonalItemPublic
+from app.schemas import (
+    AIExtraction,
+    AIItemFields,
+    FailureType,
+    ImportantField,
+    PersonalItemPublic,
+)
 
 
 class AIServiceError(Exception):
@@ -63,6 +68,8 @@ class AIService(ABC):
         self,
         original_text: str,
         existing_item: PersonalItemPublic | None,
+        *,
+        current_local_date: date,
     ) -> AIExtraction:
         raise NotImplementedError
 
@@ -72,6 +79,8 @@ class DisabledAIService(AIService):
         self,
         original_text: str,
         existing_item: PersonalItemPublic | None,
+        *,
+        current_local_date: date,
     ) -> AIExtraction:
         raise AIConfigurationError(
             "AI_PROVIDER is disabled or was not configured"
@@ -91,44 +100,34 @@ class MisconfiguredAIService(AIService):
         self,
         original_text: str,
         existing_item: PersonalItemPublic | None,
+        *,
+        current_local_date: date,
     ) -> AIExtraction:
         raise AIConfigurationError(self.technical_message, self.user_message)
 
 
+def without_legacy_priority(extraction: AIExtraction) -> AIExtraction:
+    """Ignore retired provider metadata; never erase historical stored values."""
+    return extraction.model_copy(update={
+        "fields": AIItemFields.model_validate(extraction.fields.model_dump(
+            exclude_unset=True, exclude={"importance", "urgency"},
+        )),
+        "evidence_fields": extraction.evidence_fields - {
+            ImportantField.IMPORTANCE, ImportantField.URGENCY,
+        },
+    })
+
+
 INSTRUCTIONS = """
 You extract a Personal Item from user-confirmed text. Return only the requested
-structured result. Never invent importance, urgency, or a deadline. Use
-"unknown" for importance/urgency when the user's text does not support a value,
-and null for missing optional values. Add importance, urgency, or deadline to
-evidence_fields only when the latest user text directly supports that field.
-
-Importance and urgency evidence may be explicit labels or a conservative
-inference from facts in the user's own words. Relevant evidence includes:
-- explicit consequences of doing or not doing the item;
-- dependencies or impact on the user's stated plans;
-- external requirements and deadlines;
-- stated goals and opportunities whose impact the user describes;
-- direct time pressure, blockers, or a risk that changes with delay.
-
-Judge importance and urgency separately. A deadline normally supports urgency,
-but does not by itself prove importance. A consequence or impact on a stated
-goal may support importance, but does not by itself prove immediate urgency.
-Use the user's context instead of stereotypes about the item type. Never infer
-that purchases are low importance, study is high importance, or any other
-generic category has a fixed priority. If the user's words do not provide enough
-evidence for one field, keep only that field "unknown". When a supported
-inference is made, include that field in evidence_fields because the evidence
-still comes from the user's text.
-
-Calibrate each field from the strength of that evidence:
-- high: strong direct consequences or impact for importance; explicit immediate
-  time pressure or a near hard deadline for urgency;
-- medium: meaningful but limited impact, or a real external requirement/time
-  constraint that is not clearly immediate;
-- low: the user explicitly frames the impact or time pressure as minor,
-  deferrable, or not urgent;
-- unknown: the text does not support a reliable level.
-Do not combine multiple weak generic assumptions to manufacture evidence.
+structured result. Importance and urgency are retired legacy fields: do not
+infer or classify them, even when the text states consequences or time pressure.
+Omit importance and urgency from fields and evidence_fields for create, update,
+and full-history reprocess. Preserve the user's stated consequences, constraints,
+and time pressure as factual context in extra_information instead.
+Never invent a deadline. Include deadline in evidence_fields only when the
+latest user text directly supports it. Use null for missing optional values.
+Pin is exclusively user-controlled through the application. Never emit is_pinned.
 
 For a new item, provide a concise title, a short type (use "other" when a more
 specific type is not reliable), active status, and all facts supported by the
@@ -168,7 +167,6 @@ qualifiers. estimated_time is always an integer number of minutes:
 - Wrong: "estimated_time": "约1小时"
 
 Use these exact enum values:
-- importance and urgency: "high", "medium", "low", or "unknown"
 - status: "active", "completed", or "trash"
 Use JSON null for an optional value that is not supported by the user's text.
 Do not use empty strings, "unknown", "待定", or other placeholder text for
@@ -198,8 +196,8 @@ Examples:
 - "过几天提醒我问学长" -> {"intent": true,
   "temporal_expression": "过几天"}
 
-The request includes current_local_date, calculated by the application at
-runtime. Ground all dates against it:
+The request includes current_local_date, calculated in the user's profile
+timezone for this request. Ground all dates against it:
 1. Preserve an explicit year supplied by the user.
 2. When a future task gives month/day without a year, use the next reasonable
    future occurrence; never silently choose a past year.
@@ -209,6 +207,9 @@ runtime. Ground all dates against it:
    null and preserve that month-level date fact in extra_information.
 5. If an exact interpretation is genuinely ambiguous, leave deadline null and
    preserve the user's date wording in extra_information.
+Date-only deadlines are floating calendar dates: never add midnight or an
+invented timezone offset. Datetimes without an explicit offset are local wall
+times in the user's profile timezone; preserve explicitly supplied offsets.
 """.strip()
 
 
@@ -222,7 +223,6 @@ class OpenAIResponsesAIService(AIService):
         model: str,
         timeout_seconds: float,
         client: httpx.AsyncClient | None = None,
-        today_provider: Callable[[], date] | None = None,
     ) -> None:
         if not api_url or not api_key or not model:
             raise AIConfigurationError(
@@ -233,19 +233,20 @@ class OpenAIResponsesAIService(AIService):
         self.model = model
         self.timeout_seconds = timeout_seconds
         self._client = client
-        self._today_provider = today_provider or date.today
 
     async def extract(
         self,
         original_text: str,
         existing_item: PersonalItemPublic | None,
+        *,
+        current_local_date: date,
     ) -> AIExtraction:
         context: dict[str, Any] = {
             "operation": "update" if existing_item is not None else "create",
-            "current_local_date": self._today_provider().isoformat(),
+            "current_local_date": current_local_date.isoformat(),
             "latest_user_text": original_text,
             "existing_item": (
-                existing_item.model_dump(mode="json")
+                existing_item.model_dump(mode="json", exclude={"is_pinned"})
                 if existing_item is not None
                 else None
             ),
@@ -314,7 +315,7 @@ class OpenAIResponsesAIService(AIService):
 
         output_text = self._extract_output_text(response_data)
         try:
-            return AIExtraction.model_validate_json(output_text)
+            return without_legacy_priority(AIExtraction.model_validate_json(output_text))
         except (ValueError, ValidationError) as exc:
             raise AIInvalidOutputError(
                 f"structured output validation failed: {exc}"

@@ -29,6 +29,8 @@ class FunctionAIService(AIService):
         self,
         original_text: str,
         existing_item: PersonalItemPublic | None,
+        *,
+        current_local_date,
     ) -> AIExtraction:
         self.calls += 1
         return self.handler(original_text, existing_item)

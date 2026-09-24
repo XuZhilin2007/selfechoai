@@ -124,7 +124,7 @@ def test_deadline_fact_without_reminder_intent_creates_no_reminder(client_factor
 
     assert detail["item"]["deadline"] == "2026-10-15"
     assert detail["reminder"] is None
-    assert dashboard_item["show_reminder_prompt"] is True
+    assert dashboard_item["show_reminder_prompt"] is False
 
 
 def test_explicit_deadline_and_reminder_remain_separate(client_factory):

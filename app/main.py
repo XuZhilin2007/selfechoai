@@ -33,7 +33,12 @@ from app.priority import rank_items
 from app.push_routes import create_push_router
 from app.reminder_repository import ReminderRepository
 from app.reminder_routes import create_reminder_router
-from app.repository import InvalidOperationError, NotFoundError, Repository
+from app.repository import (
+    InvalidOperationError,
+    NotFoundError,
+    Repository,
+    utc_now,
+)
 from app.schemas import (
     BulkLifecycleAction,
     BulkLifecycleRequest,
@@ -263,7 +268,7 @@ def create_app(
 
     app = FastAPI(
         title="SelfEcho AI",
-        version="0.7.0",
+        version="0.8.0",
         lifespan=lifespan,
     )
     app.state.database = database
@@ -468,7 +473,9 @@ def create_app(
         if show_capture_queue:
             reminder_service.lazy_transition_due(current_user.id)
             sortable, needs_confirmation = rank_items(
-                repository.list_items_by_status(item_status, current_user.id)
+                repository.list_items_by_status(item_status, current_user.id),
+                timezone_name=current_user.timezone,
+                now=utc_now(),
             )
             if page is None:
                 resolved_page = 1
@@ -497,6 +504,7 @@ def create_app(
                     deadline=item.deadline,
                     estimated_time=item.estimated_time,
                     status=item.status,
+                    is_pinned=item.is_pinned,
                     completed_at=item.completed_at,
                     trashed_at=item.trashed_at,
                     status_before_trash=item.status_before_trash,

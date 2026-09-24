@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, field_validator
+from pydantic import (
+    BeforeValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StrictInt,
+    field_validator,
+)
 
 from app.time_utils import (
     normalize_utc_datetime,
@@ -171,7 +179,15 @@ class ImportantField(str, Enum):
     DEADLINE = "deadline"
 
 
-Deadline = date | datetime
+def _preserve_deadline_precision(value: Any) -> Any:
+    # Pydantic's date-first union otherwise accepts midnight datetimes as dates,
+    # dropping both explicit time precision and an absolute instant's offset.
+    if isinstance(value, str) and ("T" in value or " " in value):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
+Deadline = Annotated[date | datetime, BeforeValidator(_preserve_deadline_precision)]
 
 
 class StrictModel(BaseModel):
@@ -399,6 +415,7 @@ class PersonalItemPublic(StrictModel):
     status: ItemStatus
     next_action: str | None
     extra_information: dict[str, Any] | None
+    is_pinned: bool = False
     completed_at: datetime | None = None
     trashed_at: datetime | None = None
     status_before_trash: StatusBeforeTrash | None = None
@@ -480,6 +497,7 @@ class DashboardItem(StrictModel):
     deadline: Deadline | None
     estimated_time: int | None
     status: ItemStatus
+    is_pinned: bool = False
     completed_at: datetime | None
     trashed_at: datetime | None
     status_before_trash: StatusBeforeTrash | None
@@ -604,6 +622,7 @@ class EmailOperationResponse(StrictModel):
 
 
 class UserItemPatch(StrictModel):
+    is_pinned: bool = Field(default=False, strict=True)
     title: str | None = Field(default=None, min_length=1, max_length=200)
     type: str | None = Field(default=None, min_length=1, max_length=50)
     importance: PriorityLevel | None = None

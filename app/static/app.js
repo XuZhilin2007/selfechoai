@@ -959,7 +959,8 @@ function detailRefreshBlocked() {
   const modalOpen = document.querySelector(
     "#edit-dialog[open], #reminder-dialog[open]",
   );
-  return editorHasFocus || Boolean(dirtyForm) || Boolean(modalOpen);
+  const pinSaving = document.querySelector('#detail-pin-button[data-saving="true"]');
+  return editorHasFocus || Boolean(dirtyForm) || Boolean(modalOpen) || Boolean(pinSaving);
 }
 
 function scheduleDetailPoll(itemId, delay = 2500) {
@@ -1075,6 +1076,8 @@ function zonedParts(value, timezoneName = profileTimezone()) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
+    fractionalSecondDigits: 3,
     hourCycle: "h23",
   });
   return Object.fromEntries(
@@ -1143,6 +1146,9 @@ function reminderNaturalText(reminder) {
   if (!reminder?.remind_at) return "还需要选择一个具体时间";
   const target = new Date(reminder.remind_at);
   const difference = target.getTime() - Date.now();
+  if (difference <= -86_400_000) {
+    return `已过期 ${Math.floor(-difference / 86_400_000)} 天`;
+  }
   if (reminder.status === "due" || difference <= 0) {
     const minutes = Math.floor(Math.abs(difference) / 60_000);
     return minutes < 1 ? "刚刚到了提醒时间" : `${minutes} 分钟前已到提醒时间`;
@@ -1174,29 +1180,56 @@ function reminderCardText(reminder) {
   return `提醒 · ${reminderNaturalText(reminder).replace("会微提醒你", "")}`;
 }
 
-function tag(label, value) {
-  return `<span class="tag ${escapeHtml(value)}">${escapeHtml(label)}：${escapeHtml(labels[value] || value)}</span>`;
-}
-
 function itemTypeLabel(value) {
   return itemTypeLabels[value] || String(value).replaceAll("_", " ").replaceAll("-", " ");
 }
 
-function deadlinePresentation(value) {
+function deadlineTemporalState(value, now = new Date()) {
   if (!value) return null;
-  const [year, month, day] = value.slice(0, 10).split("-").map(Number);
-  const deadline = new Date(year, month - 1, day);
-  if (Number.isNaN(deadline.getTime())) {
-    return { text: `截止 ${formatDate(value)}`, emphasis: false };
-  }
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const difference = Math.round((deadline.getTime() - today.getTime()) / 86_400_000);
-  if (difference < 0) return { text: `已截止 ${formatDate(value)}`, emphasis: true, kind: "overdue" };
-  if (difference === 0) return { text: "今天截止", emphasis: true, kind: "deadline" };
-  if (difference === 1) return { text: "明天截止", emphasis: true, kind: "deadline" };
-  if (difference <= 7) return { text: `${difference} 天后截止`, emphasis: true, kind: "deadline" };
-  return { text: `截止 ${formatDate(value)}`, emphasis: false };
+  const nowParts = zonedParts(now);
+  const today = `${nowParts.year}-${nowParts.month}-${nowParts.day}`;
+  const timed = value.includes("T") || value.includes(" ");
+  const aware = timed && /(?:Z|[+-]\d{2}:\d{2})$/i.test(value);
+  const parts = aware ? zonedParts(value) : null;
+  const localDate = parts ? `${parts.year}-${parts.month}-${parts.day}` : value.slice(0, 10);
+  const localTime = !timed ? null : parts
+    ? `${parts.hour}:${parts.minute}:${parts.second}.${parts.fractionalSecond}`
+    : value.slice(11);
+  const nowTime = `${nowParts.hour}:${nowParts.minute}:${nowParts.second}.${nowParts.fractionalSecond}`;
+  // Fixed-width local wall strings preserve naive precision without inventing
+  // an offset, UTC instant, or DST fold for legacy values.
+  const wallTime = (clock) => {
+    const [whole, fraction = ""] = clock.split(".");
+    return `${whole.length === 5 ? `${whole}:00` : whole}.${fraction.padEnd(6, "0")}`;
+  };
+  const overdue = aware ? new Date(value).getTime() < new Date(now).getTime()
+    : localDate < today || (timed && localDate === today && wallTime(localTime) < wallTime(nowTime));
+  return { localDate, localTime, overdue, today };
+}
+
+function deadlineDisplay(value) {
+  const state = deadlineTemporalState(value);
+  if (!state) return "";
+  const clock = state.localTime ? ` ${state.localTime.slice(0, 5)}` : "";
+  return `${formatDate(state.localDate)}${clock}`;
+}
+
+function deadlinePresentation(value, now = new Date()) {
+  const state = deadlineTemporalState(value, now);
+  if (!state) return null;
+  const clock = state.localTime ? ` ${state.localTime.slice(0, 5)}` : "";
+  const exact = `${formatDate(state.localDate)}${clock}`;
+  if (state.overdue) return { text: `已截止 ${exact}`, emphasis: true, kind: "overdue" };
+  // UTC is only used for calendar-day arithmetic, not as a date-only deadline.
+  const dayNumber = (text) => {
+    const [year, month, day] = text.split("-").map(Number);
+    return Date.UTC(year, month - 1, day) / 86_400_000;
+  };
+  const difference = dayNumber(state.localDate) - dayNumber(state.today);
+  if (difference === 0) return { text: `今天${clock}截止`, emphasis: true, kind: "deadline" };
+  if (difference === 1) return { text: `明天${clock}截止`, emphasis: true, kind: "deadline" };
+  if (difference <= 7) return { text: `${difference} 天后${clock}截止`, emphasis: true, kind: "deadline" };
+  return { text: `截止 ${exact}`, emphasis: false };
 }
 
 function selectedDashboardStatus() {
@@ -1322,13 +1355,6 @@ function selectionIndicator(itemId) {
 function itemCard(item) {
   const signals = [];
   const metadata = [];
-  if (item.importance === "high") signals.push('<span class="card-signal importance">高重要</span>');
-  else if (item.importance !== "unknown") metadata.push(`重要 ${labels[item.importance]}`);
-  if (item.urgency === "high") signals.push('<span class="card-signal urgency">高紧急</span>');
-  else if (item.urgency !== "unknown") metadata.push(`紧急 ${labels[item.urgency]}`);
-  if (item.importance === "unknown" || item.urgency === "unknown") {
-    signals.push('<span class="card-signal unknown">优先级待确认</span>');
-  }
   const deadline = deadlinePresentation(item.deadline);
   if (deadline?.emphasis) {
     signals.push(`<span class="card-signal ${escapeHtml(deadline.kind)}">${escapeHtml(deadline.text)}</span>`);
@@ -1784,24 +1810,6 @@ function openReminderEditor({ item, reminder = null, onSaved }) {
   else dialog.setAttribute("open", "");
 }
 
-function quickPriorityButtons(item, field) {
-  const fieldLabel = field === "importance" ? "重要性" : "紧急性";
-  return `
-    <div class="quick-priority-row">
-      <span>${fieldLabel}</span>
-      <div class="quick-priority-buttons" role="group" aria-label="${escapeHtml(item.title)}的${fieldLabel}">
-        ${["low", "medium", "high"].map((value) => `
-          <button
-            class="priority-choice-button"
-            type="button"
-            data-item-id="${item.id}"
-            data-field="${field}"
-            data-value="${value}"
-          >${labels[value]}</button>`).join("")}
-      </div>
-    </div>`;
-}
-
 function quickConfirmationCard(item) {
   const reminderChoice = item.reminder?.status === "needs_confirmation"
     ? `
@@ -1812,21 +1820,10 @@ function quickConfirmationCard(item) {
             <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置时间</button>
           </div>
         </div>`
-    : item.show_reminder_prompt
-      ? `
-        <div class="quick-reminder-choice">
-          <span>需要提醒吗？</span>
-          <div>
-            <button class="secondary-button reminder-dismiss-button" type="button" data-item-id="${item.id}">不用</button>
-            <button class="primary-button reminder-set-button" type="button" data-item-id="${item.id}">设置提醒</button>
-          </div>
-        </div>`
-      : "";
+    : "";
   return `
     <article class="quick-confirmation-card">
       <h3>${escapeHtml(item.title)}</h3>
-      ${item.importance === "unknown" ? quickPriorityButtons(item, "importance") : ""}
-      ${item.urgency === "unknown" ? quickPriorityButtons(item, "urgency") : ""}
       ${reminderChoice}
     </article>`;
 }
@@ -3461,8 +3458,7 @@ function renderCapture() {
 
   function renderQuickConfirmation() {
     const items = quickItems.filter(
-      (item) => item.importance === "unknown" || item.urgency === "unknown" ||
-        item.show_reminder_prompt || item.reminder?.status === "needs_confirmation",
+      (item) => item.reminder?.status === "needs_confirmation",
     );
     quickSection.hidden = items.length === 0;
     quickCount.textContent = items.length;
@@ -3500,7 +3496,7 @@ function renderCapture() {
 
   quickList.addEventListener("click", async (event) => {
     const reminderChoice = event.target.closest(
-      ".reminder-decline-button, .reminder-dismiss-button, .reminder-set-button",
+      ".reminder-decline-button, .reminder-set-button",
     );
     if (reminderChoice) {
       const item = quickItems.find(
@@ -3513,7 +3509,6 @@ function renderCapture() {
           reminder: item.reminder,
           onSaved: async (saved) => {
             item.reminder = saved;
-            item.show_reminder_prompt = false;
             quickStatus.dataset.kind = "success";
             quickStatus.textContent = "微提醒已设置。";
             renderUpcomingReminders();
@@ -3540,57 +3535,7 @@ function renderCapture() {
         }
         return;
       }
-      reminderChoice.disabled = true;
-      quickStatus.dataset.kind = "";
-      quickStatus.textContent = "正在保存选择…";
-      try {
-        await api(`/api/items/${item.id}/reminder-prompt/dismiss`, {
-          method: "POST",
-        });
-        item.show_reminder_prompt = false;
-        quickStatus.dataset.kind = "success";
-        quickStatus.textContent = "已记住：这次不用提醒。";
-        renderQuickConfirmation();
-      } catch (error) {
-        quickStatus.dataset.kind = "error";
-        quickStatus.textContent = `选择未保存：${error.message}`;
-        reminderChoice.disabled = false;
-      }
       return;
-    }
-    const choice = event.target.closest(".priority-choice-button");
-    if (!choice) return;
-    const item = quickItems.find(
-      (candidate) => candidate.id === Number(choice.dataset.itemId),
-    );
-    if (!item) return;
-    if (pollTimer) window.clearTimeout(pollTimer);
-    pollTimer = null;
-
-    const field = choice.dataset.field;
-    const previousValue = item[field];
-    item[field] = choice.dataset.value;
-    quickStatus.dataset.kind = "";
-    quickStatus.textContent = "正在保存确认…";
-    renderQuickConfirmation();
-    try {
-      const updated = await api(`/api/items/${item.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          [field]: item[field],
-          confirmed_important_fields: true,
-        }),
-      });
-      item.importance = updated.importance;
-      item.urgency = updated.urgency;
-      quickStatus.dataset.kind = "success";
-      quickStatus.textContent = "已保存确认。";
-      renderQuickConfirmation();
-    } catch (error) {
-      item[field] = previousValue;
-      quickStatus.dataset.kind = "error";
-      quickStatus.textContent = `确认未保存：${error.message}`;
-      renderQuickConfirmation();
     }
   });
 
@@ -3965,9 +3910,7 @@ function buildEditForm(item) {
     <form id="edit-form" class="edit-form">
       <div class="full"><label for="edit-title">标题</label><input id="edit-title" value="${escapeHtml(item.title)}" maxlength="200" required /></div>
       <div><label for="edit-type">类型</label><input id="edit-type" value="${escapeHtml(item.type)}" maxlength="50" required /></div>
-      <div><label for="edit-importance">重要性</label><select id="edit-importance">${["unknown", "low", "medium", "high"].map((value) => `<option value="${value}" ${item.importance === value ? "selected" : ""}>${labels[value]}</option>`).join("")}</select></div>
-      <div><label for="edit-urgency">紧急性</label><select id="edit-urgency">${["unknown", "low", "medium", "high"].map((value) => `<option value="${value}" ${item.urgency === value ? "selected" : ""}>${labels[value]}</option>`).join("")}</select></div>
-      <div><label for="edit-deadline">截止日期</label><input id="edit-deadline" type="date" value="${escapeHtml(item.deadline ? item.deadline.slice(0, 10) : "")}" /></div>
+      <div><label for="edit-deadline">截止日期</label><input id="edit-deadline" type="date" value="${escapeHtml(deadlineTemporalState(item.deadline)?.localDate || "")}" /></div>
       <div><label for="edit-estimate">预计分钟数</label><input id="edit-estimate" type="number" min="1" max="100800" value="${item.estimated_time || ""}" /></div>
       <div class="full"><label for="edit-next">下一步</label><textarea id="edit-next" maxlength="1000">${escapeHtml(item.next_action || "")}</textarea></div>
       <details class="full edit-extra-disclosure">
@@ -3979,7 +3922,7 @@ function buildEditForm(item) {
         </div>
       </details>
       <div class="form-footer edit-form-footer">
-        <p id="edit-status-message" class="status-message" role="status">重要性、紧急性或截止日期变化会要求确认。</p>
+        <p id="edit-status-message" class="status-message" role="status">截止日期变化会要求确认。</p>
         <div class="edit-form-buttons">
           <button class="secondary-button" id="edit-cancel-button" type="button">取消</button>
           <button class="primary-button" type="submit">保存修正</button>
@@ -3992,8 +3935,6 @@ function changedPatch(item) {
   const candidate = {
     title: document.querySelector("#edit-title").value.trim(),
     type: document.querySelector("#edit-type").value.trim(),
-    importance: document.querySelector("#edit-importance").value,
-    urgency: document.querySelector("#edit-urgency").value,
     deadline: document.querySelector("#edit-deadline").value || null,
     estimated_time: document.querySelector("#edit-estimate").value
       ? Number(document.querySelector("#edit-estimate").value)
@@ -4002,7 +3943,7 @@ function changedPatch(item) {
   };
   const patch = {};
   Object.entries(candidate).forEach(([key, value]) => {
-    const original = key === "deadline" && item[key] ? item[key].slice(0, 10) : item[key];
+    const original = key === "deadline" && item[key] ? deadlineTemporalState(item[key]).localDate : item[key];
     if (value !== original) patch[key] = value;
   });
 
@@ -4083,6 +4024,13 @@ function reminderDetailSection(item, reminder) {
     </section>`;
 }
 
+function detailPinState(item) {
+  if (item.status !== "active") {
+    return item.is_pinned ? "已保留置顶设置，回到当前事项后生效。" : "未置顶";
+  }
+  return item.is_pinned ? "已置顶，在当前事项中靠前显示。" : "未置顶，可让这件事在当前事项中靠前显示。";
+}
+
 async function renderDetail(
   itemId,
   { silent = false, actionMessage = "", automatic = false } = {},
@@ -4113,6 +4061,11 @@ async function renderDetail(
             <span class="detail-state">${escapeHtml(labels[item.status])}</span>
           </div>
           <h1>${escapeHtml(item.title)}</h1>
+          <div class="detail-actions">
+            ${item.status === "active" ? `<button id="detail-pin-button" class="secondary-button" type="button">${item.is_pinned ? "取消置顶" : "置顶显示"}</button>` : ""}
+            <p id="detail-pin-state" class="muted">${detailPinState(item)}</p>
+          </div>
+          <p id="detail-pin-status" class="status-message" role="status"></p>
         </section>
 
         <div class="detail-content">
@@ -4123,10 +4076,8 @@ async function renderDetail(
             </div>
             <dl class="detail-grid">
               ${detailField("下一步", item.next_action || "未填写", true, "detail-next-action")}
-              ${detailField("截止日期", item.deadline ? formatDate(item.deadline) : "未填写")}
+              ${detailField("截止日期", item.deadline ? deadlineDisplay(item.deadline) : "未填写")}
               ${detailField("预计耗时", item.estimated_time ? `${item.estimated_time} 分钟` : "未填写")}
-              ${detailField("重要性", labels[item.importance])}
-              ${detailField("紧急性", labels[item.urgency])}
             </dl>
             ${item.extra_information && Object.keys(item.extra_information).length ? `
               <div class="supplemental-section">
@@ -4212,6 +4163,40 @@ async function renderDetail(
     const actionStatus = document.querySelector("#item-action-status");
     const reprocessStatus = document.querySelector("#reprocess-status");
     const reminderActionStatus = document.querySelector("#reminder-action-status");
+    const pinButton = document.querySelector("#detail-pin-button");
+    const pinState = document.querySelector("#detail-pin-state");
+    const pinStatus = document.querySelector("#detail-pin-status");
+    const syncPin = (updatedItem) => {
+      item.is_pinned = updatedItem.is_pinned;
+      item.status = updatedItem.status;
+      pinState.textContent = detailPinState(item);
+      if (pinButton) {
+        pinButton.hidden = item.status !== "active";
+        pinButton.textContent = item.is_pinned ? "取消置顶" : "置顶显示";
+      }
+    };
+    pinButton?.addEventListener("click", async () => {
+      if (pinButton.disabled || item.status !== "active") return;
+      pinButton.disabled = true;
+      pinButton.dataset.saving = "true";
+      pinStatus.dataset.kind = "";
+      pinStatus.textContent = "正在保存…";
+      try {
+        const updatedItem = await api(`/api/items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ is_pinned: !item.is_pinned }),
+        });
+        syncPin(updatedItem);
+        pinStatus.dataset.kind = "success";
+        pinStatus.textContent = "显示设置已保存。";
+      } catch (error) {
+        pinStatus.dataset.kind = "error";
+        pinStatus.textContent = `未能确认保存，请重试：${error.message}`;
+      } finally {
+        pinButton.dataset.saving = "false";
+        pinButton.disabled = false;
+      }
+    });
 
     const closeEditor = () => {
       if (typeof editDialog.close === "function") editDialog.close("cancel");
@@ -4309,9 +4294,9 @@ async function renderDetail(
           editMessage.textContent = "没有需要保存的变化。";
           return;
         }
-        const importantChanged = ["importance", "urgency", "deadline"].some((field) => Object.hasOwn(patch, field));
-        if (importantChanged && !window.confirm("确认修改重要性、紧急性或截止日期吗？")) return;
-        patch.confirmed_important_fields = importantChanged;
+        const deadlineChanged = Object.hasOwn(patch, "deadline");
+        if (deadlineChanged && !window.confirm("确认修改截止日期吗？")) return;
+        patch.confirmed_important_fields = deadlineChanged;
         setEditorSaving(true);
         editMessage.dataset.kind = "";
         editMessage.textContent = "正在保存修正…";
@@ -4415,13 +4400,16 @@ async function renderDetail(
     document.querySelectorAll(".lifecycle-status-button").forEach((button) => {
       button.addEventListener("click", async () => {
         const nextStatus = button.dataset.status;
+        if (pinButton?.disabled) return;
+        if (pinButton) pinButton.disabled = true;
         button.disabled = true;
         actionStatus.textContent = "正在更新状态…";
         try {
-          await api(`/api/items/${itemId}`, {
+          const updatedItem = await api(`/api/items/${itemId}`, {
             method: "PATCH",
             body: JSON.stringify({ status: nextStatus }),
           });
+          syncPin(updatedItem);
           if (detailRefreshBlocked()) {
             actionStatus.dataset.kind = "success";
             actionStatus.textContent = "状态已更新；当前未提交输入已保留。";
@@ -4433,6 +4421,8 @@ async function renderDetail(
           actionStatus.dataset.kind = "error";
           actionStatus.textContent = error.message;
           button.disabled = false;
+        } finally {
+          if (pinButton) pinButton.disabled = false;
         }
       });
     });

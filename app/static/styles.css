@@ -1022,43 +1022,6 @@ button[aria-busy="true"] {
   padding: 7px 12px;
 }
 
-.quick-priority-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 10px;
-}
-
-.quick-priority-row > span {
-  flex: 0 0 auto;
-  color: var(--muted);
-  font-size: 0.88rem;
-  font-weight: 750;
-}
-
-.quick-priority-buttons {
-  display: flex;
-  gap: 8px;
-}
-
-.priority-choice-button {
-  min-width: 44px;
-  min-height: 44px;
-  padding: 7px 12px;
-  color: var(--accent-deep);
-  border: 1px solid #b5cdbf;
-  border-radius: var(--radius-control);
-  background: var(--surface);
-  cursor: pointer;
-  font-weight: 800;
-}
-
-.priority-choice-button:hover {
-  border-color: var(--accent);
-  background: #cce4d5;
-}
-
 .item-list,
 .status-list {
   border-top: 1px solid var(--line-soft);
@@ -1111,14 +1074,8 @@ button[aria-busy="true"] {
   color: #a1a8a3;
 }
 
-.card-signal.importance,
-.card-signal.urgency,
 .card-signal.overdue {
   color: #6e4d20;
-}
-
-.card-signal.unknown {
-  color: var(--warning);
 }
 
 .card-meta {
@@ -1138,38 +1095,6 @@ button[aria-busy="true"] {
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
-}
-
-.tag {
-  display: inline-flex;
-  align-items: center;
-  min-height: 29px;
-  padding: 4px 9px;
-  color: #40504a;
-  border-radius: 6px;
-  background: #eef0eb;
-  font-size: 0.79rem;
-  font-weight: 700;
-}
-
-.tag.unknown {
-  color: var(--warning);
-  background: var(--warning-soft);
-}
-
-.tag.high {
-  color: #8c3532;
-  background: #f9dfdc;
-}
-
-.tag.medium {
-  color: #875317;
-  background: #fbedcf;
-}
-
-.tag.low {
-  color: #426257;
-  background: #e4eee8;
 }
 
 .status-card {

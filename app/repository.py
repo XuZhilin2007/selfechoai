@@ -233,6 +233,9 @@ class Repository:
             completed_at=_parse_optional_datetime(row["completed_at"]),
             trashed_at=_parse_optional_datetime(row["trashed_at"]),
             status_before_trash=row["status_before_trash"],
+            # Historical v7 migration consumers have no Pin column; startup
+            # still requires v8 for the application itself.
+            is_pinned=bool(row["is_pinned"]) if "is_pinned" in row.keys() else False,
             created_time=datetime.fromisoformat(row["created_time"]),
             updated_time=datetime.fromisoformat(row["updated_time"]),
         )
@@ -555,17 +558,9 @@ class Repository:
             raise InvalidOperationError("AI result for a new item requires a title")
 
         now = serialize_utc_datetime(utc_now(), field_name="now")
-        importance = (
-            fields.importance
-            if ImportantField.IMPORTANCE in evidence_fields
-            and fields.importance is not None
-            else PriorityLevel.UNKNOWN
-        )
-        urgency = (
-            fields.urgency
-            if ImportantField.URGENCY in evidence_fields and fields.urgency is not None
-            else PriorityLevel.UNKNOWN
-        )
+        # Legacy columns remain, but AI no longer authors priority metadata.
+        importance = PriorityLevel.UNKNOWN
+        urgency = PriorityLevel.UNKNOWN
         deadline = (
             fields.deadline
             if ImportantField.DEADLINE in evidence_fields
@@ -698,26 +693,8 @@ class Repository:
                     _status_transition_values(item_row, fields.status, now)
                 )
 
-            for name, important_field in (
-                ("importance", ImportantField.IMPORTANCE),
-                ("urgency", ImportantField.URGENCY),
-                ("deadline", ImportantField.DEADLINE),
-            ):
-                if name not in supplied or important_field not in evidence_fields:
-                    continue
-                value = getattr(fields, name)
-                if name in {"importance", "urgency"}:
-                    if value is None:
-                        continue
-                    # Unknown never erases an already known user/AI value.
-                    if (
-                        value == PriorityLevel.UNKNOWN
-                        and item_row[name] != PriorityLevel.UNKNOWN.value
-                    ):
-                        continue
-                    updates[name] = value.value
-                else:
-                    updates[name] = _serialize_deadline(value)
+            if "deadline" in supplied and ImportantField.DEADLINE in evidence_fields:
+                updates["deadline"] = _serialize_deadline(fields.deadline)
 
             if "extra_information" in supplied and fields.extra_information is not None:
                 existing = (
@@ -805,20 +782,6 @@ class Repository:
             if "next_action" in supplied and fields.next_action is not None:
                 updates["next_action"] = fields.next_action
 
-            for name, important_field in (
-                ("importance", ImportantField.IMPORTANCE),
-                ("urgency", ImportantField.URGENCY),
-            ):
-                value = getattr(fields, name)
-                if (
-                    name in supplied
-                    and important_field in evidence_fields
-                    and item_row[name] == PriorityLevel.UNKNOWN.value
-                    and value is not None
-                    and value != PriorityLevel.UNKNOWN
-                ):
-                    updates[name] = value.value
-
             if (
                 "deadline" in supplied
                 and ImportantField.DEADLINE in evidence_fields
@@ -860,6 +823,10 @@ class Repository:
         supplied = patch.model_fields_set - excluded
         if not supplied:
             raise InvalidOperationError("no item fields were supplied")
+        if {"status", "is_pinned"} <= supplied:
+            raise InvalidOperationError(
+                "status and is_pinned must be changed separately"
+            )
 
         important = {"importance", "urgency", "deadline"}
         if supplied & important and not patch.confirmed_important_fields:
@@ -888,6 +855,8 @@ class Repository:
             ).fetchone()
             if row is None:
                 raise NotFoundError("item not found")
+            if "is_pinned" in supplied and row["status"] != ItemStatus.ACTIVE.value:
+                raise InvalidOperationError("only active items allow Pin changes")
             if "status" in supplied and patch.status is not None:
                 values.update(
                     _status_transition_values(row, patch.status, timestamp)

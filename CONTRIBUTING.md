@@ -19,9 +19,10 @@ python -m pip install -e ".[dev]"
 cp .env.example .env
 python -m app.bootstrap
 python -m pytest
+node --test tests/*.mjs
 ~~~
 
-Windows PowerShell 可用 Copy-Item .env.example .env，并通过 .venv\Scripts\Activate.ps1 激活环境。
+Windows PowerShell 可用 Copy-Item .env.example .env，并通过 .venv\Scripts\Activate.ps1 激活环境。`node --test tests/*.mjs` 一次运行全部 JavaScript / Service Worker 合同测试；新增前端合同测试文件放入 `tests/` 即可被同一命令覆盖，无需单独枚举。
 
 ## Scope and Quality
 
@@ -47,12 +48,9 @@ Windows PowerShell 可用 Copy-Item .env.example .env，并通过 .venv\Scripts\
 
 ~~~bash
 python -m pytest
+node --test tests/*.mjs
 ~~~
 
-修改前端 Push 或 Service Worker 时，还需运行对应的合同测试，例如：
-
-~~~bash
-node --test tests/test_frontend_push.mjs tests/test_service_worker_push.mjs
-~~~
+修改前端、静态资源或 PWA 行为时，Node 合同测试必须全部通过；不要只运行其中单个文件。
 
 如果修改打包、静态资源或启动流程，还应执行 wheel 构建、全新环境安装和本地启动检查。

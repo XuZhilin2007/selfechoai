@@ -98,10 +98,9 @@ class ReminderService:
         reminder = self.reminders.get_relevant_reminder_for_item(item_id, user_id)
         return ItemReminderResponse(
             reminder=self._public(reminder) if reminder is not None else None,
-            show_reminder_prompt=self.reminders.should_offer_reminder_prompt(
-                item_id,
-                user_id,
-            ),
+            # Keep the response field for older clients; absence of a reminder
+            # no longer authorizes a generic Capture invitation.
+            show_reminder_prompt=False,
         )
 
     def create_reminder(

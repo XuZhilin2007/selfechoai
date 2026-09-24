@@ -1,7 +1,7 @@
-# SelfEcho AI v0.7 UI/UX Foundation
+# SelfEcho AI v0.8 UI/UX Foundation
 
-- 文档状态：current v0.7.0 foundation
-- 适用范围：v0.7.0 已实现界面；不是独立组件库或独立 release manifest
+- 文档状态：current v0.8.0 foundation
+- 适用范围：v0.8.0 已实现界面；不是独立组件库或独立 release manifest
 
 ## 1. North Star
 
@@ -28,7 +28,7 @@ SelfEcho 是用户一天会多次打开的安静个人工具。界面服务于 `
 
 顶层导航固定为 `记录 / 事项 / 账户`，使用单一轻量 selected indicator。移动端优先保证触达与 safe-area；桌面端使用合理 max-width 和行长。
 
-- Current 是工作区，可以显示影响下一步行动的优先级、Reminder、needs-confirmation、processing、failure 与 selection 状态，但不把每个字段变成 chip/badge。
+- Current 是工作区，按用户的显式 Pin 与 Deadline 时间相关性排序，并可显示 Reminder、needs-confirmation、processing、failure 与 selection 状态，但不把每个字段变成 chip/badge；重要性 / 紧急性等 legacy priority 信号不再展示。
 - History 比 Current 更轻，只表达 title 与真实可知的 completion 信息；未知 legacy 时间必须保持未知。
 - Trash 是 secondary management surface，只表达 title、近似 retention 和 selection；页面本身不使用危险红，红色只属于永久删除。
 - Upcoming Reminder 位于 Capture 主区域之后，最多约 3 条；整行进入 Detail，空时隐藏。

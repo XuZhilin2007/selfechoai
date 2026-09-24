@@ -57,6 +57,37 @@ def reminder_client(client_factory):
     return client_factory(FunctionAIService(reminder_ai))
 
 
+def test_plain_item_has_no_invitation_without_recording_a_decline(client_factory):
+    client = client_factory(FunctionAIService(lambda text, existing: AIExtraction(
+        fields=AIItemFields(
+            title=text, importance="medium", urgency="low", status="active",
+        ),
+        evidence_fields={"importance", "urgency"},
+    )))
+    item_id = create_item(client, "普通记录")
+    dashboard = client.get("/api/items").json()
+    assert dashboard["needs_confirmation"] == []
+    assert dashboard["sortable_items"][0]["show_reminder_prompt"] is False
+    assert dashboard["sortable_items"][0]["reminder"] is None
+    assert client.get(f"/api/items/{item_id}").json()["show_reminder_prompt"] is False
+    assert client.get(f"/api/items/{item_id}/reminder").json() == {
+        "reminder": None, "show_reminder_prompt": False,
+    }
+    with client.app.state.database.connection() as connection:
+        assert connection.execute(
+            "SELECT reminder_prompt_dismissed_at FROM personal_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()[0] is None
+        assert connection.execute("SELECT COUNT(*) FROM reminders").fetchone()[0] == 0
+    # Detail's manual recovery remains available without a prior decline.
+    created = client.post(f"/api/items/{item_id}/reminder", json={
+        "local_date": local_date_after("Asia/Shanghai", 2).isoformat(),
+    })
+    assert created.status_code == 201
+    assert created.json()["status"] == "scheduled"
+    assert client.get(f"/api/items/{item_id}").json()["reminder"]["id"] == created.json()["id"]
+
+
 def test_create_reschedule_cancel_and_default_time_conversion(reminder_client):
     client = reminder_client
     timezone_name = "Asia/Shanghai"
@@ -150,7 +181,7 @@ def test_invalid_or_past_manual_time_is_rejected_without_creating_reminder(
     assert past.status_code == 422
     state = client.get(f"/api/items/{item_id}/reminder").json()
     assert state["reminder"] is None
-    assert state["show_reminder_prompt"] is True
+    assert state["show_reminder_prompt"] is False
 
 
 def test_dst_gap_or_ambiguous_local_time_is_not_silently_guessed():
@@ -252,7 +283,7 @@ def test_reminder_writes_require_csrf_without_affecting_authenticated_reads(
     assert read_response.json()["reminder"] is None
 
 
-def test_prompt_dismissal_is_persistent_and_does_not_create_a_reminder(
+def test_legacy_prompt_dismissal_remains_compatible_without_offering_invitation(
     reminder_client,
 ):
     client = reminder_client
@@ -263,7 +294,15 @@ def test_prompt_dismissal_is_persistent_and_does_not_create_a_reminder(
         for item in before["needs_confirmation"] + before["sortable_items"]
         if item["id"] == item_id
     )
-    assert item_before["show_reminder_prompt"] is True
+    assert item_before["show_reminder_prompt"] is False
+    detail = client.get(f"/api/items/{item_id}").json()
+    assert detail["show_reminder_prompt"] is False
+    assert detail["reminder"] is None
+    with client.app.state.database.connection() as connection:
+        assert connection.execute(
+            "SELECT reminder_prompt_dismissed_at FROM personal_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()[0] is None
 
     dismissed = client.post(f"/api/items/{item_id}/reminder-prompt/dismiss")
 

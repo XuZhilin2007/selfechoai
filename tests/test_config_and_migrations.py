@@ -374,10 +374,11 @@ def test_new_database_initializes_directly_to_current_v7(tmp_path: Path):
         "idx_reminder_deliveries_user_status",
         "uq_reminder_deliveries_pair",
     } <= indexes
-    assert version == CURRENT_SCHEMA_VERSION == 7
+    assert version == CURRENT_SCHEMA_VERSION == 8
     assert {"completed_at", "trashed_at", "status_before_trash"} <= set(
         item_columns
     )
+    assert {"is_pinned"} <= set(item_columns)
     assert foreign_key_errors == []
     assert integrity == "ok"
 

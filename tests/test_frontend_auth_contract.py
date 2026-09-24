@@ -54,9 +54,9 @@ def test_service_worker_never_caches_api_responses_and_manifest_is_valid(
     shell_entries = service_worker.split("const SHELL = [", 1)[1].split("];", 1)[0]
     api_guard_index = service_worker.index('requestUrl.pathname.startsWith("/api/")')
     response_handler_index = service_worker.index("event.respondWith")
-    assert "selfecho-ai-community-v0.7.0-ui-1" in service_worker
-    assert '"/static/app.js?v=0.7.0-community-ui-1"' in shell_entries
-    assert '"/static/styles.css?v=0.7.0-community-ui-1"' in shell_entries
+    assert "selfecho-ai-community-v0.8.0-ui-1" in service_worker
+    assert '"/static/app.js?v=0.8.0-community-ui-1"' in shell_entries
+    assert '"/static/styles.css?v=0.8.0-community-ui-1"' in shell_entries
     assert "public-security-filing" not in service_worker
     assert "/api/" not in shell_entries
     assert api_guard_index < response_handler_index
@@ -83,8 +83,9 @@ def test_v07_quiet_utility_structure_and_community_setup_contract(
     assert "dashboard-title-row" in frontend
     assert "card-signals" in frontend
     assert "card-meta" in frontend
-    assert "高重要" in frontend
-    assert "优先级待确认" in frontend
+    assert "高重要" not in frontend
+    assert "优先级待确认" not in frontend
+    assert "已过期" in frontend
 
     detail_renderer = frontend.split("async function renderDetail", 1)[1].split(
         "function renderRoute", 1
@@ -198,7 +199,12 @@ def test_v07_quiet_utility_structure_and_community_setup_contract(
     assert "AUTH_COOKIE_SECURE=false" in environment_example
     assert "python -m app.migrations.v005_voice_capture" in readme
     assert "python -m app.migrations.v006_email_reminders" in readme
+    assert "python -m app.migrations.v007_item_lifecycle" in readme
+    assert "python -m app.migrations.v008_item_pin" in readme
     assert "MIGRATE PUBLIC V5 TO V6" in readme
+    assert "MIGRATE PUBLIC V6 TO V7" in readme
+    assert "MIGRATE PUBLIC V7 TO V8" in readme
+    assert "--check-only" in readme
     assert "qwen-audio-3.0-asr-flash" in readme
     assert "does not bundle or redistribute ffmpeg/ffprobe" in readme
     assert "limited real-device validation" in readme

@@ -4,7 +4,7 @@
 
 SelfEcho AI helps you capture ideas quickly and uses AI to organize them into structured Personal Items, while always preserving the original input and leaving every final decision to you. AI extracts and organizes information; it does not decide what matters, what to plan, or what to do next.
 
-**Status:** Community Edition 0.7.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.8.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
@@ -21,6 +21,10 @@ Scattered thoughts often appear earlier than conventional tasks, and they carry 
 - Personal Item dashboard with Current / History / Trash lifecycle views, bulk selection (up to 100 items per action), and pagination sized to one atomic bulk batch
 - 30-day Trash retention with an embedded retention worker; Trash restore returns an item to its known source state, and legacy items without a known source return to Current
 - Truthful completion timestamps: History shows the real `completed_at`, and legacy completions without a known time stay "完成时间未知" (completion time unknown)
+- Current dashboard ordering by explicit Pin first, then Deadline: overdue items by latest deadline, upcoming items by soonest deadline (timed before date-only within a day), then no-deadline items by recency; Pin is set on the Detail page, survives lifecycle transitions, and is never authored by AI
+- Legacy Importance/Urgency retirement: AI no longer infers, writes, or asks about importance and urgency; the user's stated consequences, constraints, and time pressure are preserved as factual context in `extra_information`
+- Deadline precision contract: date-only deadlines stay floating calendar dates and timed deadlines keep their entered precision; overdue states and ordering use your profile timezone (including relative-date grounding for AI extraction) without rewriting stored values
+- Overdue Reminder presentation shows complete elapsed 24-hour days ("已过期 N 天"); sub-day reminders keep minute/hour phrasing
 - Quiet Utility interface foundation: typography- and hierarchy-first layout, one primary action per context, reversible lifecycle actions without extra confirmation, and accessible long-press selection on touch/pen with a keyboard-reachable alternative
 - One-time Reminders, created manually or extracted by AI from natural language and resolved deterministically in your timezone; new Reminders default to today, and ambiguous time expressions stay in a `needs_confirmation` state
 - In-app due fallback, so Reminders remain usable without any notification setup
@@ -33,7 +37,7 @@ Scattered thoughts often appear earlier than conventional tasks, and they carry 
 - Login, logout, server-side sessions, and CSRF protection
 - Registration closed by default, with optional invite registration
 - Multi-user data ownership isolation
-- SQLite schema v7, with a required explicit v6→v7 migration for existing v0.6 databases
+- SQLite schema v8, with a required explicit v7→v8 migration for existing v0.7 databases
 
 Planner, calendar integration, and autonomous agents are not implemented yet.
 
@@ -210,7 +214,7 @@ python -m app.bootstrap
 Bootstrap will:
 
 - use the SQLite database configured via `APP_DATABASE_PATH` in `.env`;
-- initialize schema v6 when the database does not exist yet;
+- initialize the current schema (v8) when the database does not exist yet;
 - create one regular user only when the user count is 0;
 - read and confirm the password through `getpass`;
 - apply the same user constraints and Argon2id password hashing as the application;
@@ -280,9 +284,33 @@ Even without a provider key, you can still initialize the database, create a use
 - Reminder Email addresses, verification/challenge metadata, delivery destination snapshots, and provider status metadata are stored in SQLite; raw verification codes are not
 - `.env`, `data/`, `*.db`, WAL/SHM files, and logs are ignored by Git
 - The Community Edition ships no production data and no seeds derived from real data
-- Empty databases are initialized directly to schema v7
+- Empty databases are initialized directly to schema v8
 
 Never commit databases, backups, logs, or screenshots containing personal content to Git.
+
+## Upgrade from v0.7.0
+
+A v0.7.0 database uses schema v7; v0.8.0 uses schema v8. **v0.8.0 does not migrate a v0.7 database automatically.** Starting the new runtime against schema v7 fails closed and asks the operator to migrate explicitly.
+
+1. Stop the application/service and make sure no process is using the database.
+2. Create and validate a recoverable backup of the database file and any WAL/SHM companions that exist for it.
+3. Optionally run the migration's read-only preflight check against the actual configured database path:
+
+```bash
+python -m app.migrations.v008_item_pin --database data/selfecho.db --check-only
+```
+
+4. Run the explicit v7→v8 migration:
+
+```bash
+python -m app.migrations.v008_item_pin --database data/selfecho.db
+```
+
+5. At the prompt, enter the exact confirmation phrase `MIGRATE PUBLIC V7 TO V8`. The migration runs in one transaction, adds the `is_pinned` column (NOT NULL, default 0, CHECK-constrained to 0/1) to `personal_items`, and checks preserved row counts, all-historical-items-unpinned, schema structure, foreign keys, and SQLite integrity. Historical items are migrated unpinned.
+6. Restart the v0.8.0 application only after the migration reports success.
+7. Confirm that startup accepts schema v8 and that existing data and the Account page load as expected.
+
+A fresh v0.8.0 installation creates schema v8 directly and does not need to create or migrate schema v7 first.
 
 ## Upgrade from v0.6.0
 
@@ -304,9 +332,9 @@ python -m app.migrations.v007_item_lifecycle --database data/selfecho.db
 
 5. At the prompt, enter the exact confirmation phrase `MIGRATE PUBLIC V6 TO V7`. The migration runs in one transaction and checks preserved row counts, lifecycle metadata policy, schema structure, foreign keys, and SQLite integrity. Legacy trash items receive a fresh 30-day retention window; legacy completed items keep no invented completion time.
 6. Restart the v0.7.0 application only after the migration reports success.
-7. Confirm that startup accepts schema v7 and that existing data and the Account page load as expected.
+7. Confirm that startup accepts schema v7 and that existing data and the Account page load as expected, then apply the v7→v8 migration described above.
 
-A fresh v0.7.0 installation creates schema v7 directly and does not need to create or migrate schema v6 first. Older databases must still migrate sequentially: v4→v5 with `python -m app.migrations.v005_voice_capture`, then v5→v6 with `python -m app.migrations.v006_email_reminders`, then v6→v7 as above; schema v3 must first use `python -m app.migrations.v004_reminders` for v3→v4.
+A fresh v0.7.0 installation created schema v7 directly and did not need to create or migrate schema v6 first. Older databases must still migrate sequentially: v4→v5 with `python -m app.migrations.v005_voice_capture`, then v5→v6 with `python -m app.migrations.v006_email_reminders`, then v6→v7 as above, then v7→v8; schema v3 must first use `python -m app.migrations.v004_reminders` for v3→v4.
 
 ## Upgrade from v0.5.0
 
@@ -316,9 +344,10 @@ A v0.5.0 database uses schema v5; v0.6.0 uses schema v6. Migrate v5→v6 with `p
 
 ```bash
 python -m pytest
+node --test tests/*.mjs
 ```
 
-Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses, authentication, sessions, CSRF, invites, migrations, multi-user isolation, Reminders, temporal parsing, Current/History/Trash lifecycle, bulk lifecycle atomicity, Trash retention, Web Push security and subscriptions, Email settings/verification/privacy/delivery contracts, Voice Capture contracts (draft lifecycle, transcription, storage, deletion ledger), PWA behavior, plus first-user bootstrap and local/production cookie handling. The JavaScript and Service Worker contract tests live in `tests/*.mjs` and run with the Node test runner.
+Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses, authentication, sessions, CSRF, invites, migrations, multi-user isolation, Reminders, temporal parsing, Current/History/Trash lifecycle, bulk lifecycle atomicity, Trash retention, Web Push security and subscriptions, Email settings/verification/privacy/delivery contracts, Voice Capture contracts (draft lifecycle, transcription, storage, deletion ledger), PWA behavior, plus first-user bootstrap and local/production cookie handling. The JavaScript and Service Worker contract tests live in `tests/*.mjs` and run with the Node test runner (`node --test tests/*.mjs` runs all of them).
 
 ## Current Limitations
 
@@ -339,7 +368,7 @@ Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses,
 Vanilla JavaScript PWA (incl. Service Worker push handling)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite (schema v7)
+          ├── SQLite (schema v8)
           ├── DeepSeek / OpenAI provider abstraction
           ├── optional Voice Capture → external Voice storage → Alibaba ASR
           └── optional embedded Reminder worker
@@ -349,7 +378,7 @@ FastAPI + Uvicorn
 
 The core product principles: original input must never be lost; unknown information stays unknown; AI only organizes information, and the user is always the final decision maker.
 
-For full component, data-flow, authentication, multi-user isolation, Reminder channel/worker, PWA cache, and provider boundary details, see [Architecture](docs/ARCHITECTURE.md). Stable product boundaries are described in [Product Principles](docs/PRODUCT_PRINCIPLES.md), and the interface foundation is described in [UI/UX Foundation](docs/UI_UX_FOUNDATION.md). Release-candidate notes are in [Community Edition v0.7.0 Release Notes](docs/RELEASE_NOTES_v0.7.0.md).
+For full component, data-flow, authentication, multi-user isolation, Reminder channel/worker, PWA cache, and provider boundary details, see [Architecture](docs/ARCHITECTURE.md). Stable product boundaries are described in [Product Principles](docs/PRODUCT_PRINCIPLES.md), and the interface foundation is described in [UI/UX Foundation](docs/UI_UX_FOUNDATION.md). Current release notes are in [Community Edition v0.8.0 Release Notes](docs/RELEASE_NOTES_v0.8.0.md); earlier release notes remain as historical records.
 
 ## Security and Contributing
 

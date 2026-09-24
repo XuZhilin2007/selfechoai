@@ -28,9 +28,12 @@ def test_openai_adapter_validates_structured_output(response_shape):
             assert "may be a decision, idea" in payload["instructions"]
             assert "exploration rather than a traditional todo" in payload["instructions"]
             assert "current_local_date" in payload["instructions"]
-            assert "explicit consequences" in payload["instructions"]
-            assert "Judge importance and urgency separately" in payload["instructions"]
-            assert "generic category has a fixed priority" in payload["instructions"]
+            assert "Importance and urgency are retired legacy fields" in payload["instructions"]
+            assert "Omit importance and urgency" in payload["instructions"]
+            assert "conservative inference" not in payload["instructions"]
+            assert "Calibrate each field" not in payload["instructions"]
+            assert "Never emit is_pinned" in payload["instructions"]
+            assert "user's profile" in payload["instructions"]
             assert "reminder.intent is true only" in payload["instructions"]
             assert "a date, deadline, class, exam" in payload["instructions"]
             assert "Never calculate remind_at" in payload["instructions"]
@@ -76,11 +79,12 @@ def test_openai_adapter_validates_structured_output(response_shape):
                 model="test-model",
                 timeout_seconds=1,
                 client=client,
-                today_provider=lambda: date(2026, 8, 24),
             )
-            result = await service.extract("有空研究 AI Agent", None)
+            result = await service.extract(
+                "有空研究 AI Agent", None, current_local_date=date(2026, 8, 24)
+            )
             assert result.fields.title == "研究 AI Agent"
-            assert result.fields.importance.value == "unknown"
+            assert result.fields.importance is None
             assert result.reminder.intent is False
 
     import asyncio
@@ -124,7 +128,11 @@ def test_openai_adapter_returns_provider_independent_reminder_candidate():
                 timeout_seconds=1,
                 client=client,
             )
-            result = await service.extract("30分钟后提醒我继续学习", None)
+            result = await service.extract(
+                "30分钟后提醒我继续学习",
+                None,
+                current_local_date=date(2026, 8, 24),
+            )
 
         assert result.reminder.intent is True
         assert result.reminder.temporal_expression == "30分钟后"
@@ -171,7 +179,9 @@ def test_openai_adapter_rejects_malformed_reminder_candidate():
                 client=client,
             )
             with pytest.raises(AIInvalidOutputError):
-                await service.extract("明天提醒我", None)
+                await service.extract(
+                    "明天提醒我", None, current_local_date=date(2026, 8, 24)
+                )
 
     import asyncio
 
@@ -207,7 +217,7 @@ def test_openai_adapter_rejects_invalid_provider_data():
                 client=client,
             )
             with pytest.raises(AIInvalidOutputError) as error:
-                await service.extract("text", None)
+                await service.extract("text", None, current_local_date=date(2026, 8, 24))
             assert error.value.category == FailureType.INVALID_OUTPUT
 
     import asyncio
@@ -242,7 +252,7 @@ def test_openai_adapter_classifies_api_errors(status_code, expected_message):
                 client=client,
             )
             with pytest.raises(AIAPIError) as error:
-                await service.extract("text", None)
+                await service.extract("text", None, current_local_date=date(2026, 8, 24))
             assert error.value.category == FailureType.API
             assert expected_message in error.value.user_message
 
@@ -267,7 +277,7 @@ def test_openai_adapter_classifies_network_errors():
                 client=client,
             )
             with pytest.raises(AINetworkError) as error:
-                await service.extract("text", None)
+                await service.extract("text", None, current_local_date=date(2026, 8, 24))
             assert error.value.category == FailureType.NETWORK
             assert "网络" in error.value.user_message
 

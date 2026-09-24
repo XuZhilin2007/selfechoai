@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-SelfEcho AI Community Edition 目前仍处于早期阶段，仅维护当前 0.6.x 系列。
+SelfEcho AI Community Edition 目前仍处于早期阶段，仅维护当前 0.8.x 系列。
 
 | Version | Supported |
 | --- | --- |
-| 0.6.x | Yes |
-| < 0.6 | No |
+| 0.8.x | Yes |
+| < 0.8 | No |
 
 ## Reporting a Vulnerability
 
@@ -32,7 +32,7 @@ Community Edition 提供应用代码和本地运行默认值，不提供托管�
 
 ## Web Push Security（Community self-hosting）
 
-Community v0.6.0 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+Community v0.8.0 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
 
 ### VAPID
 
@@ -68,15 +68,15 @@ Push 订阅保存于自托管实例的 SQLite，包含 endpoint、p256dh 和 aut
 
 ### Deployment
 
-Community v0.6.0 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
+Community v0.8.0 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
 
 ## Email Reminder Security（Community self-hosting）
 
-Community v0.6.0 的 Email Reminder 是可选功能，默认通过 `EMAIL_REMINDER_PROVIDER_ENABLED=false` 关闭。关闭时不解析 Email 专用配置、不创建 Tencent client，也不需要 Tencent credentials、sender、template、verification pepper 或 Tencent network access。
+Community v0.8.0 的 Email Reminder 是可选功能，默认通过 `EMAIL_REMINDER_PROVIDER_ENABLED=false` 关闭。关闭时不解析 Email 专用配置、不创建 Tencent client，也不需要 Tencent credentials、sender、template、verification pepper 或 Tencent network access。
 
 ### Tencent SES credentials and templates
 
-- v0.6.0 只正式支持 Tencent SES。Secret ID/Key 与 `EMAIL_VERIFICATION_CODE_PEPPER` 都是秘密，只能保存在未跟踪的本地 `.env`，不得写入模板、日志、截图或 Git。
+- v0.8.0 只正式支持 Tencent SES。Secret ID/Key 与 `EMAIL_VERIFICATION_CODE_PEPPER` 都是秘密，只能保存在未跟踪的本地 `.env`，不得写入模板、日志、截图或 Git。
 - Sender identity 和所有 template 均由 self-host operator 自行创建与验证，不应复用或依赖 Hosted Service 的 sender、template ID 或 domain。
 - 主动启用 Provider 后，必需配置缺失或 region/timeout 无效会 fail closed。Test Email template 可选；缺失时普通 Reminder 仍可工作，但 Test Email 不可用。
 
@@ -91,7 +91,7 @@ Community v0.6.0 的 Email Reminder 是可选功能，默认通过 `EMAIL_REMIND
 
 ## Voice Capture Security（Community self-hosting）
 
-Community v0.6.0 的 Voice Capture 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+Community v0.8.0 的 Voice Capture 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
 
 ### ASR Provider boundary
 

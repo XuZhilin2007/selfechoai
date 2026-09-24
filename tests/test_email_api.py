@@ -25,6 +25,8 @@ class NoopAIService(AIService):
         self,
         original_text: str,
         existing_item: PersonalItemPublic | None,
+        *,
+        current_local_date=None,
     ) -> AIExtraction:
         raise AssertionError("Email API tests must not invoke AI")
 
