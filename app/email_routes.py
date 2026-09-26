@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.schemas import (
     EmailAddressRequest,
@@ -19,6 +19,19 @@ from app.services.email_reminders import (
     EmailOperationUnavailableError,
     EmailReminderService,
 )
+
+
+def _rate_limited_response(
+    exc: EmailOperationRateLimitedError,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=str(exc),
+        headers=(
+            {"Retry-After": str(exc.retry_after)}
+            if exc.retry_after is not None else None
+        ),
+    )
 
 
 def create_email_reminder_router(
@@ -53,7 +66,7 @@ def create_email_reminder_router(
         except EmailOperationUnavailableError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except EmailOperationRateLimitedError as exc:
-            raise HTTPException(status_code=429, detail=str(exc)) from exc
+            raise _rate_limited_response(exc) from exc
         except EmailOperationConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except EmailOperationProviderError as exc:
@@ -87,7 +100,7 @@ def create_email_reminder_router(
         except EmailOperationUnavailableError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except EmailOperationRateLimitedError as exc:
-            raise HTTPException(status_code=429, detail=str(exc)) from exc
+            raise _rate_limited_response(exc) from exc
         except EmailOperationConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except EmailOperationProviderError as exc:

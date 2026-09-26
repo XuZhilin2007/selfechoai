@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import AbstractContextManager, asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Protocol, TypeVar
 
+from app.provider_admission import GlobalProviderLimiter, ProviderAdmissionDenied
 from app.services.alibaba_asr import AlibabaASRError, AlibabaASRResult
 from app.services.voice_media import VoiceMediaError, VoiceMediaProcessor
 from app.services.voice_storage import VoiceStorage
@@ -93,11 +94,13 @@ class VoiceTranscriptionService:
         storage: VoiceStorage,
         media: VoiceMediaProcessor,
         provider: ASRProvider,
+        admission: GlobalProviderLimiter | None = None,
     ) -> None:
         self.repository = repository
         self.storage = storage
         self.media = media
         self.provider = provider
+        self.admission = admission
 
     async def process_initial(self, segment_id: int, user_id: int) -> None:
         if not self.repository.claim_pending_segment(segment_id, user_id):
@@ -116,11 +119,16 @@ class VoiceTranscriptionService:
                     prepared.input_kind,
                 ):
                     return
-                result = await self.provider.transcribe(
-                    prepared.path,
-                    format=prepared.format,
-                    sample_rate_hz=prepared.sample_rate_hz,
-                )
+                with (
+                    self.admission.acquire()
+                    if self.admission is not None
+                    else nullcontext()
+                ):
+                    result = await self.provider.transcribe(
+                        prepared.path,
+                        format=prepared.format,
+                        sample_rate_hz=prepared.sample_rate_hz,
+                    )
             self.repository.complete_transcription(
                 segment_id,
                 user_id,
@@ -132,9 +140,20 @@ class VoiceTranscriptionService:
                 segment_id,
                 user_id,
                 failure_code="interrupted",
-                failure_message="转写被服务中断；原始录音已保留，请手动重试。",
+                failure_message=(
+                    "转写被服务中断；原始录音已保留，请手动重试。"
+                ),
             )
             raise
+        except ProviderAdmissionDenied:
+            self.repository.mark_segment_failed(
+                segment_id,
+                user_id,
+                failure_code="quota_rate_limit",
+                failure_message=(
+                    "语音转写当前达到临时使用上限；原始录音已保留，请稍后手动重试。"
+                ),
+            )
         except VoiceMediaError as exc:
             self.repository.mark_segment_failed(
                 segment_id,

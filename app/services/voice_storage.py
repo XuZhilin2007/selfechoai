@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
 import uuid
 from collections.abc import AsyncIterable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+
+from app.services.storage_admission import StorageAdmission, VoiceStorageLease
 
 
 SERVER_PART_NAME = re.compile(r"^\.[0-9a-f]{32}\.part$")
@@ -26,6 +30,10 @@ class EmptyVoiceUploadError(VoiceStorageError):
 
 
 class VoiceUploadTooLargeError(VoiceStorageError):
+    pass
+
+
+class VoiceStorageCapacityError(VoiceStorageError):
     pass
 
 
@@ -107,15 +115,31 @@ class _OriginalWriter:
 class VoiceStorage:
     """Immutable Original Audio storage below an injected external root."""
 
-    def __init__(self, root: Path, max_upload_bytes: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        max_upload_bytes: int,
+        admission: StorageAdmission | None = None,
+    ) -> None:
         if max_upload_bytes <= 0:
             raise ValueError("max_upload_bytes must be positive")
         self.root = root.resolve()
         self.original_root = self.root / "original"
         self.tmp_root = self.root / "tmp"
         self.max_upload_bytes = max_upload_bytes
+        self.admission = admission
         self.original_root.mkdir(parents=True, exist_ok=True)
         self.tmp_root.mkdir(parents=True, exist_ok=True)
+
+    def reserve_original(self) -> VoiceStorageLease | None:
+        return self.admission.reserve_voice() if self.admission is not None else None
+
+    def _write_lease(self, reservation: VoiceStorageLease | None):
+        if reservation is not None:
+            if reservation._admission is not self.admission:
+                raise ValueError("Voice storage reservation belongs to another guard")
+            return reservation.fork()
+        return self.reserve_original() or nullcontext()
 
     def allocate_original_key(self) -> str:
         token = uuid.uuid4().hex
@@ -126,28 +150,54 @@ class VoiceStorage:
         chunks: Iterable[bytes],
         *,
         storage_key: str | None = None,
+        reservation: VoiceStorageLease | None = None,
     ) -> StoredOriginal:
-        writer = _OriginalWriter(self, storage_key or self.allocate_original_key())
-        try:
-            for chunk in chunks:
-                writer.write(chunk)
-            return writer.finish()
-        finally:
-            writer.abort()
+        with self._write_lease(reservation):
+            writer = None
+            try:
+                writer = _OriginalWriter(
+                    self,
+                    storage_key or self.allocate_original_key(),
+                )
+                for chunk in chunks:
+                    writer.write(chunk)
+                return writer.finish()
+            except OSError as exc:
+                if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                    raise VoiceStorageCapacityError(
+                        "Original Audio storage is full"
+                    ) from exc
+                raise
+            finally:
+                if writer is not None:
+                    writer.abort()
 
     async def store_original_async(
         self,
         chunks: AsyncIterable[bytes],
         *,
         storage_key: str | None = None,
+        reservation: VoiceStorageLease | None = None,
     ) -> StoredOriginal:
-        writer = _OriginalWriter(self, storage_key or self.allocate_original_key())
-        try:
-            async for chunk in chunks:
-                writer.write(chunk)
-            return writer.finish()
-        finally:
-            writer.abort()
+        with self._write_lease(reservation):
+            writer = None
+            try:
+                writer = _OriginalWriter(
+                    self,
+                    storage_key or self.allocate_original_key(),
+                )
+                async for chunk in chunks:
+                    writer.write(chunk)
+                return writer.finish()
+            except OSError as exc:
+                if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                    raise VoiceStorageCapacityError(
+                        "Original Audio storage is full"
+                    ) from exc
+                raise
+            finally:
+                if writer is not None:
+                    writer.abort()
 
     def resolve_original(self, storage_key: str) -> Path:
         if not isinstance(storage_key, str):

@@ -35,8 +35,8 @@ def create_database(path: Path) -> Database:
     return database
 
 
-def test_fresh_database_initializes_complete_public_schema_v8(tmp_path: Path):
-    database = create_database(tmp_path / "fresh-v8.db")
+def test_fresh_database_initializes_complete_public_schema_v9(tmp_path: Path):
+    database = create_database(tmp_path / "fresh-v9.db")
     with database.connection() as connection:
         tables = {
             row["name"]
@@ -65,7 +65,7 @@ def test_fresh_database_initializes_complete_public_schema_v8(tmp_path: Path):
             for row in connection.execute("PRAGMA table_info(personal_items)")
         }
 
-    assert version == CURRENT_SCHEMA_VERSION == 8
+    assert version == CURRENT_SCHEMA_VERSION == 9
     assert "is_pinned" in personal_item_columns
     assert {
         "users",

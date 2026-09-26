@@ -17,7 +17,7 @@ FastAPI application
         ├── Background AI processing
         ├── 可选嵌入式 Reminder worker（定时 due 扫描 + Push / Email 投递）
         ├── 嵌入式 Trash retention worker（30 天回收站过期清理）
-        ├── SQLite schema v8
+        ├── SQLite schema v9
         ├── 可选 Tencent SES Email Provider boundary
         ├── 可选外部 Voice 存储 + Alibaba ASR boundary
         └── DeepSeek or OpenAI provider boundary
@@ -216,9 +216,11 @@ Email delivery 真正出站前会两次按当前数据重新检查 destination �
 
 - 默认数据库是 data/selfecho.db。
 - SQLite 启用 foreign_keys、busy_timeout 和 WAL。
-- 新空数据库直接初始化为 schema v8。
+- 新空数据库直接初始化为 schema v9。
 - 应用启动只验证已有数据库版本和必需结构，不执行隐式升级；遇到不支持的旧版本会拒绝启动并提示显式迁移。
-- schema v8 在 v7 的 `personal_items` 上新增 `is_pinned INTEGER NOT NULL DEFAULT 0 CHECK (is_pinned IN (0, 1))`。`CURRENT_SCHEMA_VERSION = 8`；`SCHEMA_V7_VERSION = 7` 供 v007 迁移与 v008 迁移的源版本校验引用。
+- schema v9 在 v8 的 `voice_segments` 上扩展 `transcription_status` 状态机（新增持久化状态 `transcribed`：Provider 整段转写已完成并存储，但尚未接受进入 Capture Draft）与 Streaming Voice 模型标识。`CURRENT_SCHEMA_VERSION = 9`；`SCHEMA_V7_VERSION = 7` 等历史版本常量供对应迁移的源版本校验引用。
+- schema v8 在 v7 的 `personal_items` 上新增 `is_pinned INTEGER NOT NULL DEFAULT 0 CHECK (is_pinned IN (0, 1))`。
+- app/migrations/v009_voice_segment_state.py 提供显式 v8→v9 迁移：`--check-only` 只读预检；正式迁移要求应用已停止、存在经过验证且可恢复的 v8 备份，并输入精确文字 `MIGRATE PUBLIC V8 TO V9`。迁移在单一 transaction 中重建 `voice_segments` 表，逐行保留既有数据并恢复自增高位水印与既有索引，验证行数据守恒、schema 结构（含 v9 Voice Segment contract 与 is_pinned boolean contract）、foreign key 与 integrity；任一步骤失败整体回滚。
 - app/migrations/v008_item_pin.py 提供显式 v7→v8 迁移：`--check-only` 只读预检；正式迁移要求应用已停止、存在经过验证且可恢复的 v7 备份，并输入精确文字 `MIGRATE PUBLIC V7 TO V8`。迁移在单一 transaction 中新增 Pin 列，验证行数守恒、历史事项全部未置顶、schema 结构（含 is_pinned boolean contract）、foreign key 与 integrity；任一步骤失败整体回滚。
 - schema v7 在 v6 的 `personal_items` 上新增 `completed_at`、`trashed_at` 与 `status_before_trash`（CHECK 限定 active/completed），并新增 `idx_personal_items_lifecycle` 与 `idx_personal_items_trash_retention` 索引。
 - app/migrations/v007_item_lifecycle.py 提供显式 v6→v7 迁移：`--check-only` 只读预检；正式迁移要求应用已停止、存在经过验证且可恢复的 v6 备份，并输入精确文字 `MIGRATE PUBLIC V6 TO V7`。迁移在单一 transaction 中新增生命周期列与索引，为 legacy Trash 写入迁移时刻作为 `trashed_at`（全新 30 天保留期），legacy 完成事项保持 `completed_at = NULL`，并验证行数守恒、lifecycle 策略、schema、foreign key 与 integrity。

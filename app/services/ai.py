@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from datetime import date
 from typing import Any
 
@@ -9,6 +10,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.config import Settings
+from app.provider_admission import GlobalProviderLimiter, ProviderAdmissionDenied
 from app.schemas import (
     AIExtraction,
     AIItemFields,
@@ -58,6 +60,40 @@ class AIInvalidOutputError(AIServiceError):
     default_user_message = (
         "AI 返回内容不符合事项格式；请重试，并确认所选模型支持结构化输出。"
     )
+
+
+class AIAdmissionError(AIServiceError):
+    category = FailureType.API
+    default_user_message = "AI 当前达到临时使用上限；原始记录已保留，请稍后明确重试。"
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__("AI provider admission denied")
+        self.retry_after = retry_after
+
+
+class AIInputSizeError(AIServiceError):
+    category = FailureType.API
+    default_user_message = "AI 整理内容超过当前上限；原始记录已保留，未发送给 AI。"
+
+
+async def guarded_ai_post(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    admission: GlobalProviderLimiter | None,
+    max_input_bytes: int,
+) -> httpx.Response:
+    """Bound the exact UTF-8 JSON body and admit each outbound call."""
+
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(body) > max_input_bytes:
+        raise AIInputSizeError("provider-bound AI JSON body exceeds configured bytes")
+    try:
+        with admission.acquire() if admission is not None else nullcontext():
+            return await client.post(url, content=body, headers=headers)
+    except ProviderAdmissionDenied as exc:
+        raise AIAdmissionError(exc.retry_after) from exc
 
 
 class AIService(ABC):
@@ -223,16 +259,22 @@ class OpenAIResponsesAIService(AIService):
         model: str,
         timeout_seconds: float,
         client: httpx.AsyncClient | None = None,
+        admission: GlobalProviderLimiter | None = None,
+        max_input_bytes: int = 1_000_000,
     ) -> None:
         if not api_url or not api_key or not model:
             raise AIConfigurationError(
                 "AI_API_URL, AI_API_KEY/OPENAI_API_KEY and AI_MODEL are required"
             )
+        if max_input_bytes <= 0:
+            raise ValueError("AI provider input limit must be positive")
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
         self._client = client
+        self.admission = admission
+        self.max_input_bytes = max_input_bytes
 
     async def extract(
         self,
@@ -273,13 +315,15 @@ class OpenAIResponsesAIService(AIService):
 
         try:
             if self._client is not None:
-                response = await self._client.post(
-                    self.api_url, json=payload, headers=headers
+                response = await guarded_ai_post(
+                    self._client, self.api_url, payload, headers,
+                    self.admission, self.max_input_bytes,
                 )
             else:
                 async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                    response = await client.post(
-                        self.api_url, json=payload, headers=headers
+                    response = await guarded_ai_post(
+                        client, self.api_url, payload, headers,
+                        self.admission, self.max_input_bytes,
                     )
         except httpx.TimeoutException as exc:
             raise AINetworkError("AI provider request timed out") from exc
@@ -374,7 +418,9 @@ class OpenAIResponsesAIService(AIService):
         return "AI 服务请求失败，请检查 API 配置后重试。"
 
 
-def create_ai_service(settings: Settings) -> AIService:
+def create_ai_service(
+    settings: Settings, admission: GlobalProviderLimiter | None = None
+) -> AIService:
     if settings.ai_provider == "disabled":
         return DisabledAIService()
     if settings.ai_provider == "deepseek":
@@ -405,6 +451,8 @@ def create_ai_service(settings: Settings) -> AIService:
             model=settings.deepseek_model,
             timeout_seconds=settings.ai_timeout_seconds,
             debug_output=settings.ai_debug_output,
+            admission=admission,
+            max_input_bytes=settings.ai_provider_input_max_bytes,
         )
     if settings.ai_provider == "openai":
         missing = []
@@ -423,6 +471,8 @@ def create_ai_service(settings: Settings) -> AIService:
             api_key=settings.ai_api_key,
             model=settings.ai_model,
             timeout_seconds=settings.ai_timeout_seconds,
+            admission=admission,
+            max_input_bytes=settings.ai_provider_input_max_bytes,
         )
     return MisconfiguredAIService(
         f"unsupported AI_PROVIDER: {settings.ai_provider}"

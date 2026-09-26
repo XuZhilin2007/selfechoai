@@ -15,6 +15,7 @@ from app.config import Settings
 from app.main import create_app
 from app.services.ai import DisabledAIService
 from app.services.alibaba_asr import AlibabaASRNetworkError, AlibabaASRResult
+from app.services.storage_admission import DATABASE_WRITE_ALLOWANCE
 from app.services.voice_media import MediaMetadata, PreparedASRAudio
 from app.services.voice_storage import VoiceStorageError
 
@@ -297,7 +298,7 @@ def test_storage_failure_is_controlled_and_does_not_register_segment(
     app, user_a, _, _, _, provider = voice_clients
     draft = create_draft(user_a)
 
-    async def fail_store(chunks, *, storage_key):
+    async def fail_store(chunks, *, storage_key, reservation=None):
         raise VoiceStorageError("private-path-must-not-leak")
 
     monkeypatch.setattr(app.state.voice_storage, "store_original_async", fail_store)
@@ -620,3 +621,69 @@ def test_disabled_voice_rejects_upload_and_retry_but_uses_owner_first_for_audio(
         assert owner.post(f"/api/voice-segments/{segment_id}/retry").status_code == 503
         assert owner.get(f"/api/voice-segments/{segment_id}/audio").status_code == 503
         assert other.get(f"/api/voice-segments/{segment_id}/audio").status_code == 404
+
+
+def test_direct_upload_obeys_capacity_and_release_without_orphan_growth(
+    voice_clients, monkeypatch,
+):
+    app, user_a, _, _, _, provider = voice_clients
+    draft = create_draft(user_a)
+    guard = app.state.storage_admission
+    free = {"value": guard.min_free_bytes + DATABASE_WRITE_ALLOWANCE
+            + guard.voice_max_bytes - 1}
+    monkeypatch.setattr(guard, "_filesystem", lambda _path: (1, free["value"]))
+    denied = upload(user_a, "low-water", b"recorded-audio", draft["revision"])
+    assert denied.status_code == 507
+    assert "尚未保存" in denied.json()["detail"]
+    assert provider.calls == 0
+    assert list(app.state.voice_storage.original_root.rglob("*.part")) == []
+    assert list(app.state.voice_storage.original_root.rglob("*.bin")) == []
+    with app.state.database.connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM voice_file_deletions"
+        ).fetchone()[0] == 0
+
+    free["value"] += 1
+    provider.error = AlibabaASRNetworkError("synthetic provider failure")
+    accepted = upload(user_a, "low-water", b"recorded-audio", draft["revision"])
+    assert accepted.status_code == 202
+    assert len(list(app.state.voice_storage.original_root.rglob("*.bin"))) == 1
+    free["value"] = guard.min_free_bytes - 1
+    assert user_a.get(
+        f"/api/voice-segments/{accepted.json()['id']}/audio"
+    ).status_code == 200
+    assert user_a.delete(
+        f"/api/voice-segments/{accepted.json()['id']}"
+    ).status_code == 204
+    assert list(app.state.voice_storage.original_root.rglob("*.bin")) == []
+
+
+def test_direct_upload_cannot_bypass_active_voice_reservations(voice_clients):
+    app, user_a, _, _, _, provider = voice_clients
+    draft = create_draft(user_a)
+    guard = app.state.storage_admission
+    held = [guard.reserve_voice() for _ in range(guard.voice_concurrent_limit)]
+    try:
+        denied = upload(user_a, "too-many", b"recorded-audio", draft["revision"])
+        assert denied.status_code == 429
+        assert provider.calls == 0
+        assert list(app.state.voice_storage.original_root.rglob("*.bin")) == []
+    finally:
+        for lease in held:
+            lease.release()
+    assert upload(
+        user_a, "now-admitted", b"recorded-audio", draft["revision"],
+    ).status_code == 202
+    wait_for_segment(user_a, "succeeded")
+
+
+def test_accept_endpoint_requires_a_streaming_transcribed_segment(voice_clients):
+    app, user_a, _, _, _, _ = voice_clients
+    draft = create_draft(user_a)
+    uploaded = upload(user_a, "batch-segment", b"recorded-audio", draft["revision"])
+    assert uploaded.status_code == 202
+    segment = wait_for_segment(user_a, "succeeded")
+    denied = user_a.post(f"/api/voice-segments/{segment['id']}/accept")
+    assert denied.status_code == 409
+    assert "Streaming" in denied.json()["detail"]
+    assert user_a.post("/api/voice-segments/99999/accept").status_code == 404

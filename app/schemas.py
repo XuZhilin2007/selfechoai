@@ -62,6 +62,7 @@ class ProcessingStatus(str, Enum):
 class VoiceTranscriptionStatus(str, Enum):
     PENDING = "pending"
     TRANSCRIBING = "transcribing"
+    TRANSCRIBED = "transcribed"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 

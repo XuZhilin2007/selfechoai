@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from app.config import Settings
+from app.email_admission import EmailAdmissionDenied, EmailSendAdmission
 from app.email_repository import (
     EmailAddressPausedError,
     EmailRateLimitError,
@@ -44,7 +45,9 @@ class EmailOperationUnavailableError(EmailOperationError):
 
 
 class EmailOperationRateLimitedError(EmailOperationError):
-    pass
+    def __init__(self, message: str, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class EmailOperationConflictError(EmailOperationError):
@@ -74,10 +77,12 @@ class EmailReminderService:
         repository: EmailReminderRepository,
         sender: TencentSesEmailSender,
         settings: Settings,
+        admission: EmailSendAdmission | None = None,
     ) -> None:
         self.repository = repository
         self.sender = sender
         self.settings = settings
+        self.admission = admission or EmailSendAdmission(settings)
 
     def public_settings(self, user_id: int) -> EmailReminderSettingsPublic:
         return self._public(self.repository.get_settings(user_id))
@@ -114,33 +119,42 @@ class EmailReminderService:
             raise EmailOperationConflictError("请先设置提醒邮箱。")
         if settings.health_status.value == "paused":
             raise EmailOperationConflictError("该邮箱已暂停，请更换其他邮箱。")
-        code = generate_verification_code()
-        code_hmac = verification_code_hmac(
-            self._pepper(),
-            user_id,
-            settings.email_address,
-            code,
-        )
         try:
-            challenge = self.repository.create_verification_challenge(
-                user_id,
-                email_address=settings.email_address,
-                code_hmac=code_hmac,
-            )
-        except EmailRateLimitError as exc:
-            raise EmailOperationRateLimitedError(str(exc)) from exc
-        except (EmailVerificationError, EmailAddressPausedError) as exc:
-            raise EmailOperationConflictError(
-                "当前邮箱无法发送验证码，请重新检查设置。"
+            lease = self.admission.reserve_verification(settings.email_address)
+        except EmailAdmissionDenied as exc:
+            raise EmailOperationRateLimitedError(
+                "该收件地址或全站邮件发送暂时达到上限，请稍后重试。",
+                exc.retry_after,
             ) from exc
-        try:
-            result = self.sender.send_verification(settings.email_address, code)
-        except Exception:
-            result = EmailSendResult(
-                outcome=EmailSendOutcome.AMBIGUOUS_FAILURE,
-                error_code="unexpected_provider_ambiguous",
+        with lease:
+            code = generate_verification_code()
+            code_hmac = verification_code_hmac(
+                self._pepper(),
+                user_id,
+                settings.email_address,
+                code,
             )
-        self.repository.finish_verification_send(challenge.id, user_id, result)
+            try:
+                challenge = self.repository.create_verification_challenge(
+                    user_id,
+                    email_address=settings.email_address,
+                    code_hmac=code_hmac,
+                )
+            except EmailRateLimitError as exc:
+                raise EmailOperationRateLimitedError(str(exc)) from exc
+            except (EmailVerificationError, EmailAddressPausedError) as exc:
+                raise EmailOperationConflictError(
+                    "当前邮箱无法发送验证码，请重新检查设置。"
+                ) from exc
+            lease.consume()
+            try:
+                result = self.sender.send_verification(settings.email_address, code)
+            except Exception:
+                result = EmailSendResult(
+                    outcome=EmailSendOutcome.AMBIGUOUS_FAILURE,
+                    error_code="unexpected_provider_ambiguous",
+                )
+            self.repository.finish_verification_send(challenge.id, user_id, result)
         if result.pause_destination:
             self.repository.pause_matching_address(
                 user_id,
@@ -190,22 +204,31 @@ class EmailReminderService:
         if not self.sender.test_email_available:
             raise EmailOperationUnavailableError("测试邮件模板尚未配置。")
         try:
-            destination = self.repository.reserve_test_send(user_id)
-        except EmailRateLimitError as exc:
-            raise EmailOperationRateLimitedError(str(exc)) from exc
-        except EmailSettingsUnavailableError as exc:
-            raise EmailOperationConflictError(
-                "需要当前已验证且健康的提醒邮箱。"
+            lease = self.admission.reserve_send()
+        except EmailAdmissionDenied as exc:
+            raise EmailOperationRateLimitedError(
+                "全站邮件发送暂时达到上限，请稍后重试。",
+                exc.retry_after,
             ) from exc
-        try:
-            result = self.sender.send_test(destination)
-        except EmailProviderUnavailableError as exc:
-            raise EmailOperationUnavailableError("测试邮件暂不可用。") from exc
-        except Exception:
-            result = EmailSendResult(
-                outcome=EmailSendOutcome.AMBIGUOUS_FAILURE,
-                error_code="unexpected_provider_ambiguous",
-            )
+        with lease:
+            try:
+                destination = self.repository.reserve_test_send(user_id)
+            except EmailRateLimitError as exc:
+                raise EmailOperationRateLimitedError(str(exc)) from exc
+            except EmailSettingsUnavailableError as exc:
+                raise EmailOperationConflictError(
+                    "需要当前已验证且健康的提醒邮箱。"
+                ) from exc
+            lease.consume()
+            try:
+                result = self.sender.send_test(destination)
+            except EmailProviderUnavailableError as exc:
+                raise EmailOperationUnavailableError("测试邮件暂不可用。") from exc
+            except Exception:
+                result = EmailSendResult(
+                    outcome=EmailSendOutcome.AMBIGUOUS_FAILURE,
+                    error_code="unexpected_provider_ambiguous",
+                )
         if result.pause_destination:
             self.repository.pause_matching_address(
                 user_id,
@@ -252,35 +275,43 @@ class EmailReminderService:
         }
         for _ in range(batch_size):
             attempt_time = now_utc or utc_now()
-            target = self.repository.claim_next_delivery(as_of=attempt_time)
-            if target is None:
-                break
-            counts["attempted"] += 1
-            if not self.repository.revalidate_claimed_delivery(
-                target.id,
-                target.user_id,
-                as_of=attempt_time,
-            ):
-                counts["suppressed"] += 1
-                continue
             try:
-                result = self.sender.send_reminder(
-                    target.destination_email,
-                    app_url=f"{self.settings.app_origin}/dashboard",
-                    requested_at=attempt_time,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Email Reminder transport raised unexpectedly "
-                    "delivery_id=%s reminder_id=%s exception_type=%s",
+                lease = self.admission.reserve_send()
+            except EmailAdmissionDenied:
+                # No claim or attempt count is consumed; the next normal sweep
+                # can retry while the existing delivery TTL remains authoritative.
+                break
+            with lease:
+                target = self.repository.claim_next_delivery(as_of=attempt_time)
+                if target is None:
+                    break
+                counts["attempted"] += 1
+                if not self.repository.revalidate_claimed_delivery(
                     target.id,
-                    target.reminder_id,
-                    type(exc).__name__,
-                )
-                result = EmailSendResult(
-                    outcome=EmailSendOutcome.AMBIGUOUS_FAILURE,
-                    error_code="worker_unexpected_ambiguous",
-                )
+                    target.user_id,
+                    as_of=attempt_time,
+                ):
+                    counts["suppressed"] += 1
+                    continue
+                lease.consume()
+                try:
+                    result = self.sender.send_reminder(
+                        target.destination_email,
+                        app_url=f"{self.settings.app_origin}/dashboard",
+                        requested_at=attempt_time,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Email Reminder transport raised unexpectedly "
+                        "delivery_id=%s reminder_id=%s exception_type=%s",
+                        target.id,
+                        target.reminder_id,
+                        type(exc).__name__,
+                    )
+                    result = EmailSendResult(
+                        outcome=EmailSendOutcome.AMBIGUOUS_FAILURE,
+                        error_code="worker_unexpected_ambiguous",
+                    )
             try:
                 terminal = self.repository.finish_delivery_attempt(
                     target,

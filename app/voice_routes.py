@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Annotated
 
@@ -30,11 +31,17 @@ from app.schemas import (
     UserPublic,
     VoiceSegmentPublic,
 )
+from app.services.storage_admission import (
+    StorageAdmissionDenied,
+    VoiceStorageLease,
+)
 from app.services.voice_deletions import VoiceDeletionLedger
 from app.services.voice_media import content_type_for_container
 from app.services.voice_storage import (
     EmptyVoiceUploadError,
+    StoredOriginal,
     VoiceStorage,
+    VoiceStorageCapacityError,
     VoiceStorageError,
     VoiceUploadTooLargeError,
 )
@@ -51,6 +58,44 @@ from app.voice_runtime import VoiceRuntime
 
 
 logger = logging.getLogger(__name__)
+
+
+def _database_storage_admission_response(
+    exc: StorageAdmissionDenied,
+) -> HTTPException:
+    if exc.reason == "capacity":
+        return HTTPException(
+            status_code=507, detail="存储空间暂时不足；内容尚未保存，请稍后重试。",
+        )
+    return HTTPException(
+        status_code=429, detail="保存操作暂时过于频繁；内容尚未保存，请稍后重试。",
+    )
+
+
+def _voice_storage_admission_response(
+    exc: StorageAdmissionDenied,
+) -> HTTPException:
+    if exc.reason == "capacity":
+        return HTTPException(
+            status_code=507,
+            detail="存储空间暂时不足；原始录音尚未保存，请稍后重试。",
+        )
+    return HTTPException(
+        status_code=429,
+        detail="录音保存暂时过于频繁；原始录音尚未保存，请稍后重试。",
+    )
+
+
+@contextmanager
+def _database_growth(request: Request, estimated_growth_bytes: int = 0):
+    try:
+        lease = request.app.state.storage_admission.reserve_database_growth(
+            estimated_growth_bytes
+        )
+    except StorageAdmissionDenied as exc:
+        raise _database_storage_admission_response(exc) from exc
+    with lease:
+        yield
 
 
 def create_voice_router(
@@ -76,18 +121,24 @@ def create_voice_router(
         request: Request,
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> CaptureDraftResponse:
-        try:
-            draft = repository.put_draft(
-                current_user.id,
-                payload.current_text,
-                payload.revision,
-            )
-        except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (DraftRevisionConflictError, DraftBlockedError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except DraftTextLimitError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        existing = repository.get_draft(current_user.id)
+        new_bytes = len(payload.current_text.encode("utf-8"))
+        old_bytes = len(existing.current_text.encode("utf-8")) if existing else 0
+        growth = max(0, new_bytes - old_bytes)
+        with (_database_growth(request, growth) if existing is None or growth
+              else nullcontext()):
+            try:
+                draft = repository.put_draft(
+                    current_user.id,
+                    payload.current_text,
+                    payload.revision,
+                )
+            except NotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except (DraftRevisionConflictError, DraftBlockedError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except DraftTextLimitError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         return CaptureDraftResponse(
             draft=_public_draft(draft),
             voice_available=_voice_available(request),
@@ -105,11 +156,12 @@ def create_voice_router(
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> ItemInputPublic:
         try:
-            result = repository.save_draft(
-                current_user.id,
-                payload.draft_id,
-                payload.revision,
-            )
+            with _database_growth(request):
+                result = repository.save_draft(
+                    current_user.id,
+                    payload.draft_id,
+                    payload.revision,
+                )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (DraftRevisionConflictError, DraftBlockedError) as exc:
@@ -141,57 +193,9 @@ def create_voice_router(
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> VoiceSegmentPublic:
         storage, ledger, runtime = _require_voice_services(request)
-        content_length = request.headers.get("content-length")
-        if content_length is not None:
-            try:
-                declared_length = int(content_length)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="invalid Content-Length",
-                ) from exc
-            if declared_length < 0:
-                raise HTTPException(status_code=400, detail="invalid Content-Length")
-            if declared_length > storage.max_upload_bytes:
-                raise HTTPException(status_code=413, detail="Voice upload is too large")
-
-        storage_key = storage.allocate_original_key()
-        with repository.database.transaction() as connection:
-            VoiceDeletionLedger.record(
-                connection,
-                [storage_key],
-                "orphan_cleanup",
-            )
-        try:
-            saved = await storage.store_original_async(
-                request.stream(),
-                storage_key=storage_key,
-            )
-        except VoiceUploadTooLargeError as exc:
-            await _drain_voice_deletions_async(request)
-            raise HTTPException(
-                status_code=413,
-                detail="Voice upload is too large",
-            ) from exc
-        except EmptyVoiceUploadError as exc:
-            await _drain_voice_deletions_async(request)
-            raise HTTPException(
-                status_code=400,
-                detail="Voice upload body is empty",
-            ) from exc
-        except VoiceStorageError as exc:
-            await _drain_voice_deletions_async(request)
-            raise HTTPException(
-                status_code=500,
-                detail="Original Audio could not be stored safely",
-            ) from exc
-        except Exception as exc:
-            await _drain_voice_deletions_async(request)
-            raise HTTPException(
-                status_code=400,
-                detail="Voice upload was interrupted",
-            ) from exc
-
+        saved, lease = await _store_uploaded_original(
+            request, repository, storage,
+        )
         client_content_type = request.headers.get("content-type")
         if client_content_type is not None:
             client_content_type = client_content_type[:200]
@@ -223,12 +227,35 @@ def create_voice_router(
                 status_code=500,
                 detail="Voice Segment could not be registered safely",
             ) from exc
+        finally:
+            lease.release()
 
         if not result.created:
             await _drain_voice_deletions_async(request)
         if result.segment.transcription_status == "pending":
             _schedule_voice(runtime, result.segment.id, current_user.id)
         return _public_segment(result.segment)
+
+    @router.post(
+        "/voice-segments/{segment_id}/accept",
+        response_model=VoiceSegmentPublic,
+    )
+    def accept_streaming_voice_segment(
+        segment_id: int,
+        request: Request,
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> VoiceSegmentPublic:
+        try:
+            with _database_growth(request):
+                segment = repository.accept_transcribed_segment(
+                    segment_id,
+                    current_user.id,
+                )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (DraftTextLimitError, VoiceSegmentConflictError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _public_segment(segment)
 
     @router.post(
         "/voice-segments/{segment_id}/retry",
@@ -248,10 +275,11 @@ def create_voice_router(
         if existing.failure_code != "draft_text_limit" and runtime is None:
             raise HTTPException(status_code=503, detail="Voice ASR is disabled")
         try:
-            segment, needs_processing = repository.retry_failed_segment(
-                segment_id,
-                current_user.id,
-            )
+            with _database_growth(request):
+                segment, needs_processing = repository.retry_failed_segment(
+                    segment_id,
+                    current_user.id,
+                )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (DraftBlockedError, DraftTextLimitError) as exc:
@@ -362,6 +390,64 @@ def create_voice_router(
 
 def _voice_available(request: Request) -> bool:
     return request.app.state.voice_runtime is not None
+
+
+async def _store_uploaded_original(
+    request: Request,
+    repository: VoiceCaptureRepository,
+    storage: VoiceStorage,
+) -> tuple[StoredOriginal, VoiceStorageLease]:
+    """Admit before the orphan ledger grows, then keep capacity through upload."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid Content-Length") from exc
+        if declared < 0:
+            raise HTTPException(status_code=400, detail="invalid Content-Length")
+        if declared > storage.max_upload_bytes:
+            raise HTTPException(status_code=413, detail="Voice upload is too large")
+    try:
+        lease = storage.reserve_original()
+    except StorageAdmissionDenied as exc:
+        raise _voice_storage_admission_response(exc) from exc
+    complete = False
+    try:
+        storage_key = storage.allocate_original_key()
+        with repository.database.transaction() as connection:
+            VoiceDeletionLedger.record(connection, [storage_key], "orphan_cleanup")
+        try:
+            saved = await storage.store_original_async(
+                request.stream(),
+                storage_key=storage_key,
+                reservation=lease,
+            )
+        except VoiceUploadTooLargeError as exc:
+            await _drain_voice_deletions_async(request)
+            raise HTTPException(status_code=413, detail="Voice upload is too large") from exc
+        except EmptyVoiceUploadError as exc:
+            await _drain_voice_deletions_async(request)
+            raise HTTPException(status_code=400, detail="Voice upload body is empty") from exc
+        except VoiceStorageCapacityError as exc:
+            await _drain_voice_deletions_async(request)
+            raise HTTPException(
+                status_code=507,
+                detail="存储空间暂时不足；原始录音尚未保存，请稍后重试。",
+            ) from exc
+        except VoiceStorageError as exc:
+            await _drain_voice_deletions_async(request)
+            raise HTTPException(
+                status_code=500, detail="Original Audio could not be stored safely"
+            ) from exc
+        except Exception as exc:
+            await _drain_voice_deletions_async(request)
+            raise HTTPException(status_code=400, detail="Voice upload was interrupted") from exc
+        complete = True
+        return saved, lease
+    finally:
+        if not complete and lease is not None:
+            lease.release()
 
 
 def _public_segment(record: VoiceSegmentRecord) -> VoiceSegmentPublic:

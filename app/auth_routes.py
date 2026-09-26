@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
@@ -15,8 +16,10 @@ from app.auth import (
     RegistrationClosedError,
     ValidatedSession,
 )
+from app.auth_admission import AdmissionDenied, AuthAdmissionLimiter, client_source
 from app.config import Settings
 from app.schemas import LoginRequest, RegisterRequest, UserPublic
+from app.services.storage_admission import StorageAdmissionDenied
 
 
 SESSION_COOKIE_NAME = "__Host-selfecho_session"
@@ -25,7 +28,9 @@ CSRF_COOKIE_NAME = "selfecho_csrf"
 
 
 def create_auth_router(
-    service: AuthenticationService, settings: Settings
+    service: AuthenticationService,
+    settings: Settings,
+    admission: AuthAdmissionLimiter,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/auth", tags=["authentication"])
 
@@ -39,20 +44,36 @@ def create_auth_router(
     ) -> UserPublic:
         _validate_request_origin(request, settings)
         try:
-            result = service.register(
-                invite_code=payload.invite_code.get_secret_value(),
-                email=payload.email,
-                password=payload.password.get_secret_value(),
-                display_name=payload.display_name,
-                timezone_name=payload.timezone,
-                user_agent=request.headers.get("user-agent"),
-            )
-        except RegistrationClosedError as exc:
-            raise HTTPException(status_code=403, detail="registration is closed") from exc
-        except InvalidInviteCodeError as exc:
-            raise HTTPException(status_code=403, detail="invalid invite code") from exc
-        except DuplicateEmailError as exc:
-            raise HTTPException(status_code=409, detail="email is already registered") from exc
+            admission.admit_registration(client_source(request))
+        except AdmissionDenied as exc:
+            raise _admission_response(exc) from exc
+        lease = None
+        if settings.registration_mode != "closed":
+            try:
+                lease = request.app.state.storage_admission.reserve_database_growth()
+            except StorageAdmissionDenied as exc:
+                raise HTTPException(
+                    status_code=507 if exc.reason == "capacity" else 429,
+                    detail="存储空间暂时不足，未创建账号；请稍后重试。"
+                    if exc.reason == "capacity" else
+                    "注册暂时过于频繁，未创建账号；请稍后重试。",
+                ) from exc
+        with (lease if lease is not None else nullcontext()):
+            try:
+                result = service.register(
+                    invite_code=payload.invite_code.get_secret_value(),
+                    email=payload.email,
+                    password=payload.password.get_secret_value(),
+                    display_name=payload.display_name,
+                    timezone_name=payload.timezone,
+                    user_agent=request.headers.get("user-agent"),
+                )
+            except RegistrationClosedError as exc:
+                raise HTTPException(status_code=403, detail="registration is closed") from exc
+            except InvalidInviteCodeError as exc:
+                raise HTTPException(status_code=403, detail="invalid invite code") from exc
+            except DuplicateEmailError as exc:
+                raise HTTPException(status_code=409, detail="email is already registered") from exc
         _set_auth_cookies(response, result, settings)
         return result.user
 
@@ -61,6 +82,10 @@ def create_auth_router(
         payload: LoginRequest, request: Request, response: Response
     ) -> UserPublic:
         _validate_request_origin(request, settings)
+        try:
+            admission.admit_login(client_source(request), payload.email)
+        except AdmissionDenied as exc:
+            raise _admission_response(exc) from exc
         try:
             result = service.login(
                 email=payload.email,
@@ -210,6 +235,14 @@ def _validate_request_origin(request: Request, settings: Settings) -> None:
     origin = request.headers.get("origin")
     if origin is not None and origin.rstrip("/") != settings.app_origin.rstrip("/"):
         raise HTTPException(status_code=403, detail="request origin is not allowed")
+
+
+def _admission_response(exc: AdmissionDenied) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="too many attempts; try again later",
+        headers={"Retry-After": str(exc.retry_after), "Cache-Control": "no-store"},
+    )
 
 
 def _set_auth_cookies(

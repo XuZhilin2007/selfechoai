@@ -3,10 +3,10 @@ import sqlite3
 import pytest
 
 from app.database import (
-    CURRENT_SCHEMA_VERSION, SCHEMA_VERSION, SCHEMA_V7, SCHEMA_V7_VERSION,
+    CURRENT_SCHEMA_VERSION, SCHEMA_VERSION, SCHEMA_V7, SCHEMA_V7_VERSION, SCHEMA_V8,
     V8_PIN_COLUMN_SQL, Database, DatabaseSchemaError, DatabaseVersionError,
 )
-from app.migrations import v007_item_lifecycle, v008_item_pin as migration
+from app.migrations import v007_item_lifecycle, v008_item_pin as migration, v009_voice_segment_state
 from tests.test_lifecycle_migration import create_populated_v6_database, MIGRATION_TIME
 
 
@@ -49,9 +49,10 @@ def test_v7_to_v8_preserves_every_original_value_and_defaults_false(tmp_path):
         else:
             assert after[name] == (columns, rows)
         assert result.row_counts[name] == len(rows)
+    v009_voice_segment_state.migrate_v8_to_v9(path)
     Database(path).initialize()
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         # The existing INSERT column list can omit Pin for new Items.
         connection.execute("""INSERT INTO personal_items
             (user_id, title, type, importance, urgency, status, created_time, updated_time)
@@ -65,7 +66,8 @@ def test_v7_to_v8_preserves_every_original_value_and_defaults_false(tmp_path):
 
 def test_fresh_and_migrated_schema_match_and_historical_versions_stay_fixed(tmp_path):
     fresh, migrated = tmp_path / "fresh.db", tmp_path / "migrated.db"
-    Database(fresh).initialize()
+    with sqlite3.connect(fresh) as connection:
+        connection.executescript(SCHEMA_V8)
     create_v7(migrated)
     migration.migrate_v7_to_v8(migrated)
     def schema(path):
@@ -73,7 +75,7 @@ def test_fresh_and_migrated_schema_match_and_historical_versions_stay_fixed(tmp_
             assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
             return connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
     assert schema(fresh) == schema(migrated)
-    assert CURRENT_SCHEMA_VERSION == 8
+    assert CURRENT_SCHEMA_VERSION == 9
     assert SCHEMA_V7_VERSION == 7
     assert SCHEMA_VERSION == 5
     historic = tmp_path / "historic.db"
@@ -81,7 +83,7 @@ def test_fresh_and_migrated_schema_match_and_historical_versions_stay_fixed(tmp_
         connection.executescript(SCHEMA_V7)
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert "is_pinned" not in {row[1] for row in connection.execute("PRAGMA table_info(personal_items)")}
-    with pytest.raises(DatabaseVersionError, match="explicit migration to version 8"):
+    with pytest.raises(DatabaseVersionError, match="explicit migration to version 9"):
         Database(historic).initialize()
     assert migration.inspect_v7_database(historic).schema_version == 7
 
@@ -177,8 +179,14 @@ def test_v8_startup_rejects_broken_pin_contract(tmp_path, definition):
         connection.executescript(SCHEMA_V7)
         connection.execute(f"ALTER TABLE personal_items ADD COLUMN is_pinned {definition}")
         connection.execute("PRAGMA user_version = 8")
-    with pytest.raises(DatabaseSchemaError, match="boolean contract"):
-        Database(path).initialize()
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        with pytest.raises(DatabaseSchemaError, match="boolean contract"):
+            Database._validate_v8_schema(connection, {
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            })
 
 
 def test_missing_path_is_not_created_and_execution_rechecks_source(tmp_path):
@@ -211,4 +219,5 @@ def test_historical_v007_cli_still_reports_and_produces_v7(tmp_path):
     with pytest.raises(DatabaseVersionError):
         Database(path).initialize()
     migration.migrate_v7_to_v8(path)
+    v009_voice_segment_state.migrate_v8_to_v9(path)
     Database(path).initialize()

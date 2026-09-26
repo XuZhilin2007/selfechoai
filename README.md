@@ -37,7 +37,7 @@ Scattered thoughts often appear earlier than conventional tasks, and they carry 
 - Login, logout, server-side sessions, and CSRF protection
 - Registration closed by default, with optional invite registration
 - Multi-user data ownership isolation
-- SQLite schema v8, with a required explicit v7→v8 migration for existing v0.7 databases
+- SQLite schema v9, with required explicit migrations for existing databases (v7→v8 pin migration, v8→v9 Voice Segment state migration)
 
 Planner, calendar integration, and autonomous agents are not implemented yet.
 
@@ -276,6 +276,19 @@ Depending on the configured provider, user input and related item context are se
 
 Even without a provider key, you can still initialize the database, create a user, and sign in. Capture saves the raw input first, but AI structuring will report a missing configuration.
 
+## Admission and Storage Protection
+
+The application rejects expensive or growing work early, before provider calls or persistent writes, with explicit retry information (`Retry-After`) instead of silent loss:
+
+- **Authentication admission** bounds registration and login attempts per source address, per account, and globally, before password hashing or any database write. The client identity comes from the ASGI server, never from forwarding headers.
+- **AI / ASR provider admission** bounds outbound provider calls per time window and in-flight concurrency, and bounds the provider-bound AI request body. Denied inputs stay saved locally in their original form.
+- **Persistent-storage admission** reserves real free disk space before new database content or Voice Original Audio is written, bounds Voice recording concurrency, and bounds `extra_information` growth. Rejections never modify or discard already saved content; shrinking or same-size edits remain possible under pressure.
+- **Email send admission** bounds outbound verification and reminder emails per recipient and globally, reserving capacity before local challenge state changes and counting a send only at the provider boundary.
+
+These limiters are process-local and bounded in memory; they hold no secrets and no user input. The defaults are finite community fallbacks configured through `AUTH_*_LIMIT`-style, `AI_ADMISSION_*`/`ASR_ADMISSION_*`, `STORAGE_*`, and `EMAIL_SEND_*`/`EMAIL_VERIFICATION_RECIPIENT_*` variables (see `.env.example`). They describe what this single application process enforces; they are not a multi-instance or reverse-proxy admission mechanism.
+
+Authentication admission keys its source bucket to the client address that Uvicorn reports after its own trusted proxy handling; the application never reads or trusts `X-Forwarded-For` or `X-Real-IP` itself. A reverse proxy on the same host (reaching Uvicorn via `127.0.0.1`/`::1`) works with Uvicorn's defaults. If your reverse proxy runs on another host or a LAN peer, configure Uvicorn's `FORWARDED_ALLOW_IPS` (or `--forwarded-allow-ips`) to trust it — otherwise Uvicorn keeps the proxy address as the client identity and every external user shares one source-based auth admission bucket.
+
 ## Data
 
 - Default database: `data/selfecho.db`
@@ -284,9 +297,33 @@ Even without a provider key, you can still initialize the database, create a use
 - Reminder Email addresses, verification/challenge metadata, delivery destination snapshots, and provider status metadata are stored in SQLite; raw verification codes are not
 - `.env`, `data/`, `*.db`, WAL/SHM files, and logs are ignored by Git
 - The Community Edition ships no production data and no seeds derived from real data
-- Empty databases are initialized directly to schema v8
+- Empty databases are initialized directly to schema v9
 
 Never commit databases, backups, logs, or screenshots containing personal content to Git.
+
+## Upgrade from v0.8.0
+
+A v0.8.0 database uses schema v8; this version uses schema v9. **This version does not migrate a v0.8.0 database automatically.** Starting the new runtime against schema v8 fails closed and asks the operator to migrate explicitly.
+
+1. Stop the application/service and make sure no process is using the database.
+2. Create and validate a recoverable backup of the database file and any WAL/SHM companions that exist for it.
+3. Optionally run the migration's read-only preflight check against the actual configured database path:
+
+```bash
+python -m app.migrations.v009_voice_segment_state --database data/selfecho.db --check-only
+```
+
+4. Run the explicit v8→v9 migration:
+
+```bash
+python -m app.migrations.v009_voice_segment_state --database data/selfecho.db
+```
+
+5. At the prompt, enter the exact confirmation phrase `MIGRATE PUBLIC V8 TO V9`. The migration runs in one transaction, rebuilds the `voice_segments` table so Voice Segments can additionally persist a durable `transcribed` state (provider transcription complete and stored, but not yet accepted into the Capture Draft) alongside the Streaming Voice model identity, and verifies preserved row data, the autoincrement high-water mark, schema structure, foreign keys, and SQLite integrity. All existing Voice data, storage keys, and indexes are preserved.
+6. Restart the application only after the migration reports success.
+7. Confirm that startup accepts schema v9 and that existing data and the Account page load as expected.
+
+A fresh installation creates schema v9 directly and does not need to create or migrate schema v8 first.
 
 ## Upgrade from v0.7.0
 
@@ -334,7 +371,7 @@ python -m app.migrations.v007_item_lifecycle --database data/selfecho.db
 6. Restart the v0.7.0 application only after the migration reports success.
 7. Confirm that startup accepts schema v7 and that existing data and the Account page load as expected, then apply the v7→v8 migration described above.
 
-A fresh v0.7.0 installation created schema v7 directly and did not need to create or migrate schema v6 first. Older databases must still migrate sequentially: v4→v5 with `python -m app.migrations.v005_voice_capture`, then v5→v6 with `python -m app.migrations.v006_email_reminders`, then v6→v7 as above, then v7→v8; schema v3 must first use `python -m app.migrations.v004_reminders` for v3→v4.
+A fresh v0.7.0 installation created schema v7 directly and did not need to create or migrate schema v6 first. Older databases must still migrate sequentially: v4→v5 with `python -m app.migrations.v005_voice_capture`, then v5→v6 with `python -m app.migrations.v006_email_reminders`, then v6→v7 as above, then v7→v8, then v8→v9 as described above; schema v3 must first use `python -m app.migrations.v004_reminders` for v3→v4.
 
 ## Upgrade from v0.5.0
 
@@ -368,7 +405,7 @@ Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses,
 Vanilla JavaScript PWA (incl. Service Worker push handling)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite (schema v8)
+          ├── SQLite (schema v9)
           ├── DeepSeek / OpenAI provider abstraction
           ├── optional Voice Capture → external Voice storage → Alibaba ASR
           └── optional embedded Reminder worker

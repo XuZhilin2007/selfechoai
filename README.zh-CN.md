@@ -37,7 +37,7 @@ SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Person
 - Login、Logout、服务端 Session 与 CSRF 防护
 - 默认关闭注册和可选 Invite registration
 - Multi-user 数据所有权隔离
-- SQLite schema v8；已有 v0.7 数据库必须显式执行 v7→v8 迁移
+- SQLite schema v9；已有数据库必须显式执行迁移（v7→v8 Pin 迁移、v8→v9 Voice Segment 状态迁移）
 
 Planner、日历集成和自治 Agent 尚未实现。
 
@@ -276,6 +276,19 @@ AI_MODEL=
 
 没有 Provider Key 时仍可初始化数据库、创建用户并登录；Capture 会先保存原始输入，但 AI 整理会报告配置缺失。
 
+## Admission 与存储保护
+
+应用会在 Provider 调用或持久写入之前尽早拒绝昂贵或持续增长的工作，并给出明确的重试信息（`Retry-After`），不会静默丢失内容：
+
+- **认证 admission**：在密码哈希与任何数据库写入之前，按来源地址、按账号和全站限制注册与登录尝试。客户端身份来自 ASGI server，从不读取转发头。
+- **AI / ASR Provider admission**：按时间窗口和在途并发限制对外的 Provider 调用，并限制发往 Provider 的 AI 请求体大小。被拒绝的输入仍以其原始形式保存在本地。
+- **持久存储 admission**：在写入新的数据库内容或 Voice Original Audio 之前预留真实磁盘可用空间，限制 Voice 录音并发，并限制 `extra_information` 的增长。拒绝不会修改或丢弃已保存内容；空间紧张时，等量编辑与缩小编辑仍然可用。
+- **Email 发送 admission**：按收件人和全站限制对外的验证与提醒邮件，在本地 challenge 状态变化前预留额度，并且只在 Provider 边界处计数。
+
+这些 limiter 为进程内、内存有界实现；不保存任何机密或用户输入。默认值是有限的社区回退值，通过 `AUTH_*_LIMIT` 风格、`AI_ADMISSION_*`/`ASR_ADMISSION_*`、`STORAGE_*` 与 `EMAIL_SEND_*`/`EMAIL_VERIFICATION_RECIPIENT_*` 变量配置（见 `.env.example`）。它们描述的是本单进程实际执行的强制范围，不构成多实例或反向代理层面的 admission 机制。
+
+认证 admission 的 source 桶使用 Uvicorn 完成 trusted proxy 处理后上报的客户端地址；应用自身从不读取、也不信任 `X-Forwarded-For` 或 `X-Real-IP`。与本机同主机的反向代理（经 `127.0.0.1`/`::1` 访问 Uvicorn）可直接依赖 Uvicorn 默认行为。若反向代理运行在另一台主机或 LAN peer 上，必须配置 Uvicorn 的 `FORWARDED_ALLOW_IPS`（或 `--forwarded-allow-ips`）以信任该代理——否则 Uvicorn 会继续把代理地址当作客户端身份，所有外部用户将共享同一个 source 维度的认证 admission 桶。
+
 ## Data
 
 - 默认数据库：`data/selfecho.db`
@@ -284,9 +297,33 @@ AI_MODEL=
 - Reminder Email、验证/challenge metadata、delivery destination snapshot 与 Provider status metadata 保存在 SQLite；不保存 raw verification code
 - `.env`、`data/`、`*.db`、WAL/SHM 和日志均被 Git 忽略
 - Community Edition 不附带 Production 数据或从真实数据生成的 seed
-- 空数据库会直接初始化为 schema v8
+- 空数据库会直接初始化为 schema v9
 
 不要把数据库、备份、日志或包含个人内容的截图提交到 Git。
+
+## 从 v0.8.0 升级
+
+v0.8.0 数据库使用 schema v8；本版本使用 schema v9。**本版本不会自动迁移 v0.8.0 数据库。**新运行时遇到 schema v7/v8 会直接拒绝启动，并要求操作者显式迁移。
+
+1. 停止应用/服务，确认没有进程在使用数据库。
+2. 创建并验证可恢复的备份，包括数据库文件及其存在的 WAL/SHM 伴生文件。
+3. 可先对实际配置的数据库路径执行只读预检：
+
+```bash
+python -m app.migrations.v009_voice_segment_state --database data/selfecho.db --check-only
+```
+
+4. 执行显式 v8→v9 迁移：
+
+```bash
+python -m app.migrations.v009_voice_segment_state --database data/selfecho.db
+```
+
+5. 在提示处输入准确的确认短语 `MIGRATE PUBLIC V8 TO V9`。迁移在单个事务内重建 `voice_segments` 表，使 Voice Segment 可以额外持久化 `transcribed` 状态（Provider 整段转写已完成并存储，但尚未正式接受进入 Capture Draft）以及 Streaming Voice 模型标识，并验证行数据保留、自增高位水印、schema 结构、外键与 SQLite 完整性。既有 Voice 数据、storage key 与索引全部保留。
+6. 仅在迁移报告成功后重启应用。
+7. 确认启动接受 schema v9，既有数据与账户页面加载正常。
+
+全新安装会直接创建 schema v9，无需先创建或迁移 schema v8。
 
 ## 从 v0.7.0 升级
 
@@ -334,7 +371,7 @@ python -m app.migrations.v007_item_lifecycle --database data/selfecho.db
 6. 只有迁移报告成功后，才重启 v0.7.0 应用。
 7. 确认应用启动接受 schema v7，已有数据与 Account 页面均可正常加载，然后继续执行上文 v7→v8 迁移。
 
-全新 v0.7.0 安装当时会直接创建 schema v7，不需要先创建或迁移 schema v6。更旧数据库仍须顺序迁移：schema v4 先通过 `python -m app.migrations.v005_voice_capture` 升到 v5，再通过 `python -m app.migrations.v006_email_reminders` 升到 v6，然后按上述步骤升到 v7，最后升到 v8；schema v3 还须先通过 `python -m app.migrations.v004_reminders` 升到 v4。
+全新 v0.7.0 安装当时会直接创建 schema v7，不需要先创建或迁移 schema v6。更旧数据库仍须顺序迁移：schema v4 先通过 `python -m app.migrations.v005_voice_capture` 升到 v5，再通过 `python -m app.migrations.v006_email_reminders` 升到 v6，然后按上述步骤升到 v7，再升到 v8，最后按上文 v8→v9 步骤升到 v9；schema v3 还须先通过 `python -m app.migrations.v004_reminders` 升到 v4。
 
 ## 从 v0.5.0 升级
 
@@ -368,7 +405,7 @@ node --test tests/*.mjs
 Vanilla JavaScript PWA (含 Service Worker push 处理)
           │ same origin
 FastAPI + Uvicorn
-          ├── SQLite (schema v8)
+          ├── SQLite (schema v9)
           ├── DeepSeek / OpenAI provider abstraction
           ├── 可选 Voice Capture → 外部 Voice 存储 → Alibaba ASR
           └── 可选嵌入式 Reminder worker

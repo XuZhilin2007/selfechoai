@@ -11,6 +11,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.schemas import AIExtraction, PersonalItemPublic
+from app.provider_admission import GlobalProviderLimiter
 from app.services.ai import (
     AIAPIError,
     AIConfigurationError,
@@ -18,6 +19,7 @@ from app.services.ai import (
     AINetworkError,
     AIService,
     INSTRUCTIONS,
+    guarded_ai_post,
     without_legacy_priority,
 )
 
@@ -182,6 +184,8 @@ class DeepSeekProvider(AIService):
         timeout_seconds: float = 30.0,
         client: httpx.AsyncClient | None = None,
         debug_output: bool = False,
+        admission: GlobalProviderLimiter | None = None,
+        max_input_bytes: int = 1_000_000,
     ) -> None:
         if not api_url or not api_key or not model:
             raise AIConfigurationError(
@@ -195,12 +199,16 @@ class DeepSeekProvider(AIService):
                 "DeepSeek 模型名已退役：请使用 deepseek-flash，"
                 "不要使用 deepseek-chat 或 deepseek-reasoner。",
             )
+        if max_input_bytes <= 0:
+            raise ValueError("AI provider input limit must be positive")
         self.api_url = self._chat_completions_url(api_url)
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
         self._client = client
         self.debug_output = debug_output
+        self.admission = admission
+        self.max_input_bytes = max_input_bytes
 
     async def extract(
         self,
@@ -280,12 +288,14 @@ class DeepSeekProvider(AIService):
     ) -> httpx.Response:
         try:
             if self._client is not None:
-                return await self._client.post(
-                    self.api_url, json=payload, headers=headers
+                return await guarded_ai_post(
+                    self._client, self.api_url, payload, headers,
+                    self.admission, self.max_input_bytes,
                 )
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                return await client.post(
-                    self.api_url, json=payload, headers=headers
+                return await guarded_ai_post(
+                    client, self.api_url, payload, headers,
+                    self.admission, self.max_input_bytes,
                 )
         except httpx.TimeoutException as exc:
             raise AINetworkError(

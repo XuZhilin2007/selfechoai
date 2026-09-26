@@ -15,7 +15,8 @@ SCHEMA_V6_VERSION = 6
 SCHEMA_VERSION = SCHEMA_V5_VERSION
 SCHEMA_V7_VERSION = 7
 SCHEMA_V8_VERSION = 8
-CURRENT_SCHEMA_VERSION = SCHEMA_V8_VERSION
+SCHEMA_V9_VERSION = 9
+CURRENT_SCHEMA_VERSION = SCHEMA_V9_VERSION
 
 USERS_V3_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -409,6 +410,32 @@ CREATE TABLE IF NOT EXISTS voice_file_deletions (
 );
 """
 
+# Keep the v5-v8 definition immutable for historical schema creation.
+VOICE_SEGMENTS_V9_TABLE_SQL = (
+    VOICE_SEGMENTS_TABLE_SQL
+    .replace(
+        "transcription_status IN ('pending', 'transcribing', 'succeeded', 'failed')",
+        "transcription_status IN ('pending', 'transcribing', 'transcribed', 'succeeded', 'failed')",
+    )
+    .replace(
+        "model TEXT NOT NULL CHECK (model = 'qwen-audio-3.0-asr-flash')",
+        "model TEXT NOT NULL CHECK (model IN ("
+        "'qwen-audio-3.0-asr-flash', 'qwen-audio-3.0-asr-flash-streaming'))",
+    )
+    .replace(
+        "        OR (transcription_status = 'succeeded'",
+        "        OR (transcription_status = 'transcribed'\n"
+        "            AND model = 'qwen-audio-3.0-asr-flash-streaming'\n"
+        "            AND draft_id IS NOT NULL\n"
+        "            AND provider_transcript IS NOT NULL\n"
+        "            AND length(trim(provider_transcript)) > 0\n"
+        "            AND failure_code IS NULL\n"
+        "            AND failure_message IS NULL\n"
+        "            AND transcription_finished_time IS NOT NULL)\n"
+        "        OR (transcription_status = 'succeeded'",
+    )
+)
+
 V5_PRE_VOICE_INDEXES_SQL = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_item_inputs_id_user
     ON item_inputs(id, user_id);
@@ -646,6 +673,13 @@ V8_PIN_COLUMN_SQL = (
 
 SCHEMA_V8 = "\n".join(
     (SCHEMA_V7, V8_PIN_COLUMN_SQL + ";", f"PRAGMA user_version = {SCHEMA_V8_VERSION};")
+)
+
+SCHEMA_V9 = SCHEMA_V8.replace(
+    VOICE_SEGMENTS_TABLE_SQL, VOICE_SEGMENTS_V9_TABLE_SQL
+).replace(
+    f"PRAGMA user_version = {SCHEMA_V8_VERSION};",
+    f"PRAGMA user_version = {SCHEMA_V9_VERSION};",
 )
 
 REQUIRED_V3_COLUMNS = {
@@ -913,6 +947,8 @@ REQUIRED_V8_COLUMNS = {
     "personal_items": REQUIRED_V7_COLUMNS["personal_items"] | {"is_pinned"},
 }
 REQUIRED_V8_INDEXES = REQUIRED_V7_INDEXES
+REQUIRED_V9_COLUMNS = REQUIRED_V8_COLUMNS
+REQUIRED_V9_INDEXES = REQUIRED_V8_INDEXES
 
 
 class DatabaseVersionError(RuntimeError):
@@ -937,7 +973,7 @@ class Database:
         return connection
 
     def initialize(self) -> None:
-        """Create a new v8 database or validate an existing v8 database.
+        """Create a new v9 database or validate an existing v9 database.
 
         Upgrading an existing database is intentionally not performed here.
         Production upgrades must use an explicit, backup-aware migration.
@@ -956,7 +992,7 @@ class Database:
             }
 
             if version == 0 and not existing_tables:
-                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V8}\nCOMMIT;")
+                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA_V9}\nCOMMIT;")
                 return
 
             if version != CURRENT_SCHEMA_VERSION:
@@ -965,7 +1001,7 @@ class Database:
                     f"migration to version {CURRENT_SCHEMA_VERSION}"
                 )
 
-            self._validate_v8_schema(connection, existing_tables)
+            self._validate_v9_schema(connection, existing_tables)
 
     @staticmethod
     def _validate_v3_schema(
@@ -1046,6 +1082,36 @@ class Database:
                 or column["dflt_value"] != "0"
                 or "check(is_pinnedin(0,1))" not in compact_sql):
             raise DatabaseSchemaError("version 8 is_pinned boolean contract is invalid")
+
+    @staticmethod
+    def _validate_v9_schema(
+        connection: sqlite3.Connection, existing_tables: set[str]
+    ) -> None:
+        Database._validate_schema(
+            connection, existing_tables, version=SCHEMA_V9_VERSION,
+            required_columns=REQUIRED_V9_COLUMNS,
+            required_indexes=REQUIRED_V9_INDEXES,
+        )
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='voice_segments'"
+        ).fetchone()[0]
+        compact = "".join(table_sql.lower().split())
+        for clause in (
+            "transcription_statusin('pending','transcribing','transcribed','succeeded','failed')",
+            "modelin('qwen-audio-3.0-asr-flash','qwen-audio-3.0-asr-flash-streaming')",
+            "transcription_status='transcribed'andmodel='qwen-audio-3.0-asr-flash-streaming'",
+        ):
+            if clause not in compact:
+                raise DatabaseSchemaError("version 9 Voice Segment contract is invalid")
+        column = next(row for row in connection.execute("PRAGMA table_info(personal_items)")
+                      if row["name"] == "is_pinned")
+        pin_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='personal_items'"
+        ).fetchone()[0]
+        if (column["type"].upper() != "INTEGER" or column["notnull"] != 1
+                or column["dflt_value"] != "0"
+                or "check(is_pinnedin(0,1))" not in "".join(pin_sql.lower().split())):
+            raise DatabaseSchemaError("version 9 is_pinned boolean contract is invalid")
 
     @staticmethod
     def _validate_schema(

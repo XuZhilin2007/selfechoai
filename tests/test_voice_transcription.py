@@ -637,3 +637,48 @@ def test_startup_recovery_fails_transcribing_and_keeps_pending_as_initial_work(
     assert failed.failure_code == "interrupted"
     assert failed.attempt_count == 1
     assert repository.system_list_pending_segments() == []
+
+
+def test_asr_admission_denial_marks_quota_failure_and_keeps_original(tmp_path: Path):
+    from app.provider_admission import GlobalProviderLimiter
+
+    database, repository, storage, _, provider, first_segment = make_context(
+        tmp_path,
+        current_text="原始保留",
+    )
+    limiter = GlobalProviderLimiter(60, 1, 1)
+    service = VoiceTranscriptionService(
+        repository, storage, FakeMediaProcessor(), provider, admission=limiter,
+    )
+
+    asyncio.run(service.process_initial(first_segment.id, 1))
+    assert provider.calls == 1
+
+    draft = repository.get_draft(1)
+    saved = storage.store_original([b"synthetic audio two"])
+    second_segment = repository.create_pending_segment(
+        user_id=1,
+        client_segment_id="client-2",
+        saved=saved,
+        client_content_type="untrusted/browser-type",
+        expected_revision=draft.revision,
+    ).segment
+    asyncio.run(service.process_initial(second_segment.id, 1))
+    assert provider.calls == 1
+
+    denied = repository.get_segment(second_segment.id, 1)
+    assert denied.transcription_status == "failed"
+    assert denied.failure_code == "quota_rate_limit"
+    assert "原始录音已保留" in denied.failure_message
+    assert storage.resolve_original(denied.storage_key).is_file()
+
+    repository.retry_failed_segment(second_segment.id, 1)
+    # A new window admits the retried transcription call again.
+    service = VoiceTranscriptionService(
+        repository, storage, FakeMediaProcessor(), provider,
+        admission=GlobalProviderLimiter(60, 1, 1),
+    )
+    asyncio.run(service.process_initial(second_segment.id, 1))
+    assert provider.calls == 2
+    completed = repository.get_segment(second_segment.id, 1)
+    assert completed.transcription_status == "succeeded"

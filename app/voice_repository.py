@@ -13,6 +13,7 @@ from app.services.voice_storage import StoredOriginal
 from app.voice_contracts import (
     ALIBABA_ASR_MODEL,
     ALIBABA_ASR_PROVIDER,
+    ALIBABA_STREAMING_ASR_MODEL,
     MAX_CAPTURE_TEXT_LENGTH,
     validate_client_segment_id,
 )
@@ -537,8 +538,9 @@ class VoiceCaptureRepository:
                     failure_message = NULL
                 WHERE id = ? AND user_id = ?
                   AND transcription_status = 'pending'
+                  AND model = ?
                 """,
-                (now, now, segment_id, user_id),
+                (now, now, segment_id, user_id, ALIBABA_ASR_MODEL),
             )
         return cursor.rowcount == 1
 
@@ -610,8 +612,9 @@ class VoiceCaptureRepository:
                 SELECT * FROM voice_segments
                 WHERE id = ? AND user_id = ?
                   AND transcription_status = 'transcribing'
+                  AND model = ?
                 """,
-                (segment_id, user_id),
+                (segment_id, user_id, ALIBABA_ASR_MODEL),
             ).fetchone()
             if segment is None or segment["draft_id"] is None:
                 return None
@@ -788,12 +791,13 @@ class VoiceCaptureRepository:
                     provider_request_id = NULL,
                     failure_code = NULL,
                     failure_message = NULL,
+                    model = ?,
                     updated_time = ?,
                     transcription_started_time = NULL,
                     transcription_finished_time = NULL
                 WHERE id = ? AND user_id = ?
                 """,
-                (now, segment_id, user_id),
+                (ALIBABA_ASR_MODEL, now, segment_id, user_id),
             )
             row = connection.execute(
                 "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
@@ -845,8 +849,136 @@ class VoiceCaptureRepository:
                 """
                 SELECT id, user_id FROM voice_segments
                 WHERE transcription_status = 'pending' AND draft_id IS NOT NULL
+                  AND model = ?
                 ORDER BY created_time ASC, id ASC
+                """,
+                (ALIBABA_ASR_MODEL,),
+            ).fetchall()
+        return [
+            PendingVoiceSegment(
+                segment_id=int(row["id"]),
+                user_id=int(row["user_id"]),
+            )
+            for row in rows
+        ]
+
+    def mark_segment_transcribed(
+        self,
+        segment_id: int,
+        user_id: int,
+        *,
+        transcript: str,
+        provider_request_id: str,
+    ) -> VoiceSegmentRecord | None:
+        """Store whole-task streaming success without accepting it into Draft."""
+        if not transcript.strip():
+            raise VoiceSegmentConflictError("final provider transcript must not be blank")
+        if not provider_request_id.strip():
+            raise VoiceSegmentConflictError("provider request id must not be blank")
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
                 """
+                UPDATE voice_segments
+                SET transcription_status = 'transcribed',
+                    provider_transcript = ?, provider_request_id = ?,
+                    failure_code = NULL, failure_message = NULL,
+                    updated_time = ?, transcription_finished_time = ?
+                WHERE id = ? AND user_id = ? AND draft_id IS NOT NULL
+                  AND transcription_status = 'transcribing' AND model = ?
+                """,
+                (transcript, provider_request_id, now, now, segment_id, user_id,
+                 ALIBABA_STREAMING_ASR_MODEL),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
+                (segment_id, user_id),
+            ).fetchone()
+            return self._segment_from_row(row)
+
+    def accept_transcribed_segment(
+        self, segment_id: int, user_id: int
+    ) -> VoiceSegmentRecord:
+        """Atomically append the persisted streaming result and retire its eligibility."""
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            segment = connection.execute(
+                "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
+                (segment_id, user_id),
+            ).fetchone()
+            if segment is None:
+                raise NotFoundError("Voice Segment not found")
+            if segment["model"] != ALIBABA_STREAMING_ASR_MODEL:
+                raise VoiceSegmentConflictError("not a Streaming Voice Segment")
+            if segment["transcription_status"] == "succeeded":
+                return self._segment_from_row(segment)
+            if segment["transcription_status"] != "transcribed":
+                raise VoiceSegmentConflictError(
+                    "Voice Segment is not ready for Draft acceptance"
+                )
+            transcript = segment["provider_transcript"]
+            if not isinstance(transcript, str) or not transcript.strip():
+                raise VoiceSegmentConflictError("persisted final transcript is missing")
+            if segment["draft_id"] is None or segment["item_input_id"] is not None:
+                raise VoiceSegmentConflictError(
+                    "Voice Segment has no authoritative Draft"
+                )
+            draft = connection.execute(
+                "SELECT * FROM capture_drafts WHERE id = ? AND user_id = ?",
+                (segment["draft_id"], user_id),
+            ).fetchone()
+            if draft is None:
+                raise VoiceSegmentConflictError(
+                    "Voice Segment has no authoritative Draft"
+                )
+            appended = _append_transcript(str(draft["current_text"]), transcript)
+            if len(appended) > MAX_CAPTURE_TEXT_LENGTH:
+                raise DraftTextLimitError(
+                    "草稿文字过长，请缩短后重试加入转写。"
+                )
+            draft_update = connection.execute(
+                """
+                UPDATE capture_drafts
+                SET current_text = ?, revision = revision + 1, updated_time = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (appended, now, draft["id"], user_id),
+            )
+            if draft_update.rowcount != 1:
+                raise VoiceSegmentConflictError(
+                    "authoritative Draft could not be updated"
+                )
+            segment_update = connection.execute(
+                """
+                UPDATE voice_segments
+                SET transcription_status = 'succeeded',
+                    failure_code = NULL, failure_message = NULL,
+                    updated_time = ?
+                WHERE id = ? AND user_id = ? AND transcription_status = 'transcribed'
+                """,
+                (now, segment_id, user_id),
+            )
+            if segment_update.rowcount != 1:
+                raise VoiceSegmentConflictError(
+                    "Voice Segment acceptance could not be completed"
+                )
+            row = connection.execute(
+                "SELECT * FROM voice_segments WHERE id = ? AND user_id = ?",
+                (segment_id, user_id),
+            ).fetchone()
+            return self._segment_from_row(row)
+
+    def system_list_transcribed_segments(self) -> list[PendingVoiceSegment]:
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, user_id FROM voice_segments
+                WHERE transcription_status = 'transcribed' AND model = ?
+                ORDER BY created_time ASC, id ASC
+                """,
+                (ALIBABA_STREAMING_ASR_MODEL,),
             ).fetchall()
         return [
             PendingVoiceSegment(

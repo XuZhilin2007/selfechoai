@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+import logging
+import time
+from collections.abc import Callable
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -18,6 +21,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.auth_admission import AuthAdmissionLimiter
 from app.auth import AuthenticationService
 from app.auth_repository import AuthRepository
 from app.auth_routes import (
@@ -27,9 +31,11 @@ from app.auth_routes import (
 )
 from app.config import Settings
 from app.database import Database
+from app.email_admission import EmailSendAdmission
 from app.email_repository import EmailReminderRepository
 from app.email_routes import create_email_reminder_router
 from app.priority import rank_items
+from app.provider_admission import ProviderAdmission
 from app.push_routes import create_push_router
 from app.reminder_repository import ReminderRepository
 from app.reminder_routes import create_reminder_router
@@ -37,6 +43,7 @@ from app.repository import (
     InvalidOperationError,
     NotFoundError,
     Repository,
+    serialize_extra_information,
     utc_now,
 )
 from app.schemas import (
@@ -56,7 +63,13 @@ from app.schemas import (
     UserPublic,
     UserItemPatch,
 )
-from app.services.ai import AIService, AIServiceError, create_ai_service
+from app.services.ai import (
+    AIAdmissionError,
+    AIInputSizeError,
+    AIService,
+    AIServiceError,
+    create_ai_service,
+)
 from app.services.alibaba_asr import AlibabaASRClient
 from app.services.email_reminders import EmailReminderService
 from app.services.processing import InputProcessingService
@@ -67,6 +80,10 @@ from app.services.reminder_delivery import (
     run_reminder_polling_worker,
 )
 from app.services.reminders import ReminderService
+from app.services.storage_admission import (
+    StorageAdmission,
+    StorageAdmissionDenied,
+)
 from app.services.tencent_ses import TencentSesEmailSender
 from app.services.trash_retention import (
     TrashRetentionService,
@@ -77,9 +94,54 @@ from app.services.voice_deletions import VoiceDeletionLedger
 from app.services.voice_media import VoiceMediaProcessor
 from app.services.voice_storage import VoiceStorage
 from app.services.voice_transcription import ASRProvider, VoiceTranscriptionService
-from app.voice_repository import VoiceCaptureRepository
+from app.voice_repository import DraftTextLimitError, VoiceCaptureRepository
 from app.voice_routes import create_voice_router, drain_voice_deletions
 from app.voice_runtime import VoiceRuntime, validate_voice_runtime
+
+
+logger = logging.getLogger(__name__)
+
+
+def _storage_admission_response(exc: StorageAdmissionDenied) -> HTTPException:
+    if exc.reason == "capacity":
+        return HTTPException(status_code=507, detail="存储空间暂时不足；内容尚未保存，请稍后重试。")
+    return HTTPException(status_code=429, detail="保存操作暂时过于频繁；内容尚未保存，请稍后重试。")
+
+
+@contextmanager
+def _database_growth(request: Request, estimated_growth_bytes: int = 0):
+    try:
+        lease = request.app.state.storage_admission.reserve_database_growth(
+            estimated_growth_bytes
+        )
+    except StorageAdmissionDenied as exc:
+        raise _storage_admission_response(exc) from exc
+    with lease:
+        yield
+
+
+def _accept_recovered_transcribed_segments(
+    voice_repository: VoiceCaptureRepository,
+) -> None:
+    """Accept durable streaming transcripts into Drafts at startup, once."""
+
+    for transcribed in voice_repository.system_list_transcribed_segments():
+        try:
+            voice_repository.accept_transcribed_segment(
+                transcribed.segment_id,
+                transcribed.user_id,
+            )
+        except DraftTextLimitError:
+            logger.info(
+                "Streaming Voice Draft acceptance awaits a shorter Draft "
+                "for segment %s",
+                transcribed.segment_id,
+            )
+        except Exception:
+            logger.exception(
+                "Streaming Voice Draft acceptance recovery failed for segment %s",
+                transcribed.segment_id,
+            )
 
 
 def _dashboard_page(
@@ -120,8 +182,12 @@ def create_app(
     voice_asr_provider: ASRProvider | None = None,
     voice_media_processor: VoiceMediaProcessor | None = None,
     email_sender: TencentSesEmailSender | None = None,
+    auth_admission_clock: Callable[[], float] | None = None,
+    provider_admission_clock: Callable[[], float] | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
+    if settings.storage_item_extra_max_bytes <= 0:
+        raise ValueError("STORAGE_ITEM_EXTRA_MAX_BYTES must be positive")
     database = Database(settings.database_path)
     repository = Repository(database)
     voice_repository = VoiceCaptureRepository(database)
@@ -131,10 +197,12 @@ def create_app(
     push_endpoint_policy = push_endpoint_policy or PushEndpointPolicy()
     web_push_service = WebPushService(settings, push_endpoint_policy)
     email_sender = email_sender or TencentSesEmailSender(settings)
+    email_admission = EmailSendAdmission(settings)
     email_reminder_service = EmailReminderService(
         email_repository,
         email_sender,
         settings,
+        admission=email_admission,
     )
     reminder_service = ReminderService(
         reminder_repository,
@@ -162,7 +230,22 @@ def create_app(
         invite_code_hash=settings.invite_code_hash,
         session_expiration_seconds=settings.session_expiration_seconds,
     )
-    ai_service = ai_service or create_ai_service(settings)
+    auth_admission = AuthAdmissionLimiter(
+        settings, clock=auth_admission_clock or time.monotonic
+    )
+    provider_admission = ProviderAdmission(
+        settings, clock=provider_admission_clock or time.monotonic
+    )
+    storage_admission = StorageAdmission(
+        settings.database_path,
+        settings.voice_storage_root if settings.voice_asr_enabled else None,
+        min_free_bytes=settings.storage_min_free_bytes,
+        write_window_seconds=settings.storage_write_window_seconds,
+        write_limit=settings.storage_write_limit,
+        voice_concurrent_limit=settings.storage_voice_concurrent_limit,
+        voice_max_bytes=settings.voice_max_upload_bytes,
+    )
+    ai_service = ai_service or create_ai_service(settings, provider_admission.ai)
     processor = InputProcessingService(
         repository,
         ai_service,
@@ -176,6 +259,7 @@ def create_app(
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         voice_paths = validate_voice_runtime(settings)
         database.initialize()
+        _accept_recovered_transcribed_segments(voice_repository)
         voice_runtime: VoiceRuntime | None = None
         if voice_paths is None:
             voice_repository.system_recover_interrupted_segments()
@@ -183,6 +267,7 @@ def create_app(
             voice_storage = VoiceStorage(
                 voice_paths.storage_root,
                 settings.voice_max_upload_bytes,
+                admission=storage_admission,
             )
             voice_deletion_ledger = VoiceDeletionLedger(database, voice_storage)
             media_processor = voice_media_processor or VoiceMediaProcessor(
@@ -200,6 +285,7 @@ def create_app(
                 voice_storage,
                 media_processor,
                 asr_provider,
+                admission=provider_admission.asr,
             )
             voice_runtime = VoiceRuntime(
                 voice_repository,
@@ -282,6 +368,10 @@ def create_app(
     app.state.processor = processor
     app.state.auth_repository = auth_repository
     app.state.auth_service = auth_service
+    app.state.auth_admission = auth_admission
+    app.state.provider_admission = provider_admission
+    app.state.storage_admission = storage_admission
+    app.state.email_admission = email_admission
     app.state.reminder_repository = reminder_repository
     app.state.reminder_service = reminder_service
     app.state.email_repository = email_repository
@@ -293,7 +383,7 @@ def create_app(
     app.state.reminder_delivery_service = reminder_delivery_service
     app.state.trash_retention_service = trash_retention_service
     app.state.trash_retention_worker_task = None
-    app.include_router(create_auth_router(auth_service, settings))
+    app.include_router(create_auth_router(auth_service, settings, auth_admission))
     require_current_user = create_current_user_dependency(auth_service, settings)
     require_csrf_current_user = create_current_user_dependency(
         auth_service,
@@ -363,14 +453,16 @@ def create_app(
     )
     async def capture_input(
         payload: CaptureRequest,
+        request: Request,
         background_tasks: BackgroundTasks,
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> ItemInputPublic:
-        item_input = repository.create_input(
-            payload.original_text,
-            payload.input_method,
-            current_user.id,
-        )
+        with _database_growth(request, len(payload.original_text.encode("utf-8"))):
+            item_input = repository.create_input(
+                payload.original_text,
+                payload.input_method,
+                current_user.id,
+            )
         background_tasks.add_task(
             processor.process_input,
             item_input.id,
@@ -386,16 +478,18 @@ def create_app(
     async def add_item_input(
         item_id: int,
         payload: CaptureRequest,
+        request: Request,
         background_tasks: BackgroundTasks,
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> ItemInputPublic:
         try:
-            item_input = repository.create_input(
-                payload.original_text,
-                payload.input_method,
-                current_user.id,
-                item_id=item_id,
-            )
+            with _database_growth(request, len(payload.original_text.encode("utf-8"))):
+                item_input = repository.create_input(
+                    payload.original_text,
+                    payload.input_method,
+                    current_user.id,
+                    item_id=item_id,
+                )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         background_tasks.add_task(
@@ -412,11 +506,13 @@ def create_app(
     )
     async def retry_input(
         input_id: int,
+        request: Request,
         background_tasks: BackgroundTasks,
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> ItemInputPublic:
         try:
-            item_input = repository.retry_input(input_id, current_user.id)
+            with _database_growth(request):
+                item_input = repository.retry_input(input_id, current_user.id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except InvalidOperationError as exc:
@@ -452,14 +548,27 @@ def create_app(
     )
     async def reprocess_item(
         item_id: int,
+        request: Request,
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> PersonalItemPublic:
         try:
-            return await processor.reprocess_item(item_id, current_user.id)
+            with _database_growth(request):
+                return await processor.reprocess_item(item_id, current_user.id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AIAdmissionError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=exc.user_message,
+                headers={
+                    "Retry-After": str(exc.retry_after),
+                    "Cache-Control": "no-store",
+                },
+            ) from exc
+        except AIInputSizeError as exc:
+            raise HTTPException(status_code=413, detail=exc.user_message) from exc
         except AIServiceError as exc:
             raise HTTPException(status_code=502, detail=exc.user_message) from exc
 
@@ -614,14 +723,43 @@ def create_app(
     def update_item(
         item_id: int,
         payload: UserItemPatch,
+        request: Request,
         current_user: UserPublic = Depends(require_csrf_current_user),
     ) -> PersonalItemPublic:
-        try:
-            return repository.update_item(item_id, current_user.id, payload)
-        except NotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except InvalidOperationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        supplied = payload.model_fields_set
+        content_fields = supplied & {"title", "type", "next_action", "extra_information"}
+        growth = 0
+        if content_fields:
+            def content_size(value) -> int:
+                if value is None:
+                    return 0
+                if isinstance(value, dict):
+                    value = serialize_extra_information(value)
+                return len(value.encode("utf-8"))
+
+            try:
+                existing = repository.get_item(item_id, current_user.id)
+            except NotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            if "extra_information" in supplied:
+                old_extra = content_size(existing.extra_information)
+                new_extra = content_size(payload.extra_information)
+                if (new_extra > settings.storage_item_extra_max_bytes
+                        and new_extra > old_extra):
+                    raise HTTPException(
+                        status_code=413,
+                        detail="补充信息超过当前保存上限；原有内容未修改。",
+                    )
+            old_size = sum(content_size(getattr(existing, name)) for name in content_fields)
+            new_size = sum(content_size(getattr(payload, name)) for name in content_fields)
+            growth = max(0, new_size - old_size)
+        with (_database_growth(request, growth) if growth else nullcontext()):
+            try:
+                return repository.update_item(item_id, current_user.id, payload)
+            except NotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except InvalidOperationError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.delete("/api/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
     def permanently_delete_item(

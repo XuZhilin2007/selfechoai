@@ -126,6 +126,15 @@ class Settings:
     database_path: Path
     registration_mode: str = "closed"
     invite_code_hash: str = ""
+    # Finite local fallbacks; operator admission policy is set explicitly.
+    auth_registration_window_seconds: int = 60
+    auth_registration_source_limit: int = 20
+    auth_registration_global_limit: int = 100
+    auth_login_window_seconds: int = 60
+    auth_login_source_limit: int = 30
+    auth_login_account_limit: int = 10
+    auth_login_global_limit: int = 300
+    auth_admission_max_keys: int = 1024
     app_origin: str = "http://127.0.0.1:8000"
     session_expiration_seconds: int = 2_592_000
     session_cookie_secure: bool = False
@@ -138,6 +147,20 @@ class Settings:
     deepseek_model: str = "deepseek-flash"
     ai_timeout_seconds: float = 30.0
     ai_debug_output: bool = False
+    # Finite local fallbacks; operator provider policy is set explicitly.
+    ai_admission_window_seconds: int = 60
+    ai_admission_call_limit: int = 60
+    ai_admission_concurrent_limit: int = 4
+    ai_provider_input_max_bytes: int = 1_000_000
+    asr_admission_window_seconds: int = 60
+    asr_admission_call_limit: int = 30
+    asr_admission_concurrent_limit: int = 4
+    # Finite local defaults; operator reserve and write policy are explicit.
+    storage_min_free_bytes: int = 64 * 1024 * 1024
+    storage_write_window_seconds: int = 60
+    storage_write_limit: int = 120
+    storage_voice_concurrent_limit: int = 4
+    storage_item_extra_max_bytes: int = 256 * 1024
     web_push_enabled: bool = False
     web_push_vapid_public_key: str = ""
     web_push_vapid_private_key: SecretStr = SecretStr("")
@@ -159,6 +182,12 @@ class Settings:
     tencent_ses_reminder_template_id: int | None = None
     tencent_ses_test_template_id: int | None = None
     tencent_ses_timeout_seconds: float = 10.0
+    # Finite local fallbacks; operator email policy is set explicitly.
+    email_verification_recipient_window_seconds: int = 3_600
+    email_verification_recipient_limit: int = 5
+    email_verification_recipient_max_keys: int = 1_024
+    email_send_window_seconds: int = 60
+    email_send_global_limit: int = 60
     email_verification_code_pepper: SecretStr = SecretStr("")
     voice_asr_enabled: bool = False
     voice_storage_root: Path | None = None
@@ -344,6 +373,15 @@ class Settings:
                 )
             return value in {"true", "1", "yes", "on"}
 
+        def read_positive_int(name: str, default: int) -> int:
+            try:
+                value = int(read(name, str(default)))
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a positive integer") from exc
+            if value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+            return value
+
         api_key = read("AI_API_KEY") or read("OPENAI_API_KEY")
         database_value = read("APP_DATABASE_PATH").strip()
         registration_mode = read("AUTH_REGISTRATION_MODE", "closed").strip().lower()
@@ -408,6 +446,30 @@ class Settings:
             ),
             registration_mode=registration_mode,
             invite_code_hash=read("AUTH_INVITE_CODE_HASH").strip().lower(),
+            auth_registration_window_seconds=read_positive_int(
+                "AUTH_REGISTRATION_WINDOW_SECONDS", 60
+            ),
+            auth_registration_source_limit=read_positive_int(
+                "AUTH_REGISTRATION_SOURCE_LIMIT", 20
+            ),
+            auth_registration_global_limit=read_positive_int(
+                "AUTH_REGISTRATION_GLOBAL_LIMIT", 100
+            ),
+            auth_login_window_seconds=read_positive_int(
+                "AUTH_LOGIN_WINDOW_SECONDS", 60
+            ),
+            auth_login_source_limit=read_positive_int(
+                "AUTH_LOGIN_SOURCE_LIMIT", 30
+            ),
+            auth_login_account_limit=read_positive_int(
+                "AUTH_LOGIN_ACCOUNT_LIMIT", 10
+            ),
+            auth_login_global_limit=read_positive_int(
+                "AUTH_LOGIN_GLOBAL_LIMIT", 300
+            ),
+            auth_admission_max_keys=read_positive_int(
+                "AUTH_ADMISSION_MAX_KEYS", 1024
+            ),
             app_origin=app_origin,
             session_expiration_seconds=session_expiration_seconds,
             session_cookie_secure=session_cookie_secure,
@@ -426,6 +488,42 @@ class Settings:
             ).strip(),
             ai_timeout_seconds=float(read("AI_TIMEOUT_SECONDS", "30")),
             ai_debug_output=read_bool("AI_DEBUG_OUTPUT", "false"),
+            ai_admission_window_seconds=read_positive_int(
+                "AI_ADMISSION_WINDOW_SECONDS", 60
+            ),
+            ai_admission_call_limit=read_positive_int(
+                "AI_ADMISSION_CALL_LIMIT", 60
+            ),
+            ai_admission_concurrent_limit=read_positive_int(
+                "AI_ADMISSION_CONCURRENT_LIMIT", 4
+            ),
+            ai_provider_input_max_bytes=read_positive_int(
+                "AI_PROVIDER_INPUT_MAX_BYTES", 1_000_000
+            ),
+            asr_admission_window_seconds=read_positive_int(
+                "ASR_ADMISSION_WINDOW_SECONDS", 60
+            ),
+            asr_admission_call_limit=read_positive_int(
+                "ASR_ADMISSION_CALL_LIMIT", 30
+            ),
+            asr_admission_concurrent_limit=read_positive_int(
+                "ASR_ADMISSION_CONCURRENT_LIMIT", 4
+            ),
+            storage_min_free_bytes=read_positive_int(
+                "STORAGE_MIN_FREE_BYTES", 64 * 1024 * 1024
+            ),
+            storage_write_window_seconds=read_positive_int(
+                "STORAGE_WRITE_WINDOW_SECONDS", 60
+            ),
+            storage_write_limit=read_positive_int(
+                "STORAGE_WRITE_LIMIT", 120
+            ),
+            storage_voice_concurrent_limit=read_positive_int(
+                "STORAGE_VOICE_CONCURRENT_LIMIT", 4
+            ),
+            storage_item_extra_max_bytes=read_positive_int(
+                "STORAGE_ITEM_EXTRA_MAX_BYTES", 256 * 1024
+            ),
             web_push_enabled=read_bool("WEB_PUSH_ENABLED", "false"),
             web_push_vapid_public_key=read(
                 "WEB_PUSH_VAPID_PUBLIC_KEY"
@@ -465,6 +563,21 @@ class Settings:
             tencent_ses_reminder_template_id=email_reminder_template_id,
             tencent_ses_test_template_id=email_test_template_id,
             tencent_ses_timeout_seconds=email_timeout_seconds,
+            email_verification_recipient_window_seconds=read_positive_int(
+                "EMAIL_VERIFICATION_RECIPIENT_WINDOW_SECONDS", 3_600
+            ),
+            email_verification_recipient_limit=read_positive_int(
+                "EMAIL_VERIFICATION_RECIPIENT_LIMIT", 5
+            ),
+            email_verification_recipient_max_keys=read_positive_int(
+                "EMAIL_VERIFICATION_RECIPIENT_MAX_KEYS", 1_024
+            ),
+            email_send_window_seconds=read_positive_int(
+                "EMAIL_SEND_WINDOW_SECONDS", 60
+            ),
+            email_send_global_limit=read_positive_int(
+                "EMAIL_SEND_GLOBAL_LIMIT", 60
+            ),
             email_verification_code_pepper=SecretStr(email_verification_pepper),
             voice_asr_enabled=read_bool("VOICE_ASR_ENABLED", "false"),
             voice_storage_root=(

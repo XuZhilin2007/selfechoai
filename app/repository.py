@@ -99,10 +99,16 @@ def _parse_deadline(value: str | None) -> date | datetime | None:
     return date.fromisoformat(value)
 
 
-def _json_dump(value: dict[str, Any] | None) -> str | None:
+def serialize_extra_information(value: dict[str, Any] | None) -> str | None:
     if value is None:
         return None
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    )
+
+
+def _json_dump(value: dict[str, Any] | None) -> str | None:
+    return serialize_extra_information(value)
 
 
 def _parse_optional_datetime(value: str | None) -> datetime | None:
