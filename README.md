@@ -154,6 +154,15 @@ Enabling Voice requires operator configuration:
 
 When Voice is enabled, browser audio is sent from your self-hosted SelfEcho instance to the configured Alibaba ASR endpoint, which receives the audio required for transcription. This is a separate provider boundary and credential from AI Structuring, which still uses the configured DeepSeek/OpenAI-compatible provider after Final Save. Alibaba is not used for AI Structuring. Original Audio, transcripts, the database, Voice storage, backups, and provider credentials can all contain sensitive personal information and must be protected accordingly.
 
+### Streaming Voice
+
+Streaming Voice is part of Voice Capture and needs no extra application feature flag: with Voice enabled, holding the record button starts a live recognition attempt. The browser captures a 16 kHz mono PCM track through an AudioWorklet and streams it over the same-origin WebSocket to the configured Alibaba streaming endpoint while MediaRecorder records the preserved Original Audio in parallel. Sentence-level live text is a preview only; it never becomes Draft text by itself. On release, the whole-task final transcript must be fully persisted (the `transcribed` state) before it can enter the Draft. Accepting a persisted transcript into the Draft is a separate, durable transition: the normal path performs it automatically once the transcript is durable, and a pending acceptance can also be applied explicitly from the Capture page. The user's required explicit step remains Final Save: the Draft still needs it to reach the Item and AI flow.
+
+- Original Audio is uploaded to this server independently of the provider session, so a provider, network, or admission failure never discards a safely saved recording; failed recordings stay explicitly retryable through the batch ASR path or deletable.
+- Cancel stops the attempt and marks it non-authoritative; late provider events cannot revive a cancelled attempt. Cancel cannot recall audio already streamed to the provider.
+- A Voice configuration that is valid for batch transcription but not for streaming (for example the shared `dashscope.aliyuncs.com` endpoint) keeps the existing non-streaming capture path: the app reports streaming as unavailable and browser recordings use batch ASR as before. A streaming attempt that fails after starting never falls back to batch automatically; its saved recording stays explicitly retryable.
+- The `ALIBABA_ASR_API_URL` must be a workspace-specific HTTPS endpoint for streaming recognition; the shared `dashscope.aliyuncs.com` endpoint does not support it and attempts fail clearly with a configuration error. Batch transcription keeps working with whatever endpoint Voice already uses. Voice-disabled instances require no streaming configuration.
+
 ## Requirements
 
 - Python 3.11 or later

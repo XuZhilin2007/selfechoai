@@ -12,6 +12,7 @@ from pathlib import Path
 
 # A bounded SQLite write can allocate new WAL/database pages as well as content.
 DATABASE_WRITE_ALLOWANCE = 1024 * 1024
+STREAM_UPLOAD_HANDOFF_SECONDS = 120
 
 
 class StorageAdmissionDenied(RuntimeError):
@@ -105,6 +106,8 @@ class StorageAdmission:
         self._used = 0
         self._active_voice = 0
         self._reserved_by_device: dict[int, int] = {}
+        self._handoffs: dict[tuple[int, int, int, int, str],
+                             tuple[float, VoiceStorageLease]] = {}
 
     @staticmethod
     def _filesystem(path: Path) -> tuple[int, int]:
@@ -117,6 +120,12 @@ class StorageAdmission:
             return os.stat(candidate).st_dev, shutil.disk_usage(candidate).free
         except OSError as exc:
             raise StorageAdmissionDenied("capacity") from exc
+
+    def _expire_handoffs(self, now: float) -> None:
+        for key, (expiry, lease) in list(self._handoffs.items()):
+            if expiry <= now:
+                del self._handoffs[key]
+                self._release_locked(lease)
 
     def _admit_write_locked(self, now: float) -> None:
         if (self._window_start is not None
@@ -134,6 +143,7 @@ class StorageAdmission:
             raise ValueError("estimated database growth must not be negative")
         with self._lock:
             now = self._clock()
+            self._expire_handoffs(now)
             device, free = self._filesystem(self.database_path.parent)
             size = DATABASE_WRITE_ALLOWANCE + estimated_growth_bytes
             if (free - self._reserved_by_device.get(device, 0)
@@ -150,6 +160,7 @@ class StorageAdmission:
             raise StorageAdmissionDenied("capacity")
         with self._lock:
             now = self._clock()
+            self._expire_handoffs(now)
             if self._active_voice >= self.voice_concurrent_limit:
                 raise StorageAdmissionDenied("pressure")
             db_device, db_free = self._filesystem(self.database_path.parent)
@@ -197,3 +208,35 @@ class StorageAdmission:
     def _release(self, lease: VoiceStorageLease) -> None:
         with self._lock:
             self._release_locked(lease)
+
+    def park_stream_upload(
+        self, key: tuple[int, int, int, int, str], lease: VoiceStorageLease
+    ) -> None:
+        """Keep a failed provider session's recording capacity briefly for upload."""
+        with self._lock:
+            now = self._clock()
+            self._expire_handoffs(now)
+            if lease._released:
+                return
+            existing = self._handoffs.pop(key, None)
+            if existing is not None:
+                self._release_locked(existing[1])
+            lease._slot.references += 1
+            self._handoffs[key] = (
+                now + STREAM_UPLOAD_HANDOFF_SECONDS,
+                VoiceStorageLease(self, lease._slot),
+            )
+
+    def take_stream_upload(
+        self, key: tuple[int, int, int, int, str]
+    ) -> VoiceStorageLease | None:
+        with self._lock:
+            self._expire_handoffs(self._clock())
+            entry = self._handoffs.pop(key, None)
+            return entry[1] if entry is not None else None
+
+    def discard_stream_upload(self, key: tuple[int, int, int, int, str]) -> None:
+        with self._lock:
+            entry = self._handoffs.pop(key, None)
+            if entry is not None:
+                self._release_locked(entry[1])

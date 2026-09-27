@@ -393,6 +393,9 @@ class CaptureDraftPublic(StrictModel):
 class CaptureDraftResponse(StrictModel):
     draft: CaptureDraftPublic | None
     voice_available: bool = False
+    # Capability routing, not runtime state: whether this instance's Voice
+    # configuration supports live streaming capture at all.
+    streaming_voice_available: bool = False
 
 
 class CaptureDraftPutRequest(StrictModel):

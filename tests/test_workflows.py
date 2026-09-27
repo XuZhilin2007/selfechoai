@@ -582,9 +582,9 @@ def test_pwa_routes_and_health_start(client_factory):
     assert service_worker.status_code == 200
     assert service_worker.headers["content-type"].startswith("text/javascript")
     assert service_worker.headers["cache-control"] == "no-cache"
-    assert "selfecho-ai-community-v0.8.0-ui-1" in service_worker.text
-    assert "/static/app.js?v=0.8.0-community-ui-1" in shell
-    assert "/static/styles.css?v=0.8.0-community-ui-1" in shell
+    assert "selfecho-ai-community-v0.8.1-stream-1" in service_worker.text
+    assert "/static/app.js?v=0.8.1-stream-1" in shell
+    assert "/static/styles.css?v=0.8.1-stream-1" in shell
     assert "public-security-filing" not in service_worker.text
     frontend = client.get("/static/app.js").text
     assert "<h1>先记下来</h1>" in frontend

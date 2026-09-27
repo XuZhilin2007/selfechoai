@@ -154,6 +154,15 @@ Voice Capture 可选且默认关闭（`VOICE_ASR_ENABLED=false`）。关闭 Voic
 
 启用 Voice 后，浏览器音频会从你自托管的 SelfEcho 实例发送到所配置的 Alibaba ASR 端点，Alibaba 接收转写所需的音频。这是与 AI Structuring 不同的 Provider 边界与凭据：AI Structuring 仍在 Final Save 后使用所配置的 DeepSeek/OpenAI 兼容 Provider，Alibaba 不用于 AI Structuring。Original Audio、转写文本、数据库、Voice 存储、备份和 Provider 凭据都可能包含敏感个人信息，应按敏感数据保护。
 
+### Streaming Voice（实时流式转写）
+
+Streaming Voice 是 Voice Capture 的一部分，不需要额外的应用特性开关：启用 Voice 后，按住录音按钮即开始一次实时识别尝试。浏览器通过 AudioWorklet 采集 16 kHz 单声道 PCM，并在录音过程中经同源 WebSocket 实时发送到所配置的 Alibaba streaming endpoint；同时 MediaRecorder 并行录制需要保留的 Original Audio。句级实时文本只是预览，本身永远不会成为 Draft 文字。松手后，整段最终转写必须完整持久化（`transcribed` 状态）才能进入 Draft。把已持久化的转写接受进 Draft 是一个独立的 durable 状态迁移：正常路径会在转写 durable 后自动完成，处于等待状态的接受也可以随时在 Capture 页面手动执行。用户必须显式执行的步骤仍是 Final Save：Draft 仍须经过它才会进入 Item 与 AI 流程。
+
+- Original Audio 与 Provider 会话相互独立地上传到本服务器，因此 Provider、网络或 admission 失败都不会丢弃已安全保存的录音；失败的录音保持显式可重试（走 batch ASR 路径）或可删除。
+- Cancel 会终止本次 attempt 并使其失去权威性；迟到的 Provider 事件无法复活已取消的 attempt。Cancel 无法撤回已经发送给 Provider 的音频。
+- 对 batch 转写有效但不支持 streaming 的 Voice 配置（例如共享的 `dashscope.aliyuncs.com` endpoint）会继续使用既有的非流式录制路径：应用将 streaming 标记为不可用，浏览器录音照常走 batch ASR。已开始但失败的 streaming attempt 不会自动回退到 batch；其已保存的录音保持显式可重试。
+- Streaming 识别要求 `ALIBABA_ASR_API_URL` 是 workspace 专用的 HTTPS endpoint；共享的 `dashscope.aliyuncs.com` endpoint 不支持流式识别，尝试会以明确的配置错误失败。batch 转写继续使用 Voice 现有 endpoint。未启用 Voice 的实例无需任何 Streaming 配置。
+
 ## Requirements
 
 - Python 3.11 或更高版本

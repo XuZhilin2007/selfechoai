@@ -575,6 +575,24 @@ textarea {
   color: white;
 }
 
+.voice-live-preview {
+  margin: 0.75rem 0;
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.75rem;
+  background: var(--surface-muted, #f5f6f4);
+  color: var(--text-muted, #4e5752);
+}
+
+.voice-live-preview p {
+  margin: 0.35rem 0 0;
+  white-space: pre-wrap;
+}
+
+.voice-segment-transcript {
+  margin: 0.6rem 0 0;
+  white-space: pre-wrap;
+}
+
 .voice-segment-list {
   display: grid;
   gap: 9px;

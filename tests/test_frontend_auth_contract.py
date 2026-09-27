@@ -54,9 +54,9 @@ def test_service_worker_never_caches_api_responses_and_manifest_is_valid(
     shell_entries = service_worker.split("const SHELL = [", 1)[1].split("];", 1)[0]
     api_guard_index = service_worker.index('requestUrl.pathname.startsWith("/api/")')
     response_handler_index = service_worker.index("event.respondWith")
-    assert "selfecho-ai-community-v0.8.0-ui-1" in service_worker
-    assert '"/static/app.js?v=0.8.0-community-ui-1"' in shell_entries
-    assert '"/static/styles.css?v=0.8.0-community-ui-1"' in shell_entries
+    assert "selfecho-ai-community-v0.8.1-stream-1" in service_worker
+    assert '"/static/app.js?v=0.8.1-stream-1"' in shell_entries
+    assert '"/static/styles.css?v=0.8.1-stream-1"' in shell_entries
     assert "public-security-filing" not in service_worker
     assert "/api/" not in shell_entries
     assert api_guard_index < response_handler_index

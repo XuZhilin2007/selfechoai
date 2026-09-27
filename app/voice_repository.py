@@ -405,10 +405,67 @@ class VoiceCaptureRepository:
         client_content_type: str | None,
         expected_revision: int,
     ) -> VoiceSegmentUploadResult:
+        return self._create_uploaded_segment(
+            user_id=user_id,
+            client_segment_id=client_segment_id,
+            saved=saved,
+            client_content_type=client_content_type,
+            expected_revision=expected_revision,
+            streaming=False,
+            streaming_active=False,
+            expected_draft_id=None,
+        )
+
+    def create_streaming_segment(
+        self,
+        *,
+        user_id: int,
+        client_segment_id: str,
+        saved: StoredOriginal,
+        client_content_type: str | None,
+        expected_revision: int,
+        streaming_active: bool,
+        expected_draft_id: int,
+    ) -> VoiceSegmentUploadResult:
+        """Record a complete Original; inactive attempts remain explicitly recoverable."""
+        return self._create_uploaded_segment(
+            user_id=user_id,
+            client_segment_id=client_segment_id,
+            saved=saved,
+            client_content_type=client_content_type,
+            expected_revision=expected_revision,
+            streaming=True,
+            streaming_active=streaming_active,
+            expected_draft_id=expected_draft_id,
+        )
+
+    def _create_uploaded_segment(
+        self,
+        *,
+        user_id: int,
+        client_segment_id: str,
+        saved: StoredOriginal,
+        client_content_type: str | None,
+        expected_revision: int,
+        streaming: bool,
+        streaming_active: bool,
+        expected_draft_id: int | None,
+    ) -> VoiceSegmentUploadResult:
         validate_client_segment_id(client_segment_id)
         if expected_revision < 0:
             raise ValueError("expected_revision must be non-negative")
         now = utc_now_iso()
+        segment_status = (
+            "transcribing" if streaming_active else "failed"
+        ) if streaming else "pending"
+        model = ALIBABA_STREAMING_ASR_MODEL if streaming else ALIBABA_ASR_MODEL
+        failure_code = "interrupted" if streaming and not streaming_active else None
+        failure_message = (
+            "实时转写未完成；原始录音已保留，请手动重试。"
+            if failure_code else None
+        )
+        started_time = now if streaming_active else None
+        finished_time = now if failure_code else None
         with self.database.transaction() as connection:
             existing = connection.execute(
                 """
@@ -418,6 +475,10 @@ class VoiceCaptureRepository:
                 (user_id, client_segment_id),
             ).fetchone()
             if existing is not None:
+                if expected_draft_id is not None and existing["draft_id"] != expected_draft_id:
+                    raise VoiceSegmentConflictError(
+                        "client_segment_id belongs to another Capture Draft"
+                    )
                 if (
                     int(existing["original_size_bytes"]) != saved.size_bytes
                     or existing["original_sha256"] != saved.sha256
@@ -441,9 +502,10 @@ class VoiceCaptureRepository:
             ).fetchone()
             if draft is None:
                 raise NotFoundError("Capture Draft not found")
+            if expected_draft_id is not None and draft["id"] != expected_draft_id:
+                raise DraftRevisionConflictError("Capture Draft changed")
             if int(draft["revision"]) != expected_revision:
                 raise DraftRevisionConflictError("Capture Draft revision is stale")
-
             blocked = connection.execute(
                 """
                 SELECT transcription_status FROM voice_segments
@@ -461,7 +523,6 @@ class VoiceCaptureRepository:
                 raise DraftBlockedError(
                     "another Voice Segment is still being transcribed"
                 )
-
             next_position = int(
                 connection.execute(
                     """
@@ -479,8 +540,10 @@ class VoiceCaptureRepository:
                     client_segment_id, storage_key, original_size_bytes,
                     original_sha256, client_content_type,
                     transcription_status, provider, model,
-                    created_time, updated_time
-                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    failure_code, failure_message,
+                    transcription_started_time, transcription_finished_time,
+                    attempt_count, created_time, updated_time
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -491,8 +554,14 @@ class VoiceCaptureRepository:
                     saved.size_bytes,
                     saved.sha256,
                     client_content_type,
+                    segment_status,
                     ALIBABA_ASR_PROVIDER,
-                    ALIBABA_ASR_MODEL,
+                    model,
+                    failure_code,
+                    failure_message,
+                    started_time,
+                    finished_time,
+                    1 if streaming else 0,
                     now,
                     now,
                 ),
@@ -558,7 +627,9 @@ class VoiceCaptureRepository:
                     sample_rate_hz = ?, channels = ?, duration_ms = ?,
                     updated_time = ?
                 WHERE id = ? AND user_id = ?
-                  AND transcription_status = 'transcribing'
+                  AND (transcription_status = 'transcribing'
+                       OR (transcription_status = 'failed'
+                           AND model = ?))
                 """,
                 (
                     metadata.container,
@@ -569,6 +640,7 @@ class VoiceCaptureRepository:
                     utc_now_iso(),
                     segment_id,
                     user_id,
+                    ALIBABA_STREAMING_ASR_MODEL,
                 ),
             )
         return cursor.rowcount == 1
@@ -709,6 +781,30 @@ class VoiceCaptureRepository:
                 ),
             )
         return cursor.rowcount == 1
+
+    def mark_streaming_media_failed(
+        self,
+        segment_id: int,
+        user_id: int,
+        *,
+        failure_code: str,
+        failure_message: str,
+    ) -> None:
+        """Prefer a verified Original-media failure over a generic stream failure."""
+        now = utc_now_iso()
+        with self.database.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE voice_segments
+                SET transcription_status = 'failed',
+                    failure_code = ?, failure_message = ?,
+                    updated_time = ?, transcription_finished_time = ?
+                WHERE id = ? AND user_id = ? AND model = ?
+                  AND transcription_status IN ('transcribing', 'failed')
+                """,
+                (failure_code, failure_message[:500], now, now,
+                 segment_id, user_id, ALIBABA_STREAMING_ASR_MODEL),
+            )
 
     def retry_failed_segment(
         self,

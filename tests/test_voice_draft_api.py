@@ -60,6 +60,7 @@ def test_draft_load_create_update_preserves_exact_text(draft_clients):
     assert user_a.get("/api/capture-draft").json() == {
         "draft": None,
         "voice_available": False,
+        "streaming_voice_available": False,
     }
     created_response = user_a.put(
         "/api/capture-draft",

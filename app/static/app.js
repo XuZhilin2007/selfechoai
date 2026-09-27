@@ -2445,6 +2445,9 @@ const VOICE_DETAILED_FAILURE_CODES = new Set([
 ]);
 
 function voiceSegmentFailureCopy(segment) {
+  if (segment.failure_code === "quota_rate_limit") {
+    return "语音转写受到用量限制；原始录音已保留，可稍后手动重试。";
+  }
   if (
     segment.failure_code &&
     VOICE_DETAILED_FAILURE_CODES.has(segment.failure_code) &&
@@ -2514,7 +2517,7 @@ function observeVoiceSegmentCompletions(previousStatuses, draft) {
   for (const [segmentId, status] of statuses) {
     if (
       status === "succeeded" &&
-      ["pending", "transcribing"].includes(previousStatuses.get(segmentId))
+      ["pending", "transcribing", "transcribed"].includes(previousStatuses.get(segmentId))
     ) {
       completedSegmentIds.push(segmentId);
     }
@@ -2585,6 +2588,82 @@ function voiceAudioMarkup(segmentId, label = "播放原始录音", { preload = "
   return `<audio class="voice-audio" controls preload="${preload}" aria-label="${escapeHtml(label)}" src="/api/voice-segments/${segmentId}/audio"></audio>`;
 }
 
+function openVoiceStream(hello, onEvent, signal = null) {
+  return new Promise((resolve, reject) => {
+    const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${scheme}//${window.location.host}/api/capture-draft/voice-stream`);
+    let ready = false;
+    let ended = false;
+    let resolveOutcome;
+    let rejectOutcome;
+    const outcome = new Promise((accept, fail) => {
+      resolveOutcome = accept;
+      rejectOutcome = fail;
+    });
+    outcome.catch(() => {});
+    const cancelPending = () => {
+      if (ready || ended) return;
+      ended = true;
+      signal?.removeEventListener("abort", cancelPending);
+      reject(new Error("录音尚未开始，实时连接已取消。"));
+      if (socket.readyState < WebSocket.CLOSING) socket.close();
+    };
+    signal?.addEventListener("abort", cancelPending, { once: true });
+    if (signal?.aborted) cancelPending();
+    const fail = (reason = "") => {
+      if (ended) return;
+      ended = true;
+      signal?.removeEventListener("abort", cancelPending);
+      const error = new Error(reason === "capacity"
+        ? "实时转写当前达到临时使用上限；尚未开始录音，请稍后重试。"
+        : reason === "storage_capacity"
+          ? "存储空间暂时不足，尚未开始录音；请稍后重试。"
+          : reason === "storage_pressure"
+            ? "录音保存暂时过于频繁，尚未开始录音；请稍后重试。"
+        : ready
+          ? "实时转写未完成；原始录音仍会安全保存。"
+          : "实时转写暂不可用，尚未开始录音；请稍后重试。");
+      if (ready) {
+        onEvent({ type: "failed" });
+        rejectOutcome(error);
+      }
+      else reject(error);
+      if (socket.readyState < WebSocket.CLOSING) socket.close();
+    };
+    socket.onopen = () => {
+      if (!ended) socket.send(JSON.stringify({ type: "hello", ...hello }));
+    };
+    socket.onmessage = (message) => {
+      if (ended) return;
+      let event;
+      try { event = JSON.parse(message.data); } catch (_) { fail(); return; }
+      if (event.type === "ready" && !ready) {
+        ready = true;
+        signal?.removeEventListener("abort", cancelPending);
+        resolve({
+          socket, outcome, sessionId: event.session_id,
+          stop: () => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stop" })); },
+          cancel: () => {
+            if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "cancel" }));
+            socket.close();
+          },
+        });
+      } else if (event.type === "complete" && ready) {
+        ended = true;
+        resolveOutcome(event);
+        socket.close();
+      } else if (event.type === "failed") {
+        fail(event.reason);
+        socket.close();
+      } else if (ready && !ended) {
+        onEvent(event);
+      }
+    };
+    socket.onerror = fail;
+    socket.onclose = fail;
+  });
+}
+
 function renderCapture() {
   appElement.innerHTML = `
     <div class="capture-view">
@@ -2602,6 +2681,9 @@ function renderCapture() {
               <span class="voice-hold-label">按住说话</span>
             </button>
             <p id="voice-gesture-hint" class="form-hint" hidden>按住录音；按住时上滑，松手取消。</p>
+          </div>
+          <div id="voice-live-preview" class="voice-live-preview" role="status" aria-live="polite" hidden>
+            <strong>实时转写预览 · 文字可能变化</strong><p></p>
           </div>
           <div id="voice-segment-list" class="voice-segment-list" aria-live="polite"></div>
           <div id="pending-upload-actions" class="pending-upload-actions" hidden>
@@ -2643,6 +2725,7 @@ function renderCapture() {
   const voiceButton = document.querySelector("#voice-hold-button");
   const voiceLabel = voiceButton.querySelector(".voice-hold-label");
   const voiceHint = document.querySelector("#voice-gesture-hint");
+  const livePreview = document.querySelector("#voice-live-preview");
   const segmentList = document.querySelector("#voice-segment-list");
   const pendingUploadActions = document.querySelector("#pending-upload-actions");
   const revisionConflictPanel = document.querySelector("#capture-revision-conflict");
@@ -2662,6 +2745,7 @@ function renderCapture() {
     savePending: localBuffer.savePending,
     discardPending: false,
     voiceAvailable: false,
+    streamingAvailable: false,
     autosaveTimer: null,
     statusPollTimer: null,
     completionFeedbackTimer: null,
@@ -2681,11 +2765,25 @@ function renderCapture() {
     status.textContent = message;
   }
 
+  function setRevisionConflict(serverDraft, bufferDraftId = state.draft?.id ?? localBuffer.draftId,
+    bufferRevision = state.draft?.revision ?? localBuffer.revision) {
+    const existing = state.revisionConflict;
+    state.revisionConflict = {
+      serverDraft,
+      bufferDraftId: existing ? existing.bufferDraftId : bufferDraftId,
+      bufferRevision: existing ? existing.bufferRevision : bufferRevision,
+    };
+  }
+
   function writeSafetyBuffer({ savePending = state.savePending } = {}) {
     writeCaptureDraft(textarea.value, {
       dirty: state.dirty,
-      draftId: state.draft?.id ?? localBuffer.draftId,
-      revision: state.draft?.revision ?? localBuffer.revision,
+      draftId: state.revisionConflict
+        ? state.revisionConflict.bufferDraftId
+        : state.draft?.id ?? localBuffer.draftId,
+      revision: state.revisionConflict
+        ? state.revisionConflict.bufferRevision
+        : state.draft?.revision ?? localBuffer.revision,
       savePending,
     });
   }
@@ -2703,6 +2801,7 @@ function renderCapture() {
       const statusText = {
         pending: "等待转写",
         transcribing: "正在转写",
+        transcribed: "已转写，尚未加入草稿",
         succeeded: "已加入可编辑文字",
         failed: "转写未完成",
       }[segment.transcription_status] || segment.transcription_status;
@@ -2716,12 +2815,17 @@ function renderCapture() {
              ${deleteAction}
            </div>`
         : "";
+      const completedPreview = segment.transcription_status === "transcribed"
+        ? `<p class="voice-segment-transcript">${escapeHtml(segment.provider_transcript || "")}</p>
+           <button class="text-button voice-segment-accept" type="button" data-segment-id="${segment.id}">重试加入草稿</button>`
+        : "";
       return `<article class="voice-segment" data-status="${escapeHtml(segment.transcription_status)}">
         <div class="voice-segment-heading">
           <strong>录音 ${index + 1}</strong>
           <span>${escapeHtml(statusText)}</span>
         </div>
         ${voiceAudioMarkup(segment.id, `播放第 ${index + 1} 段原始录音`, { preload: "metadata" })}
+        ${completedPreview}
         ${failure}
       </article>`;
     }).join("");
@@ -2745,14 +2849,16 @@ function renderCapture() {
         <div><span>另一页面保存的文字</span><pre>${escapeHtml(serverDraft?.current_text ?? "（另一页面的草稿已不存在）")}</pre></div>
       </div>
       <div class="revision-conflict-actions">
-        <button class="secondary-button conflict-keep-local" type="button">保留本页文字并继续</button>
-        ${serverDraft ? '<button class="secondary-button conflict-use-server" type="button">使用另一页面文字并继续</button>' : ""}
+        <button class="secondary-button conflict-keep-local" type="button" ${state.discardPending ? "disabled" : ""}>保留本页文字并继续</button>
+        ${serverDraft ? `<button class="secondary-button conflict-use-server" type="button" ${state.discardPending ? "disabled" : ""}>使用另一页面文字并继续</button>` : ""}
       </div>`;
   }
 
   function updateCaptureControls() {
     const hasActive = captureHasActiveSegment(state.draft);
     const hasFailed = captureHasFailedSegment(state.draft);
+    const hasTranscribed = Boolean(state.draft?.voice_segments?.some((segment) =>
+      segment.transcription_status === "transcribed"));
     const transient = [
       CAPTURE_BROWSER_STATES.REQUESTING_MIC,
       CAPTURE_BROWSER_STATES.RECORDING,
@@ -2760,13 +2866,13 @@ function renderCapture() {
       CAPTURE_BROWSER_STATES.FINALIZING,
       CAPTURE_BROWSER_STATES.UPLOADING,
       CAPTURE_BROWSER_STATES.SAVING,
-    ].includes(state.phase);
+    ].includes(state.phase) || state.discardPending;
     textarea.disabled = state.savePending || hasActive || transient;
     voiceButton.hidden = !state.voiceAvailable;
     voiceHint.hidden = !state.voiceAvailable;
-    voiceButton.disabled = state.savePending || !state.voiceAvailable || hasActive || hasFailed || transient ||
+    voiceButton.disabled = state.savePending || !state.voiceAvailable || hasActive || hasFailed || hasTranscribed || transient ||
       state.phase === CAPTURE_BROWSER_STATES.BOOTSTRAPPING || Boolean(state.pendingUpload);
-    button.disabled = transient || hasActive || hasFailed || Boolean(state.pendingUpload) ||
+    button.disabled = transient || hasActive || hasFailed || hasTranscribed || Boolean(state.pendingUpload) ||
       Boolean(state.revisionConflict) ||
       !textarea.value.trim();
     const discardControl = captureDiscardControl({
@@ -2810,13 +2916,31 @@ function renderCapture() {
     try {
       const response = await api("/api/capture-draft");
       if (state.disposed) return null;
+      if (
+        response.draft && state.draft?.id === response.draft.id &&
+        response.draft.revision < state.draft.revision
+      ) return state.draft;
       state.voiceAvailable = response.voice_available === true;
+      state.streamingAvailable = response.streaming_voice_available === true;
       const completion = observeVoiceSegmentCompletions(
         state.voiceSegmentStatuses,
         response.draft,
       );
       state.voiceSegmentStatuses = completion.statuses;
       if (response.draft) {
+        if (
+          state.dirty && state.draft?.id === response.draft.id &&
+          state.draft.revision !== response.draft.revision &&
+          textarea.value !== response.draft.current_text
+        ) {
+          setRevisionConflict(response.draft);
+          state.phase = CAPTURE_BROWSER_STATES.REVISION_CONFLICT;
+          writeSafetyBuffer();
+          setCaptureStatus("草稿已在其他页面更新；本页未确认文字仍保留，请明确选择文字版本。", "error");
+        } else if (state.dirty && textarea.value === response.draft.current_text) {
+          state.dirty = false;
+          clearCaptureDraft();
+        }
         state.draft = response.draft;
         if (!state.dirty && !state.savePending) {
           textarea.value = response.draft.current_text;
@@ -2829,9 +2953,11 @@ function renderCapture() {
       if (polling || active) {
         state.phase = active ? CAPTURE_BROWSER_STATES.POLLING : CAPTURE_BROWSER_STATES.OPEN;
       }
-      if (!active && captureHasFailedSegment(state.draft)) {
+      if (!state.revisionConflict && !active && state.draft?.voice_segments?.some((segment) => segment.transcription_status === "transcribed")) {
+        setCaptureStatus("转写已安全保存；文字尚未加入草稿，可以重试加入，暂不能最终保存。", "error");
+      } else if (!state.revisionConflict && !active && captureHasFailedSegment(state.draft)) {
         setCaptureStatus("请先处理未完成的录音，再保存。", "error");
-      } else if (!active && polling) {
+      } else if (!state.revisionConflict && !active && polling) {
         setCaptureStatus("转写已加入文本，你可以继续编辑后保存。", "success");
       }
       updateCaptureControls();
@@ -2896,6 +3022,7 @@ function renderCapture() {
         if (state.disposed) return response.draft;
         state.draft = response.draft;
         state.voiceAvailable = response.voice_available === true;
+        state.streamingAvailable = response.streaming_voice_available === true;
         if (textarea.value === snapshot) {
           state.dirty = false;
           clearCaptureDraft();
@@ -2935,10 +3062,16 @@ function renderCapture() {
       const response = await api("/api/capture-draft");
       if (state.disposed) return;
       state.voiceAvailable = response.voice_available === true;
+      state.streamingAvailable = response.streaming_voice_available === true;
       const serverDraft = response.draft;
       if (serverDraft) {
         state.draft = serverDraft;
         const localMatchesServer = localBuffer.text === serverDraft.current_text;
+        const localBufferConflicts = localBuffer.dirty && !localMatchesServer &&
+          (localBuffer.draftId !== serverDraft.id ||
+           localBuffer.revision !== serverDraft.revision);
+        const bootstrapInputConflicts = state.userTypedDuringBootstrap &&
+          textarea.value !== serverDraft.current_text;
         const pendingSaveMatchesServer = localBuffer.savePending &&
           localBuffer.draftId === serverDraft.id &&
           localBuffer.revision === serverDraft.revision &&
@@ -2948,6 +3081,11 @@ function renderCapture() {
           state.dirty = false;
           state.savePending = true;
           setCaptureStatus("上次保存结果待确认；请再次点“保存”安全确认。", "error");
+        } else if (localBufferConflicts || bootstrapInputConflicts) {
+          if (!state.userTypedDuringBootstrap) textarea.value = localBuffer.text;
+          state.dirty = true;
+          setRevisionConflict(serverDraft, localBuffer.draftId, localBuffer.revision);
+          setCaptureStatus("本页未确认文字与已保存草稿不同；请选择要保留的文字版本。", "error");
         } else if (!state.userTypedDuringBootstrap && (!localBuffer.dirty || localMatchesServer)) {
           textarea.value = serverDraft.current_text;
           state.dirty = false;
@@ -2971,13 +3109,18 @@ function renderCapture() {
         state.dirty = localBuffer.dirty || state.userTypedDuringBootstrap;
       }
       state.voiceSegmentStatuses = voiceSegmentStatusSnapshot(state.draft);
-      state.phase = captureHasActiveSegment(state.draft)
-        ? CAPTURE_BROWSER_STATES.POLLING
-        : state.dirty
-          ? CAPTURE_BROWSER_STATES.DIRTY
-          : CAPTURE_BROWSER_STATES.OPEN;
+      state.phase = state.revisionConflict
+        ? CAPTURE_BROWSER_STATES.REVISION_CONFLICT
+        : captureHasActiveSegment(state.draft)
+          ? CAPTURE_BROWSER_STATES.POLLING
+          : state.dirty
+            ? CAPTURE_BROWSER_STATES.DIRTY
+            : CAPTURE_BROWSER_STATES.OPEN;
+      if (!state.revisionConflict && state.draft?.voice_segments?.some((segment) => segment.transcription_status === "transcribed")) {
+        setCaptureStatus("转写已安全保存；文字尚未加入草稿，可以重试加入，暂不能最终保存。", "error");
+      }
       updateCaptureControls();
-      if (state.dirty && !state.savePending) scheduleAutosave();
+      if (state.dirty && !state.savePending && !state.revisionConflict) scheduleAutosave();
       scheduleDraftPoll();
     } catch (error) {
       state.phase = state.dirty ? CAPTURE_BROWSER_STATES.DIRTY : CAPTURE_BROWSER_STATES.OPEN;
@@ -2990,10 +3133,21 @@ function renderCapture() {
     stream?.getTracks?.().forEach((track) => track.stop());
   }
 
+  function closeGestureAudio(gesture) {
+    gesture.audioSource?.disconnect();
+    gesture.audioNode?.disconnect();
+    if (gesture.audioContext) void gesture.audioContext.close().catch(() => {});
+    gesture.audioContext = null;
+  }
+
   function abandonVoiceGesture(gesture, message) {
     if (gesture.limitTimer) window.clearTimeout(gesture.limitTimer);
+    gesture.setupAbort?.abort();
+    gesture.streamSession?.cancel();
+    closeGestureAudio(gesture);
     stopTracks(gesture.stream);
-    if (state.gesture === gesture) state.gesture = null;
+    if (state.gesture !== gesture) return;
+    state.gesture = null;
     state.phase = CAPTURE_BROWSER_STATES.OPEN;
     if (!state.disposed) {
       setCaptureStatus(message, "error");
@@ -3006,7 +3160,13 @@ function renderCapture() {
     if (!gesture?.recorder || gesture.recorder.state === "inactive") return;
     if (gesture.limitTimer) window.clearTimeout(gesture.limitTimer);
     gesture.discard = discard;
+    closeGestureAudio(gesture);
+    if (discard || gesture.streamFailed) gesture.streamSession?.cancel();
+    else gesture.streamSession?.stop();
     state.phase = CAPTURE_BROWSER_STATES.FINALIZING;
+    if (!discard) setCaptureStatus(gesture.streamFailed
+      ? "实时转写中断，正在保存原始录音…"
+      : "录音已结束，正在等待整段最终文字…");
     updateCaptureControls();
     gesture.recorder.stop();
   }
@@ -3014,14 +3174,15 @@ function renderCapture() {
   async function uploadRecording(
     blob,
     clientSegmentId,
-    { allowConflictRecovery = true } = {},
+    { allowConflictRecovery = true, streaming = false, ownerId = null,
+      draftId = null, sessionId = null, forceFailed = false } = {},
   ) {
     const existingPending = state.pendingUpload;
     const pendingUpload = existingPending &&
       existingPending.blob === blob &&
       existingPending.clientSegmentId === clientSegmentId
       ? existingPending
-      : { blob, clientSegmentId };
+      : { blob, clientSegmentId, streaming, ownerId, draftId, sessionId, forceFailed };
     state.pendingUpload = pendingUpload;
     state.phase = CAPTURE_BROWSER_STATES.UPLOADING;
     updateCaptureControls();
@@ -3030,7 +3191,7 @@ function renderCapture() {
       await flushDraft({ ensureDraft: true });
       if (!state.draft) throw new Error("草稿尚未就绪");
       const uploadedSegment = await rawApi(
-        `/api/capture-draft/voice-segments/${encodeURIComponent(clientSegmentId)}?revision=${state.draft.revision}`,
+        `/api/capture-draft/${streaming ? "streaming-voice-segments" : "voice-segments"}/${encodeURIComponent(clientSegmentId)}?revision=${state.draft.revision}${streaming ? `&draft_id=${pendingUpload.draftId}&owner_id=${pendingUpload.ownerId}&session_id=${pendingUpload.sessionId}${pendingUpload.forceFailed ? "&force_failed=true" : ""}` : ""}`,
         {
           method: "PUT",
           body: blob,
@@ -3042,9 +3203,10 @@ function renderCapture() {
         uploadedSegment.transcription_status,
       );
       if (state.pendingUpload === pendingUpload) state.pendingUpload = null;
-      state.revisionConflict = null;
-      state.phase = CAPTURE_BROWSER_STATES.POLLING;
-      setCaptureStatus("原始录音已安全保存，正在转写…", "success");
+      state.phase = streaming ? CAPTURE_BROWSER_STATES.FINALIZING : CAPTURE_BROWSER_STATES.POLLING;
+      setCaptureStatus(streaming
+        ? "原始录音已安全保存，等待整段转写完成…"
+        : "原始录音已安全保存，正在转写…", "success");
       await refreshDraft({ polling: true });
     } catch (error) {
       if (
@@ -3070,10 +3232,10 @@ function renderCapture() {
             requireChoice: (serverDraft, voiceAvailable) => {
               if (state.autosaveTimer) window.clearTimeout(state.autosaveTimer);
               state.autosaveTimer = null;
+              setRevisionConflict(serverDraft);
               state.draft = serverDraft;
               state.voiceAvailable = voiceAvailable;
               state.dirty = true;
-              state.revisionConflict = { serverDraft };
               state.phase = CAPTURE_BROWSER_STATES.REVISION_CONFLICT;
               writeSafetyBuffer();
               setCaptureStatus(
@@ -3085,7 +3247,9 @@ function renderCapture() {
             retryPendingUpload: (retained) => uploadRecording(
               retained.blob,
               retained.clientSegmentId,
-              { allowConflictRecovery: false },
+              { allowConflictRecovery: false, streaming: retained.streaming,
+                ownerId: retained.ownerId, draftId: retained.draftId,
+                sessionId: retained.sessionId, forceFailed: retained.forceFailed },
             ),
           });
           if (outcome !== "cancelled") return;
@@ -3105,6 +3269,11 @@ function renderCapture() {
       setCaptureStatus("此浏览器暂不支持录音；仍可继续输入文字。", "error");
       return;
     }
+    if (state.streamingAvailable &&
+        (typeof WebSocket === "undefined" || !window.AudioContext)) {
+      setCaptureStatus("此浏览器暂不支持实时录音；仍可继续输入文字。", "error");
+      return;
+    }
     event.preventDefault();
     const gesture = {
       pointerId: event.pointerId,
@@ -3116,7 +3285,30 @@ function renderCapture() {
       chunks: [],
       discard: false,
       limitTimer: null,
+      streamSession: null,
+      setupAbort: new AbortController(),
+      clientSegmentId: globalThis.crypto?.randomUUID?.() ||
+        `voice-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      ownerId: authentication.user?.id,
+      draftId: null,
+      sessionId: null,
+      audioContext: null,
+      audioSource: null,
+      audioNode: null,
     };
+    if (state.streamingAvailable) {
+      // Live PCM capture only applies to the streaming route; a batch-only
+      // Voice setup records with MediaRecorder alone.
+      try {
+        gesture.audioContext = new window.AudioContext();
+        if (!gesture.audioContext.audioWorklet || gesture.audioContext.sampleRate < 16000) {
+          throw new Error("AudioWorklet unavailable");
+        }
+      } catch (_) {
+        setCaptureStatus("此浏览器暂不支持实时录音；仍可继续输入文字。", "error");
+        return;
+      }
+    }
     state.gesture = gesture;
     voiceButton.setPointerCapture?.(event.pointerId);
     state.phase = CAPTURE_BROWSER_STATES.REQUESTING_MIC;
@@ -3125,7 +3317,15 @@ function renderCapture() {
     // Permission is requested synchronously from pointerdown's user gesture.
     let mediaPromise;
     try {
-      mediaPromise = navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaPromise = navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+        // Own or release the microphone without waiting for Draft persistence.
+        if (gesture.released || state.disposed || state.gesture !== gesture) {
+          stopTracks(stream);
+        } else {
+          gesture.stream = stream;
+        }
+        return stream;
+      });
     } catch (_) {
       abandonVoiceGesture(gesture, "浏览器无法请求麦克风；仍可继续输入文字。");
       return;
@@ -3136,10 +3336,13 @@ function renderCapture() {
       flushPromise,
     ]);
     if (mediaResult.status !== "fulfilled") {
-      state.gesture = null;
-      state.phase = CAPTURE_BROWSER_STATES.OPEN;
-      setCaptureStatus("没有获得麦克风权限；仍可继续输入文字。", "error");
-      updateCaptureControls();
+      closeGestureAudio(gesture);
+      if (state.gesture === gesture) {
+        state.gesture = null;
+        state.phase = CAPTURE_BROWSER_STATES.OPEN;
+        setCaptureStatus("没有获得麦克风权限；仍可继续输入文字。", "error");
+        updateCaptureControls();
+      }
       return;
     }
     const stream = mediaResult.value;
@@ -3148,15 +3351,17 @@ function renderCapture() {
       gesture.cancelArmed || state.disposed || state.gesture !== gesture
     ) {
       stopTracks(stream);
-      state.gesture = null;
-      state.phase = CAPTURE_BROWSER_STATES.OPEN;
-      if (!state.disposed) {
-        setCaptureStatus(gesture.released ? "已取消录音。" : "草稿未保存，未开始录音。", gesture.released ? "" : "error");
-        updateCaptureControls();
+      closeGestureAudio(gesture);
+      if (state.gesture === gesture) {
+        state.gesture = null;
+        state.phase = CAPTURE_BROWSER_STATES.OPEN;
+        if (!state.disposed) {
+          setCaptureStatus(gesture.released ? "已取消录音。" : "草稿未保存，未开始录音。", gesture.released ? "" : "error");
+          updateCaptureControls();
+        }
       }
       return;
     }
-    gesture.stream = stream;
     let recorder;
     try {
       recorder = new MediaRecorder(stream);
@@ -3168,6 +3373,116 @@ function renderCapture() {
       return;
     }
     gesture.recorder = recorder;
+    gesture.draftId = state.draft.id;
+    if (!state.streamingAvailable) {
+      // Batch-only Voice capability: use the existing batch capture path.
+      recorder.addEventListener("dataavailable", (dataEvent) => {
+        if (dataEvent.data?.size) gesture.chunks.push(dataEvent.data);
+      });
+      recorder.addEventListener("error", () => {
+        gesture.failureMessage = "录音过程发生错误，没有上传不完整音频。";
+        if (recorder.state === "inactive") {
+          abandonVoiceGesture(gesture, gesture.failureMessage);
+        } else {
+          finishRecording(true);
+        }
+      }, { once: true });
+      recorder.addEventListener("stop", async () => {
+        stopTracks(stream);
+        if (gesture.limitTimer) window.clearTimeout(gesture.limitTimer);
+        const shouldDiscard = gesture.discard || state.disposed;
+        const chunks = gesture.chunks;
+        const mediaType = recorder.mimeType || chunks[0]?.type || "application/octet-stream";
+        state.gesture = null;
+        state.phase = CAPTURE_BROWSER_STATES.OPEN;
+        livePreview.hidden = true;
+        if (shouldDiscard) {
+          if (!state.disposed) {
+            setCaptureStatus(
+              gesture.failureMessage || "录音已取消，没有上传。",
+              gesture.failureMessage ? "error" : "success",
+            );
+            updateCaptureControls();
+          }
+          return;
+        }
+        const blob = new Blob(chunks, { type: mediaType });
+        if (!blob.size) {
+          setCaptureStatus("没有录到可上传的音频；请重试。", "error");
+          updateCaptureControls();
+          return;
+        }
+        await uploadRecording(blob, gesture.clientSegmentId);
+      }, { once: true });
+      try {
+        recorder.start();
+      } catch (_) {
+        abandonVoiceGesture(
+          gesture,
+          "浏览器无法启动录音；草稿原文已保留。",
+        );
+        return;
+      }
+      gesture.limitTimer = window.setTimeout(() => {
+        gesture.released = true;
+        finishRecording(false);
+      }, VOICE_MAX_RECORDING_MS);
+      state.phase = CAPTURE_BROWSER_STATES.RECORDING;
+      setCaptureStatus("正在录音；松手完成，上滑后松手取消。");
+      updateCaptureControls();
+      return;
+    }
+    try {
+      const session = await openVoiceStream({
+        csrf: readCookie(CSRF_COOKIE_NAME),
+        client_segment_id: gesture.clientSegmentId,
+        draft_id: state.draft.id,
+        revision: state.draft.revision,
+      }, (message) => {
+        if (state.disposed || state.gesture !== gesture || gesture.discard) return;
+        if (message.type === "preview") {
+          livePreview.hidden = false;
+          livePreview.querySelector("p").textContent = message.text || "正在聆听…";
+        } else if (message.type === "finishing") {
+          setCaptureStatus("正在等待整段最终文字；原始录音会继续安全保存…");
+        } else if (message.type === "failed") {
+          gesture.streamFailed = true;
+          if (gesture.recorder?.state === "recording") finishRecording(false);
+        }
+      }, gesture.setupAbort.signal);
+      gesture.streamSession = session;
+      gesture.sessionId = session.sessionId;
+      if (gesture.released || gesture.streamFailed || state.disposed || state.gesture !== gesture) {
+        session.cancel();
+        abandonVoiceGesture(gesture, "已取消录音。");
+        return;
+      }
+      await gesture.audioContext.audioWorklet.addModule("/static/voice-pcm-worklet.js?v=0.8.1-stream-1");
+      gesture.audioSource = gesture.audioContext.createMediaStreamSource(stream);
+      gesture.audioNode = new AudioWorkletNode(gesture.audioContext, "selfecho-pcm-16k");
+      gesture.audioNode.port.onmessage = (message) => {
+        if (state.gesture !== gesture || gesture.released || gesture.discard ||
+            recorder.state !== "recording" ||
+            session.socket.readyState !== WebSocket.OPEN) return;
+        if (session.socket.bufferedAmount > 128 * 1024) {
+          gesture.streamFailed = true;
+          finishRecording(false);
+          return;
+        }
+        session.socket.send(message.data);
+      };
+      gesture.audioSource.connect(gesture.audioNode);
+      gesture.audioNode.connect(gesture.audioContext.destination);
+      await gesture.audioContext.resume();
+      if (gesture.audioContext.state !== "running") throw new Error("audio context suspended");
+      if (gesture.released || gesture.streamFailed || state.disposed || state.gesture !== gesture) {
+        abandonVoiceGesture(gesture, "已取消录音。");
+        return;
+      }
+    } catch (error) {
+      abandonVoiceGesture(gesture, error.message || "实时转写暂不可用，尚未开始录音；请稍后重试。");
+      return;
+    }
     recorder.addEventListener("dataavailable", (dataEvent) => {
       if (dataEvent.data?.size) gesture.chunks.push(dataEvent.data);
     });
@@ -3185,9 +3500,11 @@ function renderCapture() {
       const shouldDiscard = gesture.discard || state.disposed;
       const chunks = gesture.chunks;
       const mediaType = recorder.mimeType || chunks[0]?.type || "application/octet-stream";
-      state.gesture = null;
-      state.phase = CAPTURE_BROWSER_STATES.OPEN;
+      closeGestureAudio(gesture);
       if (shouldDiscard) {
+        state.gesture = null;
+        state.phase = CAPTURE_BROWSER_STATES.OPEN;
+        livePreview.hidden = true;
         if (!state.disposed) {
           setCaptureStatus(
             gesture.failureMessage || "录音已取消，没有上传。",
@@ -3199,13 +3516,40 @@ function renderCapture() {
       }
       const blob = new Blob(chunks, { type: mediaType });
       if (!blob.size) {
+        gesture.streamSession?.cancel();
+        state.gesture = null;
+        state.phase = CAPTURE_BROWSER_STATES.OPEN;
         setCaptureStatus("没有录到可上传的音频；请重试。", "error");
         updateCaptureControls();
         return;
       }
-      const clientSegmentId = globalThis.crypto?.randomUUID?.() ||
-        `voice-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      await uploadRecording(blob, clientSegmentId);
+      await uploadRecording(blob, gesture.clientSegmentId, {
+        streaming: true, ownerId: gesture.ownerId, draftId: gesture.draftId,
+        sessionId: gesture.sessionId, forceFailed: Boolean(gesture.streamFailed),
+      });
+      if (state.pendingUpload) {
+        gesture.streamSession?.cancel();
+        setCaptureStatus("原始录音尚未得到安全确认，仍保留在本页；请重试上传。", "error");
+      } else {
+        try {
+          await gesture.streamSession.outcome;
+          const refreshed = await refreshDraft();
+          const completed = refreshed?.voice_segments?.find((segment) =>
+            segment.client_segment_id === gesture.clientSegmentId);
+          if (completed?.transcription_status === "succeeded") {
+            setCaptureStatus("转写已加入文本，你可以继续编辑后保存。", "success");
+          } else if (completed?.transcription_status === "transcribed") {
+            setCaptureStatus("转写已安全保存，尚未加入草稿；可以重试加入。", "error");
+          }
+        } catch (_) {
+          await refreshDraft();
+          setCaptureStatus("实时转写未完成；原始录音已保留，可明确重试。", "error");
+        }
+      }
+      state.gesture = null;
+      state.phase = CAPTURE_BROWSER_STATES.OPEN;
+      livePreview.hidden = true;
+      updateCaptureControls();
     }, { once: true });
     try {
       recorder.start();
@@ -3235,7 +3579,9 @@ function renderCapture() {
     } catch (_) {
       // Capture may already have been released by the browser.
     }
-    if (gesture.recorder) finishRecording(gesture.cancelArmed);
+    if (!gesture.recorder || gesture.recorder.state === "inactive") {
+      abandonVoiceGesture(gesture, "已取消录音。");
+    } else finishRecording(gesture.cancelArmed);
   }
 
   textarea.addEventListener("input", () => {
@@ -3280,8 +3626,9 @@ function renderCapture() {
 
   segmentList.addEventListener("click", async (event) => {
     const retry = event.target.closest(".voice-segment-retry");
+    const accept = event.target.closest(".voice-segment-accept");
     const remove = event.target.closest(".voice-segment-delete");
-    const target = retry || remove;
+    const target = retry || accept || remove;
     if (!target) return;
     const segmentId = Number(target.dataset.segmentId);
     target.disabled = true;
@@ -3290,7 +3637,19 @@ function renderCapture() {
       return;
     }
     try {
-      if (retry) {
+      if (accept) {
+        await flushDraft();
+        if (state.dirty || state.revisionConflict || state.savePending) {
+          throw new Error("请先确认本页草稿文字已安全保存");
+        }
+        const acceptedSegment = await api(`/api/voice-segments/${segmentId}/accept`, {
+          method: "POST",
+        });
+        if (acceptedSegment.transcription_status !== "succeeded") {
+          throw new Error("草稿尚未确认接受转写，请刷新后重试");
+        }
+        setCaptureStatus("转写已加入文本，你可以继续编辑后保存。", "success");
+      } else if (retry) {
         const retriedSegment = await api(`/api/voice-segments/${segmentId}/retry`, {
           method: "POST",
         });
@@ -3303,7 +3662,7 @@ function renderCapture() {
         await api(`/api/voice-segments/${segmentId}`, { method: "DELETE" });
         setCaptureStatus("未完成的录音已删除，可以重新录制。", "success");
       }
-      await refreshDraft({ polling: Boolean(retry) });
+      await refreshDraft({ polling: Boolean(retry || accept) });
     } catch (error) {
       setCaptureStatus(`操作未完成：${error.message}`, "error");
       target.disabled = false;
@@ -3316,7 +3675,10 @@ function renderCapture() {
       !state.revisionConflict &&
       state.phase !== CAPTURE_BROWSER_STATES.UPLOADING
     ) {
-      void uploadRecording(state.pendingUpload.blob, state.pendingUpload.clientSegmentId);
+      void uploadRecording(state.pendingUpload.blob, state.pendingUpload.clientSegmentId,
+        { streaming: state.pendingUpload.streaming, ownerId: state.pendingUpload.ownerId,
+          draftId: state.pendingUpload.draftId, sessionId: state.pendingUpload.sessionId,
+          forceFailed: state.pendingUpload.forceFailed });
     }
   });
   pendingUploadActions.querySelector(".pending-upload-delete").addEventListener("click", () => {
@@ -3334,7 +3696,7 @@ function renderCapture() {
   revisionConflictPanel.addEventListener("click", (event) => {
     const keepLocal = event.target.closest(".conflict-keep-local");
     const useServer = event.target.closest(".conflict-use-server");
-    if ((!keepLocal && !useServer) || !state.revisionConflict) return;
+    if ((!keepLocal && !useServer) || !state.revisionConflict || state.discardPending) return;
     const pendingUpload = state.pendingUpload;
     const serverDraft = state.revisionConflict.serverDraft;
     if (useServer) {
@@ -3346,15 +3708,18 @@ function renderCapture() {
     } else {
       state.draft = serverDraft;
       state.dirty = true;
-      writeSafetyBuffer();
     }
     state.revisionConflict = null;
+    if (keepLocal) writeSafetyBuffer();
     state.phase = pendingUpload || state.dirty
       ? CAPTURE_BROWSER_STATES.DIRTY
       : CAPTURE_BROWSER_STATES.OPEN;
     updateCaptureControls();
     if (pendingUpload) {
-      void uploadRecording(pendingUpload.blob, pendingUpload.clientSegmentId);
+      void uploadRecording(pendingUpload.blob, pendingUpload.clientSegmentId,
+        { streaming: pendingUpload.streaming, ownerId: pendingUpload.ownerId,
+          draftId: pendingUpload.draftId, sessionId: pendingUpload.sessionId,
+          forceFailed: pendingUpload.forceFailed });
     } else if (keepLocal) {
       void flushDraft();
     } else {
@@ -3368,7 +3733,6 @@ function renderCapture() {
     if (state.pendingUpload) {
       state.pendingUpload = null;
     }
-    state.revisionConflict = null;
     await runWithCaptureDiscardPending({
       state,
       updateControls: updateCaptureControls,
@@ -3379,6 +3743,7 @@ function renderCapture() {
               method: "DELETE",
             });
           }
+          state.revisionConflict = null;
           state.draft = null;
           state.voiceSegmentStatuses = new Map();
           state.dirty = false;
@@ -3406,7 +3771,7 @@ function renderCapture() {
   };
   const beforeUnloadHandler = (event) => {
     writeSafetyBuffer();
-    if (state.pendingUpload || state.revisionConflict) {
+    if (state.pendingUpload || state.revisionConflict || state.gesture) {
       event.preventDefault();
       event.returnValue = "";
     }
@@ -3426,9 +3791,11 @@ function renderCapture() {
       return true;
     },
     async prepareNavigation() {
-      if (state.pendingUpload || state.revisionConflict) {
+      if (state.pendingUpload || state.revisionConflict || state.gesture) {
         setCaptureStatus(
-          state.pendingUpload
+          state.gesture
+            ? "正在处理当前录音；请等待完成或明确取消。"
+            : state.pendingUpload
             ? "录音尚未安全上传；请先重试上传或明确删除。"
             : "草稿文字冲突尚未解决；请先明确选择文字版本。",
           "error",
@@ -3440,6 +3807,7 @@ function renderCapture() {
     },
     dispose() {
       state.disposed = true;
+      state.gesture?.setupAbort?.abort();
       if (state.autosaveTimer) window.clearTimeout(state.autosaveTimer);
       if (state.statusPollTimer) window.clearTimeout(state.statusPollTimer);
       if (state.completionFeedbackTimer) {
@@ -3447,8 +3815,12 @@ function renderCapture() {
       }
       if (state.gesture?.recorder && state.gesture.recorder.state !== "inactive") {
         state.gesture.discard = true;
+        state.gesture.streamSession?.cancel();
+        closeGestureAudio(state.gesture);
         state.gesture.recorder.stop();
       } else {
+        state.gesture?.streamSession?.cancel();
+        if (state.gesture) closeGestureAudio(state.gesture);
         stopTracks(state.gesture?.stream);
       }
       document.removeEventListener("visibilitychange", visibilityHandler);

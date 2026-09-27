@@ -20,6 +20,8 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from app.auth import InvalidSessionError
+from app.auth_routes import session_cookie_name
 from app.repository import NotFoundError
 from app.schemas import (
     CaptureDraftPublic,
@@ -36,7 +38,11 @@ from app.services.storage_admission import (
     VoiceStorageLease,
 )
 from app.services.voice_deletions import VoiceDeletionLedger
-from app.services.voice_media import content_type_for_container
+from app.services.voice_media import (
+    UnsupportedMediaError,
+    VoiceMediaError,
+    content_type_for_container,
+)
 from app.services.voice_storage import (
     EmptyVoiceUploadError,
     StoredOriginal,
@@ -45,6 +51,8 @@ from app.services.voice_storage import (
     VoiceStorageError,
     VoiceUploadTooLargeError,
 )
+from app.services.voice_transcription import MEDIA_FAILURE_MESSAGES
+from app.voice_contracts import MAX_VOICE_SEGMENT_DURATION_SECONDS
 from app.voice_repository import (
     CaptureDraftRecord,
     DraftBlockedError,
@@ -113,6 +121,7 @@ def create_voice_router(
         return CaptureDraftResponse(
             draft=_public_draft(repository.get_draft(current_user.id)),
             voice_available=_voice_available(request),
+            streaming_voice_available=_streaming_available(request),
         )
 
     @router.put("/capture-draft", response_model=CaptureDraftResponse)
@@ -142,6 +151,7 @@ def create_voice_router(
         return CaptureDraftResponse(
             draft=_public_draft(draft),
             voice_available=_voice_available(request),
+            streaming_voice_available=_streaming_available(request),
         )
 
     @router.post(
@@ -256,6 +266,139 @@ def create_voice_router(
         except (DraftTextLimitError, VoiceSegmentConflictError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _public_segment(segment)
+
+    @router.put(
+        "/capture-draft/streaming-voice-segments/{client_segment_id}",
+        response_model=VoiceSegmentPublic,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def upload_streaming_original(
+        client_segment_id: Annotated[
+            str,
+            PathParameter(min_length=1, max_length=128,
+                          pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"),
+        ],
+        request: Request,
+        revision: int = Query(ge=0),
+        draft_id: int = Query(ge=1),
+        owner_id: int = Query(ge=1),
+        session_id: int = Query(ge=1),
+        force_failed: bool = Query(default=False),
+        current_user: UserPublic = Depends(require_csrf_current_user),
+    ) -> VoiceSegmentPublic:
+        """Save the complete recording independently of provider outcome."""
+        if owner_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Voice attempt owner changed")
+        try:
+            current_session = request.app.state.auth_service.validate_session(
+                request.cookies.get(
+                    session_cookie_name(request.app.state.settings)
+                ),
+                touch=False,
+            )
+        except InvalidSessionError as exc:
+            raise HTTPException(status_code=401, detail="authentication required") from exc
+        if current_session.session.id != session_id:
+            raise HTTPException(status_code=403, detail="Voice attempt session changed")
+        storage, ledger, _runtime = _require_voice_services(request)
+        attempt_key = (
+            current_user.id, session_id, draft_id, revision, client_segment_id,
+        )
+        candidate = request.app.state.voice_stream_attempts.get(current_user.id)
+        matching = bool(
+            candidate and candidate.session_id == session_id
+            and candidate.draft_id == draft_id and candidate.revision == revision
+            and candidate.client_segment_id == client_segment_id
+            and candidate.storage_reservation is not None
+        )
+        if matching and candidate.upload_started and not candidate.upload_completed:
+            raise HTTPException(status_code=409, detail="Voice upload is already in progress")
+        shared_attempt = bool(matching and not candidate.upload_started)
+        reservation = None
+        if shared_attempt:
+            reservation = candidate.storage_reservation.fork()
+            candidate.upload_started = True
+        else:
+            reservation = request.app.state.storage_admission.take_stream_upload(
+                attempt_key
+            )
+        try:
+            saved, lease = await _store_uploaded_original(
+                request, repository, storage, reservation=reservation,
+            )
+        except BaseException:
+            if shared_attempt:
+                candidate.upload_started = False
+            raise
+        if shared_attempt:
+            candidate.upload_completed = True
+        try:
+            attempt = request.app.state.voice_stream_attempts.get(current_user.id)
+            same_attempt = bool(
+                attempt and attempt.active
+                and attempt.client_segment_id == client_segment_id
+                and attempt.session_id == session_id
+                and attempt.draft_id == draft_id
+                and attempt.revision == revision
+            )
+            if force_failed and same_attempt:
+                attempt.active = False
+            active = same_attempt and not force_failed
+            if active and not attempt.stopped:
+                try:
+                    await asyncio.wait_for(attempt.stop_received.wait(), 5)
+                except TimeoutError:
+                    pass
+                active = bool(attempt.active and attempt.stopped)
+            content_type = request.headers.get("content-type")
+            try:
+                result = repository.create_streaming_segment(
+                    user_id=current_user.id,
+                    client_segment_id=client_segment_id,
+                    saved=saved,
+                    client_content_type=content_type[:200] if content_type else None,
+                    expected_revision=revision,
+                    streaming_active=active,
+                    expected_draft_id=draft_id,
+                )
+            except NotFoundError as exc:
+                await _drain_voice_deletions_async(request)
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except (DraftRevisionConflictError, DraftBlockedError,
+                    VoiceSegmentConflictError) as exc:
+                await _drain_voice_deletions_async(request)
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except Exception:
+                await _drain_voice_deletions_async(request)
+                raise
+        finally:
+            if lease is not None:
+                lease.release()
+        if not result.created:
+            await _drain_voice_deletions_async(request)
+            return _public_segment(result.segment)
+        if active and result.segment.transcription_status == "transcribing":
+            attempt.segment_id = result.segment.id
+        elif force_failed and same_attempt:
+            attempt.segment_id = result.segment.id
+        try:
+            metadata = await asyncio.to_thread(
+                request.app.state.voice_transcription_service.media.probe, saved.path,
+            )
+            repository.set_media_metadata(result.segment.id, current_user.id, metadata)
+            if metadata.duration_ms > MAX_VOICE_SEGMENT_DURATION_SECONDS * 1000:
+                raise UnsupportedMediaError("Voice recording exceeds duration limit")
+        except VoiceMediaError as exc:
+            repository.mark_streaming_media_failed(
+                result.segment.id, current_user.id,
+                failure_code=exc.failure_code,
+                failure_message=MEDIA_FAILURE_MESSAGES.get(
+                    exc.failure_code, "录音格式无法确认；原始录音已保留。"
+                ),
+            )
+        if same_attempt and (active or force_failed):
+            attempt.original_saved.set()
+        return repository.get_segment(result.segment.id, current_user.id)
 
     @router.post(
         "/voice-segments/{segment_id}/retry",
@@ -392,28 +535,41 @@ def _voice_available(request: Request) -> bool:
     return request.app.state.voice_runtime is not None
 
 
+def _streaming_available(request: Request) -> bool:
+    return bool(getattr(request.app.state, "voice_streaming_available", False))
+
+
 async def _store_uploaded_original(
     request: Request,
     repository: VoiceCaptureRepository,
     storage: VoiceStorage,
+    *,
+    reservation: VoiceStorageLease | None = None,
 ) -> tuple[StoredOriginal, VoiceStorageLease]:
-    """Admit before the orphan ledger grows, then keep capacity through upload."""
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared = int(content_length)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="invalid Content-Length") from exc
-        if declared < 0:
-            raise HTTPException(status_code=400, detail="invalid Content-Length")
-        if declared > storage.max_upload_bytes:
-            raise HTTPException(status_code=413, detail="Voice upload is too large")
-    try:
-        lease = storage.reserve_original()
-    except StorageAdmissionDenied as exc:
-        raise _voice_storage_admission_response(exc) from exc
+    """Admit before the orphan ledger grows, then keep capacity through upload.
+
+    Once handed a reservation (or after acquiring one), this helper owns its
+    lifetime: on success the lease is returned for the caller to release after
+    segment registration; on any earlier failure it is released exactly once.
+    """
+    lease = reservation
     complete = False
     try:
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared = int(content_length)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="invalid Content-Length") from exc
+            if declared < 0:
+                raise HTTPException(status_code=400, detail="invalid Content-Length")
+            if declared > storage.max_upload_bytes:
+                raise HTTPException(status_code=413, detail="Voice upload is too large")
+        if lease is None:
+            try:
+                lease = storage.reserve_original()
+            except StorageAdmissionDenied as exc:
+                raise _voice_storage_admission_response(exc) from exc
         storage_key = storage.allocate_original_key()
         with repository.database.transaction() as connection:
             VoiceDeletionLedger.record(connection, [storage_key], "orphan_cleanup")

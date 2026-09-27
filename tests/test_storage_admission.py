@@ -396,3 +396,34 @@ def test_direct_settings_cannot_disable_item_size_boundary(tmp_path: Path) -> No
             database_path=tmp_path / "app.db",
             storage_item_extra_max_bytes=0,
         ))
+
+
+def test_stream_upload_handoff_is_bounded_and_expires(tmp_path: Path, monkeypatch) -> None:
+    clock = Clock()
+    admission = guard(tmp_path, concurrent=1, write_limit=20, clock=clock)
+    monkeypatch.setattr(admission, "_filesystem", lambda _path: (1, 10_000_000))
+    key = (1, 2, 3, 4, "client")
+
+    held = admission.reserve_voice()
+    with pytest.raises(StorageAdmissionDenied, match="pressure"):
+        admission.reserve_voice()
+    admission.park_stream_upload(key, held)
+    held.release()
+    # The parked lease keeps the Voice slot reserved for the late upload.
+    with pytest.raises(StorageAdmissionDenied, match="pressure"):
+        admission.reserve_voice()
+    transferred = admission.take_stream_upload(key)
+    assert transferred is not None
+    with transferred:
+        pass
+    with admission.reserve_voice():
+        pass
+
+    orphaned = admission.reserve_voice()
+    admission.park_stream_upload(key, orphaned)
+    orphaned.release()
+    clock.now = 181
+    # An expired handoff releases its slot instead of leaking it.
+    with admission.reserve_voice():
+        pass
+    assert admission.take_stream_upload(key) is None

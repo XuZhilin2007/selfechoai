@@ -71,6 +71,10 @@ from app.services.ai import (
     create_ai_service,
 )
 from app.services.alibaba_asr import AlibabaASRClient
+from app.services.alibaba_streaming_asr import (
+    AlibabaStreamingASRSession,
+    streaming_asr_configured,
+)
 from app.services.email_reminders import EmailReminderService
 from app.services.processing import InputProcessingService
 from app.services.push_security import PushEndpointPolicy
@@ -96,6 +100,7 @@ from app.services.voice_storage import VoiceStorage
 from app.services.voice_transcription import ASRProvider, VoiceTranscriptionService
 from app.voice_repository import DraftTextLimitError, VoiceCaptureRepository
 from app.voice_routes import create_voice_router, drain_voice_deletions
+from app.voice_stream_routes import create_voice_stream_router
 from app.voice_runtime import VoiceRuntime, validate_voice_runtime
 
 
@@ -184,6 +189,7 @@ def create_app(
     email_sender: TencentSesEmailSender | None = None,
     auth_admission_clock: Callable[[], float] | None = None,
     provider_admission_clock: Callable[[], float] | None = None,
+    voice_stream_session_factory=None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
     if settings.storage_item_extra_max_bytes <= 0:
@@ -298,6 +304,25 @@ def create_app(
                 voice_transcription_service
             )
             application.state.voice_runtime = voice_runtime
+            application.state.voice_stream_session_factory = (
+                voice_stream_session_factory or (
+                    lambda: AlibabaStreamingASRSession(
+                        settings.alibaba_asr_api_url,
+                        settings.alibaba_api_key.get_secret_value(),
+                        settings.voice_asr_timeout_seconds,
+                    )
+                )
+            )
+            # Capability routing: a custom session factory implies streaming by
+            # contract; the default adapter requires a workspace endpoint, so a
+            # valid batch-only Voice setup reports streaming as unavailable.
+            application.state.voice_streaming_available = (
+                voice_stream_session_factory is not None
+                or streaming_asr_configured(
+                    settings.alibaba_asr_api_url,
+                    settings.alibaba_api_key.get_secret_value(),
+                )
+            )
             await voice_runtime.start()
         trash_retention_service.voice_deletion_ledger = (
             application.state.voice_deletion_ledger
@@ -365,6 +390,9 @@ def create_app(
     app.state.voice_deletion_ledger = None
     app.state.voice_transcription_service = None
     app.state.voice_runtime = None
+    app.state.voice_stream_session_factory = None
+    app.state.voice_streaming_available = False
+    app.state.voice_stream_attempts = {}
     app.state.processor = processor
     app.state.auth_repository = auth_repository
     app.state.auth_service = auth_service
@@ -423,6 +451,7 @@ def create_app(
             require_csrf_current_user,
         )
     )
+    app.include_router(create_voice_stream_router(voice_repository))
 
     def add_reminder_state(
         items: list[DashboardItem],
