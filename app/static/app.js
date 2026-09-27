@@ -14,6 +14,12 @@ let activeSelectableTouchPress = null;
 // Short-lived record of the selectable item whose touch/pen press just ended,
 // covering user agents that dispatch contextmenu after the pointer stream.
 let recentSelectableTouchPress = null;
+const dashboardPinPendingIds = new Set();
+const dashboardPinFailures = new Map();
+const dashboardPinFocusListeners = new Set();
+let dashboardPinContextGeneration = 0;
+let dashboardPinRouteKey = null;
+let dashboardRenderEpoch = 0;
 
 const dashboardSelection = {
   active: false,
@@ -287,6 +293,11 @@ function readCookie(name) {
 }
 
 function setAuthentication(status, user = authentication.user) {
+  if (
+    status !== AUTH_STATES.AUTHENTICATED ||
+    authentication.status !== AUTH_STATES.AUTHENTICATED ||
+    authentication.user?.id !== user?.id
+  ) resetDashboardPinContext();
   if (status === AUTH_STATES.AUTHENTICATED && authRedirectTimer) {
     window.clearTimeout(authRedirectTimer);
     authRedirectTimer = null;
@@ -300,6 +311,17 @@ function setAuthentication(status, user = authentication.user) {
   } else if (status === AUTH_STATES.UNAUTHENTICATED) {
     resetPushDeviceState(null);
   }
+}
+
+function resetDashboardPinContext() {
+  dashboardPinContextGeneration += 1;
+  dashboardRenderEpoch += 1;
+  dashboardPinPendingIds.clear();
+  dashboardPinFailures.clear();
+  for (const listener of dashboardPinFocusListeners) {
+    document.removeEventListener("focusin", listener);
+  }
+  dashboardPinFocusListeners.clear();
 }
 
 function resetPushDeviceState(userId) {
@@ -608,20 +630,6 @@ async function initializePushForAuthenticatedUser() {
     if (notificationDisableRequested()) {
       return performDisableDeviceNotifications(userId, generation);
     }
-    if (!systemNotificationsSupported()) {
-      updatePushDeviceState(userId, generation, {
-        initialized: true,
-        status: "unsupported",
-      });
-      return pushDeviceState;
-    }
-    if (window.Notification.permission === "denied") {
-      updatePushDeviceState(userId, generation, {
-        initialized: true,
-        status: "denied",
-      });
-      return pushDeviceState;
-    }
     try {
       const config = await api("/api/push/config");
       if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
@@ -629,6 +637,22 @@ async function initializePushForAuthenticatedUser() {
         updatePushDeviceState(userId, generation, {
           initialized: true,
           status: "unavailable",
+          config,
+        });
+        return pushDeviceState;
+      }
+      if (!systemNotificationsSupported()) {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "unsupported",
+          config,
+        });
+        return pushDeviceState;
+      }
+      if (window.Notification.permission === "denied") {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "denied",
           config,
         });
         return pushDeviceState;
@@ -695,20 +719,10 @@ async function enableDeviceNotifications() {
   writePushPreference(notificationDisabledStorageKey(), false);
   return runPushSingleFlight(async () => {
     const generation = pushStateGeneration;
-    if (!systemNotificationsSupported()) {
-      updatePushDeviceState(userId, generation, {
-        initialized: true,
-        status: "unsupported",
-      });
-      return pushDeviceState;
-    }
-    if (window.Notification.permission === "denied") {
-      updatePushDeviceState(userId, generation, {
-        initialized: true,
-        status: "denied",
-      });
-      return pushDeviceState;
-    }
+    // Use the capability established for this page when requesting browser
+    // permission. A network wait here could lose the user's activation.
+    const knownCapability = pushDeviceState.config?.available &&
+      pushDeviceState.config?.vapid_public_key;
     updatePushDeviceState(userId, generation, {
       initialized: false,
       status: "connecting",
@@ -716,7 +730,7 @@ async function enableDeviceNotifications() {
     });
     let connectionStage = "config";
     try {
-      const config = pushDeviceState.config?.available
+      const config = knownCapability
         ? pushDeviceState.config
         : await api("/api/push/config");
       if (!pushContextIsCurrent(userId, generation)) return pushDeviceState;
@@ -725,6 +739,39 @@ async function enableDeviceNotifications() {
           initialized: true,
           status: "unavailable",
           config,
+        });
+        return pushDeviceState;
+      }
+      if (!systemNotificationsSupported()) {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "unsupported",
+          config,
+          lastErrorCode: null,
+        });
+        return pushDeviceState;
+      }
+      if (window.Notification.permission === "denied") {
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "denied",
+          config,
+          lastErrorCode: null,
+        });
+        return pushDeviceState;
+      }
+      if (
+        window.Notification.permission === "default" &&
+        !knownCapability
+      ) {
+        // Server capability is confirmed but was not established when this
+        // activation started; do not request browser permission from a stale
+        // gesture. The next explicit enable click will request it.
+        updatePushDeviceState(userId, generation, {
+          initialized: true,
+          status: "not_enabled",
+          config,
+          lastErrorCode: null,
         });
         return pushDeviceState;
       }
@@ -1297,6 +1344,12 @@ function selectAllVisibleDashboardItems() {
   dashboardSelection.ids = new Set(dashboardSelection.visibleIds);
 }
 
+function currentDashboardPinRouteKey() {
+  return window.location.pathname === "/dashboard"
+    ? `${selectedDashboardStatus()}:${selectedDashboardPage()}`
+    : null;
+}
+
 function createDashboardFocusIntent(kind, itemId = null) {
   return {
     kind,
@@ -1319,6 +1372,8 @@ function restoreDashboardFocus(intent) {
     target = document.querySelector(
       `[data-selectable-item][data-item-id="${intent.itemId}"]`,
     );
+  } else if (intent.kind === "pin" && Number.isSafeInteger(intent.itemId)) {
+    target = document.querySelector(`[data-dashboard-pin][data-item-id="${intent.itemId}"]`);
   } else if (intent.kind === "first_item") {
     target = document.querySelector("[data-selectable-item]");
   } else if (intent.kind === "select_all") {
@@ -1364,13 +1419,86 @@ function itemCard(item) {
   if (item.estimated_time) metadata.push(`约 ${item.estimated_time} 分钟`);
   const reminderText = reminderCardText(item.reminder);
   if (reminderText) metadata.push(reminderText);
-  return `
+  const pinButton = dashboardSelection.active ? "" : `
+      <button class="dashboard-pin-button" type="button" data-dashboard-pin data-item-id="${item.id}"
+        aria-label="${item.is_pinned ? "取消置顶" : "置顶"}：${escapeHtml(item.title)}" aria-pressed="${Boolean(item.is_pinned)}" ${dashboardPinPendingIds.has(item.id) ? "disabled" : ""}>
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M8 3h8l-1 6 3 3v2H6v-2l3-3-1-6ZM12 14v7" />
+        </svg>
+      </button>`;
+  const card = `
     <a class="item-card selectable-item ${dashboardSelection.ids.has(item.id) ? "selected" : ""}" href="/items/${item.id}" data-link ${selectableItemAttributes(item.id)}>
       ${selectionIndicator(item.id)}
       <h3>${escapeHtml(item.title)}</h3>
       ${signals.length ? `<div class="card-signals">${signals.join("")}</div>` : ""}
       ${metadata.length ? `<div class="card-meta">${metadata.map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
     </a>`;
+  return dashboardSelection.active ? card : `<div class="item-card-row">${card}${pinButton}</div>`;
+}
+
+function renderDashboardPinStatus() {
+  if (selectedDashboardStatus() !== "active") return;
+  const status = document.querySelector("#dashboard-action-status");
+  if (!status) return;
+  status.dataset.kind = dashboardPinFailures.size ? "error" : "";
+  status.textContent = dashboardPinFailures.size
+    ? [...dashboardPinFailures.values()].join(" ")
+    : dashboardPinPendingIds.size ? "正在保存置顶设置…" : "";
+}
+
+function bindDashboardPinShortcuts() {
+  document.querySelectorAll("[data-dashboard-pin]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const itemId = Number(button.dataset.itemId);
+      if (dashboardSelection.active || dashboardPinPendingIds.has(itemId)) return;
+      const contextGeneration = dashboardPinContextGeneration;
+      const currentInteractionContext = () => contextGeneration === dashboardPinContextGeneration;
+      const hadFocus = document.activeElement === button;
+      let restoreFocus = hadFocus;
+      const onFocusIn = (event) => {
+        if (event.target !== button) restoreFocus = false;
+      };
+      if (hadFocus) {
+        document.addEventListener("focusin", onFocusIn);
+        dashboardPinFocusListeners.add(onFocusIn);
+      }
+      const focusIntent = createDashboardFocusIntent("pin", itemId);
+      const itemLabel = button.getAttribute("aria-label") || "该事项";
+      dashboardPinPendingIds.add(itemId);
+      button.disabled = true;
+      renderDashboardPinStatus();
+      try {
+        await api(`/api/items/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ is_pinned: button.getAttribute("aria-pressed") !== "true" }),
+        });
+        if (currentInteractionContext()) {
+          dashboardPinFailures.delete(itemId);
+          await renderDashboard({ silent: true });
+        }
+      } catch (error) {
+        if (currentInteractionContext()) {
+          dashboardPinFailures.set(itemId, `未能确认置顶设置（${itemLabel}），请重试：${error.message}`);
+        }
+      } finally {
+        if (hadFocus) {
+          document.removeEventListener("focusin", onFocusIn);
+          dashboardPinFocusListeners.delete(onFocusIn);
+        }
+        if (currentInteractionContext()) {
+          dashboardPinPendingIds.delete(itemId);
+          const currentButton = document.querySelector(`[data-dashboard-pin][data-item-id="${itemId}"]`);
+          if (currentButton) currentButton.disabled = false;
+          renderDashboardPinStatus();
+          const active = document.activeElement;
+          if (
+            restoreFocus && !dashboardSelection.active &&
+            (active === document.body || active === button || !active?.isConnected)
+          ) restoreDashboardFocus(focusIntent);
+        }
+      }
+    });
+  });
 }
 
 function historyCompletionText(completedAt) {
@@ -1888,10 +2016,11 @@ function renderLogin() {
           <p id="login-status" class="status-message" role="alert"></p>
           <button class="primary-button auth-submit" type="submit">登录</button>
         </form>
-        <p class="auth-switch">收到邀请码？<a href="/register" data-link>注册账号</a></p>
+        <p class="auth-switch" data-auth-switch>收到邀请码？<a href="/register" data-link>注册账号</a></p>
       </div>
     </section>`;
 
+  void hydrateRegistrationMode();
   const form = document.querySelector("#login-form");
   const status = document.querySelector("#login-status");
   const submitButton = form.querySelector("button[type='submit']");
@@ -1922,6 +2051,9 @@ function renderLogin() {
 
 function loginErrorMessage(error) {
   if (error instanceof NetworkError) return error.message;
+  if (error instanceof ApiError && error.status === 429) {
+    return "登录尝试过于频繁，请稍后再试。";
+  }
   if (error instanceof ApiError && error.status === 401) {
     return "邮箱或密码不正确，或账号当前不可用。";
   }
@@ -1941,15 +2073,15 @@ function renderRegister() {
     <section class="auth-layout">
       <div class="auth-heading">
         ${publicAuthIdentityMarkup()}
-        <p class="eyebrow">受邀注册</p>
+        <p class="eyebrow" data-register-eyebrow>注册账号</p>
         <h1>创建账号。</h1>
         <p class="subtitle">每个账号都有独立的数据空间。</p>
       </div>
-      <div class="panel auth-panel">
+      <div class="panel auth-panel" data-register-panel>
         <form id="register-form" class="auth-form">
-          <div class="field-group">
+          <div class="field-group" data-registration-invite>
             <label for="register-invite">邀请码</label>
-            <input id="register-invite" name="invite_code" type="password" autocomplete="off" maxlength="256" required autofocus />
+            <input id="register-invite" name="invite_code" type="password" autocomplete="off" maxlength="256" />
           </div>
           <div class="field-group">
             <label for="register-email">邮箱</label>
@@ -1984,16 +2116,18 @@ function renderRegister() {
     status.dataset.kind = "";
     status.textContent = "正在创建账号…";
     const formData = new FormData(form);
+    const payload = {
+      email: formData.get("email"),
+      password: formData.get("password"),
+      display_name: formData.get("display_name"),
+      timezone: formData.get("timezone"),
+    };
+    const inviteField = form.querySelector("[data-registration-invite] input");
+    if (inviteField) payload.invite_code = formData.get("invite_code");
     try {
       const user = await api("/api/auth/register", {
         method: "POST",
-        body: JSON.stringify({
-          invite_code: formData.get("invite_code"),
-          email: formData.get("email"),
-          password: formData.get("password"),
-          display_name: formData.get("display_name"),
-          timezone: formData.get("timezone"),
-        }),
+        body: JSON.stringify(payload),
       });
       setAuthentication(AUTH_STATES.AUTHENTICATED, user);
       history.replaceState({}, "", "/");
@@ -2004,10 +2138,67 @@ function renderRegister() {
       submitButton.disabled = false;
     }
   });
+
+  void hydrateRegistrationMode();
+}
+
+async function hydrateRegistrationMode() {
+  let mode = null;
+  try {
+    const config = await api("/api/auth/config");
+    mode = config.registration_mode;
+  } catch (_) {
+    return;
+  }
+  if (
+    (window.location.pathname !== "/register" &&
+      window.location.pathname !== "/login") ||
+    !["closed", "invite", "open"].includes(mode)
+  ) return;
+  if (mode === "invite") {
+    if (window.location.pathname === "/register") {
+      const eyebrow = document.querySelector("[data-register-eyebrow]");
+      if (eyebrow) eyebrow.textContent = "受邀注册";
+    }
+    return;
+  }
+
+  if (window.location.pathname === "/login") {
+    const loginSwitch = document.querySelector("[data-auth-switch]");
+    if (!loginSwitch) return;
+    if (mode === "closed") {
+      loginSwitch.hidden = true;
+    } else {
+      loginSwitch.querySelector("a").textContent = "注册账号";
+      loginSwitch.childNodes[0].textContent = "没有账号？";
+    }
+    return;
+  }
+
+  const inviteGroup = document.querySelector("[data-registration-invite]");
+  const eyebrow = document.querySelector("[data-register-eyebrow]");
+  const panel = document.querySelector("[data-register-panel]");
+  if (mode === "open") {
+    inviteGroup?.remove();
+    if (eyebrow) eyebrow.textContent = "注册账号";
+    return;
+  }
+  if (mode === "closed") {
+    if (eyebrow) eyebrow.textContent = "注册账号";
+    inviteGroup?.remove();
+    if (panel) {
+      panel.innerHTML = `
+        <p class="status-message" data-kind="error">注册当前未开放。</p>
+        <p class="auth-switch">已有账号？<a href="/login" data-link>返回登录</a></p>`;
+    }
+  }
 }
 
 function registrationErrorMessage(error) {
   if (error instanceof NetworkError) return error.message;
+  if (error instanceof ApiError && error.status === 429) {
+    return "注册尝试过于频繁，请稍后再试。";
+  }
   if (error instanceof ApiError && error.status === 403) {
     return "邀请码无效，或注册当前未开放。";
   }
@@ -4049,6 +4240,9 @@ function markRenderedRemindersSurfaced(reminders) {
 }
 
 async function renderDashboard({ silent = false, focusIntent = null } = {}) {
+  if (dashboardPinRouteKey === null) dashboardPinRouteKey = currentDashboardPinRouteKey();
+  const renderEpoch = ++dashboardRenderEpoch;
+  const contextGeneration = dashboardPinContextGeneration;
   if (!silent) {
     appElement.innerHTML = '<p class="loading">正在读取事项…</p>';
   }
@@ -4062,6 +4256,8 @@ async function renderDashboard({ silent = false, focusIntent = null } = {}) {
       `/api/items?status=${encodeURIComponent(selectedStatus)}&page=${requestedPage}`,
     );
     if (
+      renderEpoch !== dashboardRenderEpoch ||
+      contextGeneration !== dashboardPinContextGeneration ||
       selectionGeneration !== dashboardSelection.generation ||
       window.location.pathname !== "/dashboard" ||
       selectedDashboardStatus() !== selectedStatus ||
@@ -4177,6 +4373,8 @@ async function renderDashboard({ silent = false, focusIntent = null } = {}) {
     renderNotificationOnboarding();
     bindDashboardSelectionControls(selectedStatus);
     bindDashboardLongPressRows(selectedStatus);
+    if (selectedStatus === "active") bindDashboardPinShortcuts();
+    renderDashboardPinStatus();
 
     if (selectedStatus === "active") {
       markRenderedRemindersSurfaced(data.due_reminders);
@@ -4219,7 +4417,13 @@ async function renderDashboard({ silent = false, focusIntent = null } = {}) {
       pollTimer = window.setTimeout(() => renderDashboard({ silent: true }), 2500);
     }
   } catch (error) {
-    appElement.innerHTML = `<div class="empty-state section">无法读取事项：${escapeHtml(error.message)}</div>`;
+    if (
+      renderEpoch === dashboardRenderEpoch &&
+      contextGeneration === dashboardPinContextGeneration &&
+      window.location.pathname === "/dashboard"
+    ) {
+      appElement.innerHTML = `<div class="empty-state section">无法读取事项：${escapeHtml(error.message)}</div>`;
+    }
   }
 }
 
@@ -4828,6 +5032,11 @@ async function renderDetail(
 }
 
 function renderRoute() {
+  const nextPinRouteKey = currentDashboardPinRouteKey();
+  if (nextPinRouteKey !== dashboardPinRouteKey) {
+    dashboardPinRouteKey = nextPinRouteKey;
+    resetDashboardPinContext();
+  }
   resetDashboardSelection();
   if (activeCaptureController) {
     const previousCaptureController = activeCaptureController;

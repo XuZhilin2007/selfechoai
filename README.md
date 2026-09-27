@@ -35,7 +35,7 @@ Scattered thoughts often appear earlier than conventional tasks, and they carry 
 - Capture/Voice correctness fixes for concurrent discard actions and truthful failed-segment feedback
 - Mobile-first Web/PWA interface with versioned static assets and a coherent Service Worker cache revision
 - Login, logout, server-side sessions, and CSRF protection
-- Registration closed by default, with optional invite registration
+- Registration closed by default, with optional invite or open registration
 - Multi-user data ownership isolation
 - SQLite schema v9, with required explicit migrations for existing databases (v7→v8 pin migration, v8→v9 Voice Segment state migration)
 
@@ -232,6 +232,9 @@ Bootstrap will:
 The bootstrap command does not print passwords, password hashes, session tokens, or CSRF tokens.
 
 ## Invite Registration
+
+`AUTH_REGISTRATION_MODE` supports `closed` (default), `invite`, and `open`. `open` removes the invite-code requirement for new registrations and signs them in directly; enable it only when the instance is intended for self-serve sign-ups. Authentication admission limits apply in every mode, and first-user bootstrap is unaffected.
+
 
 Invite registration is only for optional multi-user scenarios after the first user has been created. The project ships no default invite code.
 

@@ -35,7 +35,7 @@ SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Person
 - Capture/Voice 正确性修复：覆盖并发 discard 操作与如实的失败片段提示
 - 移动端优先的 Web/PWA 界面，带版本化静态资源与一致的 Service Worker cache revision
 - Login、Logout、服务端 Session 与 CSRF 防护
-- 默认关闭注册和可选 Invite registration
+- 默认关闭注册，可选 Invite 或 open registration
 - Multi-user 数据所有权隔离
 - SQLite schema v9；已有数据库必须显式执行迁移（v7→v8 Pin 迁移、v8→v9 Voice Segment 状态迁移）
 
@@ -232,6 +232,9 @@ Bootstrap 会：
 Bootstrap 命令不会在终端输出 password、password hash、Session token 或 CSRF token。
 
 ## Invite Registration
+
+`AUTH_REGISTRATION_MODE` 支持 `closed`（默认）、`invite` 与 `open`。`open` 取消新注册的邀请码要求并直接进入登录态；仅当实例面向自助注册时开启。每种模式都受认证 admission 限制，首用户 bootstrap 不受影响。
+
 
 Invite registration 只用于 first user 创建完成后的可选多用户场景。项目不提供默认邀请码。
 

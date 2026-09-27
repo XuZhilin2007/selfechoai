@@ -385,8 +385,8 @@ class Settings:
         api_key = read("AI_API_KEY") or read("OPENAI_API_KEY")
         database_value = read("APP_DATABASE_PATH").strip()
         registration_mode = read("AUTH_REGISTRATION_MODE", "closed").strip().lower()
-        if registration_mode not in {"closed", "invite"}:
-            raise ValueError("AUTH_REGISTRATION_MODE must be closed or invite")
+        if registration_mode not in {"closed", "invite", "open"}:
+            raise ValueError("AUTH_REGISTRATION_MODE must be closed, invite, or open")
         app_origin = read("APP_ORIGIN", "http://127.0.0.1:8000").strip().rstrip("/")
         if not app_origin:
             raise ValueError("APP_ORIGIN must not be empty")

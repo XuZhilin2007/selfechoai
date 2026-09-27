@@ -233,7 +233,13 @@ class UserCreationRequest(StrictModel):
 
 
 class RegisterRequest(UserCreationRequest):
-    invite_code: SecretStr = Field(min_length=1, max_length=256)
+    # Required in invite mode; ignored in open mode. Optional so open-mode
+    # clients can omit it entirely.
+    invite_code: SecretStr = Field(default=SecretStr(""), max_length=256)
+
+
+class RegistrationConfigPublic(StrictModel):
+    registration_mode: str
 
 
 class LoginRequest(StrictModel):

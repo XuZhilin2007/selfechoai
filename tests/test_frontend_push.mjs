@@ -292,10 +292,14 @@ for (const unsupported of [
     harness.context.__setAuthentication("authenticated", user(1));
     await harness.context.__waitForPush();
 
+    // Capability-aware flow: the server capability is established first, then
+    // the browser check degrades to "unsupported" with that config attached.
+    // Browser permission is never requested and nothing is subscribed.
     assert.equal(harness.context.__getPushState().status, "unsupported");
-    assert.equal(harness.calls.config, 0);
+    assert.equal(harness.calls.config, 1);
     assert.equal(harness.calls.permission, 0);
     assert.equal(harness.calls.subscribe, 0);
+    assert.equal(harness.context.__getPushState().config?.available, true);
   });
 }
 

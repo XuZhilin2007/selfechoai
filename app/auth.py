@@ -143,8 +143,8 @@ class AuthenticationService:
         invite_code_hash: str,
         session_expiration_seconds: int,
     ) -> None:
-        if registration_mode not in {"closed", "invite"}:
-            raise ValueError("registration_mode must be closed or invite")
+        if registration_mode not in {"closed", "invite", "open"}:
+            raise ValueError("registration_mode must be closed, invite, or open")
         if session_expiration_seconds <= 0:
             raise ValueError("session_expiration_seconds must be positive")
         normalized_invite_hash = invite_code_hash.strip().lower()
@@ -170,7 +170,7 @@ class AuthenticationService:
         timezone_name: str,
         user_agent: str | None = None,
     ) -> AuthenticationResult:
-        self._validate_invite_code(invite_code)
+        self._validate_registration(invite_code)
         normalized_email = normalize_email(email)
         if self.repository.get_user_by_email(normalized_email) is not None:
             raise DuplicateEmailError("email is already registered")
@@ -246,9 +246,11 @@ class AuthenticationService:
         ):
             raise InvalidCsrfTokenError("CSRF token is not valid")
 
-    def _validate_invite_code(self, invite_code: str) -> None:
-        if self.registration_mode != "invite":
+    def _validate_registration(self, invite_code: str) -> None:
+        if self.registration_mode == "closed":
             raise RegistrationClosedError("registration is closed")
+        if self.registration_mode == "open":
+            return
         if not invite_code or not secrets.compare_digest(
             hash_invite_code(invite_code), self.invite_code_hash
         ):

@@ -1045,6 +1045,64 @@ button[aria-busy="true"] {
   border-top: 1px solid var(--line-soft);
 }
 
+.item-card-row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.item-card-row > .item-card {
+  flex: 1;
+  min-width: 0;
+  border-bottom: 0;
+}
+
+.dashboard-pin-button {
+  display: grid;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  margin: 4px 0 0 4px;
+  padding: 12px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.dashboard-pin-button:hover,
+.dashboard-pin-button:focus-visible {
+  background: var(--surface-subtle);
+  color: var(--accent-deep);
+}
+
+.dashboard-pin-button[aria-pressed="true"] {
+  color: var(--accent-deep);
+}
+
+.dashboard-pin-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.dashboard-pin-button svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.dashboard-pin-button[aria-pressed="true"] svg path {
+  fill: currentColor;
+  fill-opacity: 0.16;
+}
+
 .item-card {
   display: block;
   padding: 16px 4px;

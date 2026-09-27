@@ -18,7 +18,12 @@ from app.auth import (
 )
 from app.auth_admission import AdmissionDenied, AuthAdmissionLimiter, client_source
 from app.config import Settings
-from app.schemas import LoginRequest, RegisterRequest, UserPublic
+from app.schemas import (
+    LoginRequest,
+    RegistrationConfigPublic,
+    RegisterRequest,
+    UserPublic,
+)
 from app.services.storage_admission import StorageAdmissionDenied
 
 
@@ -33,6 +38,11 @@ def create_auth_router(
     admission: AuthAdmissionLimiter,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/auth", tags=["authentication"])
+
+    @router.get("/config", response_model=RegistrationConfigPublic)
+    def registration_config() -> RegistrationConfigPublic:
+        """Unauthenticated capability surface: the real registration mode."""
+        return RegistrationConfigPublic(registration_mode=settings.registration_mode)
 
     @router.post(
         "/register",
