@@ -4,11 +4,13 @@
 
 SelfEcho AI 用于快速捕获想法，由 AI 帮助整理为结构化的 Personal Items，同时保留原始输入和用户的最终决策权。AI 负责提取与组织信息，不替用户决定重要性、计划或行动。
 
-**Status:** Community Edition 0.8.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.8.1 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
 本公开仓库 [github.com/XuZhilin2007/selfechoai](https://github.com/XuZhilin2007/selfechoai) 提供可自托管的 Community Edition。[selfechoai.com](https://selfechoai.com) 是独立运营的 Hosted Service。两者共享产品方向，但公开仓库不包含托管服务的生产数据库、密钥、服务器配置、部署 Runbook 或私有 Git 历史。
+
+v0.8.1 是当前计划中最后一次 Private → Public 的 product selective sync。此后本仓库作为独立的 self-hosted Community / Showcase snapshot 存在：不承诺与 Hosted Service 的 feature / version parity，未来的 Hosted 功能也不自动同步。security fixes、严重 correctness fixes、必要的 compatibility / dependency maintenance 与 Community-specific 文档仍受欢迎。Hosted Service 独立运营、不会停留在 v0.8.1；两者不共享 implementation、deployment 或 schema history。
 
 ## Why SelfEcho
 
@@ -427,7 +429,7 @@ FastAPI + Uvicorn
 
 核心产品原则是：原始输入不能丢失；未知信息保持未知；AI 只整理信息，用户始终是最终决策者。
 
-更完整的组件、数据流、认证、多用户隔离、Reminder channel/worker、PWA Cache 和 Provider 边界说明见 [Architecture](docs/ARCHITECTURE.md)，稳定产品边界见 [Product Principles](docs/PRODUCT_PRINCIPLES.md)，界面基础见 [UI/UX Foundation](docs/UI_UX_FOUNDATION.md)。当前版本说明见 [Community Edition v0.8.0 Release Notes](docs/RELEASE_NOTES_v0.8.0.md)；更早的 Release Notes 保留为历史记录。
+更完整的组件、数据流、认证、多用户隔离、Reminder channel/worker、PWA Cache 和 Provider 边界说明见 [Architecture](docs/ARCHITECTURE.md)，稳定产品边界见 [Product Principles](docs/PRODUCT_PRINCIPLES.md)，界面基础见 [UI/UX Foundation](docs/UI_UX_FOUNDATION.md)。当前版本说明见 [Community Edition v0.8.1 Release Notes](docs/RELEASE_NOTES_v0.8.1.md)；更早的 Release Notes 保留为历史记录。
 
 ## Security and Contributing
 

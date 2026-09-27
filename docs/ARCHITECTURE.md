@@ -1,6 +1,6 @@
 # SelfEcho AI Architecture
 
-本文描述 Community Edition v0.8.0 的当前实现，不代表托管服务的基础设施设计。
+本文描述 Community Edition v0.8.1 的当前实现，不代表托管服务的基础设施设计。
 
 ## System Overview
 
@@ -234,7 +234,7 @@ Voice Original Audio 存储在 `VOICE_STORAGE_ROOT` 指定的外部目录，不�
 
 ## PWA and Caching
 
-FastAPI 同源提供 API、静态资源和单页应用入口。静态资源通过 `?v=0.8.0-community-ui-1` 版本化引用；Service Worker 使用 `selfecho-ai-community-v0.8.0-ui-1` cache namespace（opaque cache revision，不是产品版本号），只缓存 App Shell：HTML、版本化 CSS 与 JavaScript、Manifest 和图标；以 /api/ 开头或非 GET 的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
+FastAPI 同源提供 API、静态资源和单页应用入口。静态资源通过 `?v=0.8.1-stream-1` 版本化引用；Service Worker 使用 `selfecho-ai-community-v0.8.1-stream-1` cache namespace（opaque cache revision，不是产品版本号），只缓存 App Shell：HTML、版本化 CSS 与 JavaScript、Manifest 和图标；以 /api/ 开头或非 GET 的请求明确绕过 Service Worker Cache。导航离线时只能回退到已缓存 Shell，并不表示业务数据支持离线同步。
 
 登录用户的 Capture 草稿临时保存在 sessionStorage，并按用户区分。认证状态和私有事项不写入 Service Worker Cache。Service Worker 文件自身以 no-cache 响应，便于更新缓存版本。
 

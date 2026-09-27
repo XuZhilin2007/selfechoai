@@ -4,11 +4,13 @@
 
 SelfEcho AI helps you capture ideas quickly and uses AI to organize them into structured Personal Items, while always preserving the original input and leaving every final decision to you. AI extracts and organizes information; it does not decide what matters, what to plan, or what to do next.
 
-**Status:** Community Edition 0.8.0 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
+**Status:** Community Edition 0.8.1 · Python 3.11+ · FastAPI · Web/PWA · Apache-2.0
 
 ## Community Edition
 
 This public repository, [github.com/XuZhilin2007/selfechoai](https://github.com/XuZhilin2007/selfechoai), provides a self-hostable Community Edition. [selfechoai.com](https://selfechoai.com) is an independently operated Hosted Service. The two share the same product direction, but the public repository does not contain the hosted service's production database, credentials, server configuration, deployment runbooks, or private Git history.
+
+v0.8.1 is the last planned Private → Public product sync. The repository continues as an independent self-hosted Community / Showcase snapshot: it does not promise feature or version parity with the Hosted Service, and future Hosted features are not automatically synced. Security fixes, severe correctness fixes, necessary compatibility or dependency maintenance, and Community-specific documentation remain welcome. The Hosted Service is operated independently and does not freeze at v0.8.1; the two do not share implementation, deployment, or schema history.
 
 ## Why SelfEcho
 
@@ -427,7 +429,7 @@ FastAPI + Uvicorn
 
 The core product principles: original input must never be lost; unknown information stays unknown; AI only organizes information, and the user is always the final decision maker.
 
-For full component, data-flow, authentication, multi-user isolation, Reminder channel/worker, PWA cache, and provider boundary details, see [Architecture](docs/ARCHITECTURE.md). Stable product boundaries are described in [Product Principles](docs/PRODUCT_PRINCIPLES.md), and the interface foundation is described in [UI/UX Foundation](docs/UI_UX_FOUNDATION.md). Current release notes are in [Community Edition v0.8.0 Release Notes](docs/RELEASE_NOTES_v0.8.0.md); earlier release notes remain as historical records.
+For full component, data-flow, authentication, multi-user isolation, Reminder channel/worker, PWA cache, and provider boundary details, see [Architecture](docs/ARCHITECTURE.md). Stable product boundaries are described in [Product Principles](docs/PRODUCT_PRINCIPLES.md), and the interface foundation is described in [UI/UX Foundation](docs/UI_UX_FOUNDATION.md). Current release notes are in [Community Edition v0.8.1 Release Notes](docs/RELEASE_NOTES_v0.8.1.md); earlier release notes remain as historical records.
 
 ## Security and Contributing
 

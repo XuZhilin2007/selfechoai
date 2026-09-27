@@ -32,7 +32,7 @@ Community Edition 提供应用代码和本地运行默认值，不提供托管�
 
 ## Web Push Security（Community self-hosting）
 
-Community v0.8.0 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+Community v0.8.1 的 Web Push 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
 
 ### VAPID
 
@@ -68,15 +68,15 @@ Push 订阅保存于自托管实例的 SQLite，包含 endpoint、p256dh 和 aut
 
 ### Deployment
 
-Community v0.8.0 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
+Community v0.8.1 正式支持单应用实例与嵌入式 worker 的部署拓扑。在不受信任的多用户自托管场景中，管理员应额外考虑 host/container/network 层面的隔离与出站策略。
 
 ## Email Reminder Security（Community self-hosting）
 
-Community v0.8.0 的 Email Reminder 是可选功能，默认通过 `EMAIL_REMINDER_PROVIDER_ENABLED=false` 关闭。关闭时不解析 Email 专用配置、不创建 Tencent client，也不需要 Tencent credentials、sender、template、verification pepper 或 Tencent network access。
+Community v0.8.1 的 Email Reminder 是可选功能，默认通过 `EMAIL_REMINDER_PROVIDER_ENABLED=false` 关闭。关闭时不解析 Email 专用配置、不创建 Tencent client，也不需要 Tencent credentials、sender、template、verification pepper 或 Tencent network access。
 
 ### Tencent SES credentials and templates
 
-- v0.8.0 只正式支持 Tencent SES。Secret ID/Key 与 `EMAIL_VERIFICATION_CODE_PEPPER` 都是秘密，只能保存在未跟踪的本地 `.env`，不得写入模板、日志、截图或 Git。
+- v0.8.1 只正式支持 Tencent SES。Secret ID/Key 与 `EMAIL_VERIFICATION_CODE_PEPPER` 都是秘密，只能保存在未跟踪的本地 `.env`，不得写入模板、日志、截图或 Git。
 - Sender identity 和所有 template 均由 self-host operator 自行创建与验证，不应复用或依赖 Hosted Service 的 sender、template ID 或 domain。
 - 主动启用 Provider 后，必需配置缺失或 region/timeout 无效会 fail closed。Test Email template 可选；缺失时普通 Reminder 仍可工作，但 Test Email 不可用。
 
@@ -91,11 +91,12 @@ Community v0.8.0 的 Email Reminder 是可选功能，默认通过 `EMAIL_REMIND
 
 ## Voice Capture Security（Community self-hosting）
 
-Community v0.8.0 的 Voice Capture 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
+Community v0.8.1 的 Voice Capture 是可选功能，默认关闭。启用它意味着部署者接受以下安全责任与边界。
 
 ### ASR Provider boundary
 
 - 启用 Voice 后，浏览器录音经自托管实例发送到所配置的 Alibaba DashScope ASR 端点用于转写。Voice 不是完全本地的功能：Alibaba 会接收转写所需的录音音频。
+- Streaming（实时流式）转写启用后，录音期间的音频会实时发送到所配置的流式端点；Cancel 停止继续发送，但不能撤回已经发送的数据。对流式转写有效的端点要求比 batch 更严格（workspace 专用 HTTPS 端点），配置不满足时应用明确报告 streaming 不可用，batch 转写不受影响。
 - ALIBABA_API_KEY 是秘密凭据：只保存在未跟踪的本地 `.env` 中，绝不提交到 Git，也不写入示例、日志或截图。
 - 配置加载与运行时要求 ASR 端点为 HTTPS 且不含用户凭据信息；转写文本（transcript）与 Original Audio 一样属于敏感用户数据。
 
