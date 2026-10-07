@@ -225,7 +225,7 @@ python -m app.bootstrap
 Bootstrap will:
 
 - use the SQLite database configured via `APP_DATABASE_PATH` in `.env`;
-- initialize the current schema (v8) when the database does not exist yet;
+- initialize the current schema (v9) when the database does not exist yet;
 - create one regular user only when the user count is 0;
 - read and confirm the password through `getpass`;
 - apply the same user constraints and Argon2id password hashing as the application;
@@ -404,7 +404,7 @@ Tests cover Capture, raw input persistence, simulated DeepSeek/OpenAI responses,
 
 - No password reset
 - No recurring reminders, planner, or calendar integration
-- No built-in rate limiting
+- Admission and limiting are bounded and process-local; there is no shared global rate-limiting system across application instances or at the reverse-proxy layer
 - No formal admin console or role system
 - Tencent SES is the only formally supported Email provider; the Test Email action is unavailable without its optional dedicated template
 - Provider acceptance is not guaranteed recipient delivery; ambiguous Email submission results remain `unknown` and status reconciliation is bounded

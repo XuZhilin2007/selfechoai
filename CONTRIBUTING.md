@@ -14,7 +14,8 @@
 ## Local Setup
 
 ~~~bash
-python -m venv .venv
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -e ".[dev]"
 cp .env.example .env
 python -m app.bootstrap

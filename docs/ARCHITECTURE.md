@@ -227,7 +227,7 @@ Email delivery 真正出站前会两次按当前数据重新检查 destination �
 - schema v6 在 v5 基础上新增 `email_reminder_settings`（账户 Email 设置）、`email_verification_challenges`（验证 challenge 与 HMAC）和 `reminder_email_deliveries`（包含 destination snapshot 与 Provider 状态的 durable ledger）。
 - app/migrations/v006_email_reminders.py 提供显式 v5→v6 迁移：`python -m app.migrations.v006_email_reminders --database data/selfecho.db --check-only` 做只读预检；正式迁移去掉 `--check-only`，要求应用已停止、存在经过验证且可恢复的备份，并输入精确文字 `MIGRATE PUBLIC V5 TO V6`。迁移在单一 transaction 中创建三个新表与索引，同时验证旧表行数、schema、foreign key 与 integrity。
 - app/migrations/v005_voice_capture.py 提供显式的 v4→v5 迁移：`--check-only` 只读预检；正式迁移要求停止使用且已备份的数据库、输入 `MIGRATE V4 TO V5` 确认文字、单事务执行，并通过迁移后行数守恒、schema 结构、foreign key 和 integrity 检查。
-- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。旧数据库必须顺序迁移 v3→v4→v5→v6→v7→v8，不存在跨版本直达路径。
+- app/migrations/v004_reminders.py 提供显式的 v3→v4 迁移。旧数据库必须顺序迁移 v3→v4→v5→v6→v7→v8→v9，不存在跨版本直达路径。
 - app/migrations/v003_auth.py 保留通用的 v2 到 v3 显式迁移实现，属于历史兼容层。
 
 Voice Original Audio 存储在 `VOICE_STORAGE_ROOT` 指定的外部目录，不在 SQLite 内；数据库迁移不涉及也不重建历史音频文件。数据库、Voice 存储、WAL/SHM、备份和真实数据不属于公开发行物。

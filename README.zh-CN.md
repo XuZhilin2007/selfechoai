@@ -225,7 +225,7 @@ python -m app.bootstrap
 Bootstrap 会：
 
 - 使用 `.env` 中 `APP_DATABASE_PATH` 指定的 SQLite 数据库；
-- 在数据库不存在时初始化当前 schema（v8）；
+- 在数据库不存在时初始化当前 schema（v9）；
 - 只在 user count 为 0 时创建一个普通用户；
 - 通过 `getpass` 读取并确认 password；
 - 使用与应用相同的用户约束和 Argon2id password hashing；
@@ -404,7 +404,7 @@ node --test tests/*.mjs
 
 - 没有 password reset
 - 不支持循环提醒，尚无 planner 或日历集成
-- 没有内置 rate limiting
+- Admission 与限流有界且仅在单进程内生效；没有跨应用实例共享或反向代理层面的全局限流系统
 - 没有正式管理后台或角色系统
 - v0.6.0 首发只正式支持 Tencent SES；未配置可选专用模板时 Test Email 操作不可用
 - Provider acceptance 不等于 recipient delivery；Email 提交结果有歧义时保留为 `unknown`，delivery-status reconciliation 次数有限
